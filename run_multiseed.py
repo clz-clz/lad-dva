@@ -51,11 +51,24 @@ NOISE_TYPES = ["BT", "IF", "ATF"]
 SEEDS       = [13, 42, 2024]
 SAMPLE_SIZE = None  # None = full dataset
 MAX_CONCURRENCY = 200     # high throughput for LLM API calls
+PER_REQUEST_TIMEOUT = 180  # seconds per sentence; straggler → dirty fallback
 
 # Configurations — each key maps to either a pipeline config or a standalone method.
 CONFIGURATIONS: Dict[str, dict] = {
-    # Our method: Coder + Reviewer(DEER retrieval) + Voting + DFA wash
-    "lad_dva_full":              {"lambda_bias": 1.0,  "use_dfa": True},
+    # SelectDenoise: Coder(+ATF de-anchoring) -> Reviewer(LADS/DEER) -> Verifier
+    "selectdenoise_full":        {"deanchor_atf": True,  "use_verifier": True},
+    # Ablations to attribute the gain to each lever
+    "selectdenoise_no_verifier": {"deanchor_atf": True,  "use_verifier": False},
+    "selectdenoise_no_deanchor": {"deanchor_atf": False, "use_verifier": True},
+    "selectdenoise_verify_all":  {"deanchor_atf": True,  "use_verifier": True,
+                                  "verify_all": True},
+    "selectdenoise_vote":        {"deanchor_atf": False, "use_verifier": False},
+    # Legacy LAD-RG (graph no longer wires ror/gasd; kept for filename compat)
+    "lad_rg_full":               {"use_ror": True,  "gasd_potentials": True},
+    "lad_rg_no_ror":             {"use_ror": False, "gasd_potentials": True},
+    "lad_rg_no_potentials":      {"use_ror": True,  "gasd_potentials": False},
+    "lad_rg_ror_ungated":        {"use_ror": True,  "gasd_potentials": True,
+                                  "ror_ungated": True},
     # Baselines (2024-2025 published & standard)
     "baseline_zero_shot":         {"method": "zero_shot"},
     "baseline_cot_reasoning":     {"method": "cot_reasoning"},
@@ -261,24 +274,42 @@ async def _run_one_cell(config_name: str, config: dict,
             if dummy:
                 cfg["__gold__"] = gold
                 cfg["__seed__"] = seed
-            try:
+            # Log the Coder candidate pool for the main methods only (oracle /
+            # selection analysis); keeps ablation prediction files lean.
+            if config_name in ("selectdenoise_full", "lad_rg_full"):
+                cfg["__return_candidates__"] = True
+            extra: dict = {}
+
+            async def _call():
                 method = cfg.get("method")
                 if method and method in baseline_fns:
                     fn = baseline_fns[method]
                     try:
-                        pred = await fn(tokens, dirty, cfg,
-                                        dataset_name=dataset)
+                        return await fn(tokens, dirty, cfg, dataset_name=dataset)
                     except TypeError:
-                        pred = await fn(tokens, dirty, cfg)
-                else:
-                    try:
-                        pred = await default_fn(tokens, dirty, cfg,
-                                                dataset_name=dataset)
-                    except TypeError:
-                        pred = await default_fn(tokens, dirty, cfg)
+                        return await fn(tokens, dirty, cfg)
+                try:
+                    return await default_fn(tokens, dirty, cfg, dataset_name=dataset)
+                except TypeError:
+                    return await default_fn(tokens, dirty, cfg)
+
+            try:
+                # Per-request timeout: a single straggler sentence (e.g. very long
+                # MSRA input) must not stall the whole cell's async gather.
+                pred = await asyncio.wait_for(_call(), timeout=PER_REQUEST_TIMEOUT)
+            except asyncio.TimeoutError:
+                logging.warning(f"[timeout] sentence {i} exceeded "
+                                f"{PER_REQUEST_TIMEOUT}s; using dirty as fallback")
+                pred = list(dirty)
             except Exception as e:                       # noqa: BLE001
                 logging.error(f"[!] sentence {i} failed ({e!r}); using dirty as fallback")
                 pred = list(dirty)
+            # Candidate-rich return (dict) → unpack pred_tags + extra fields.
+            if isinstance(pred, dict):
+                extra = {k: pred[k] for k in
+                         ("candidate_paths", "rag_weights", "confidence")
+                         if k in pred}
+                pred = pred.get("pred_tags", list(dirty))
             # Length alignment (defensive)
             if not isinstance(pred, list):
                 pred = ["O"] * len(gold)
@@ -286,7 +317,10 @@ async def _run_one_cell(config_name: str, config: dict,
                 pred = list(pred) + ["O"] * (len(gold) - len(pred))
             elif len(pred) > len(gold):
                 pred = pred[:len(gold)]
-            buffer[i] = {"tokens": tokens, "gold_tags": gold, "pred_tags": pred}
+            rec = {"tokens": tokens, "gold_tags": gold, "pred_tags": pred}
+            if extra:
+                rec.update(extra)
+            buffer[i] = rec
 
     rate_tag = f"r{int(round(ratio*100))}"
     try:

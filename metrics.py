@@ -76,6 +76,36 @@ def compute_ser(pred: List[List[str]]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Token-class rates (Lazy-Erasure diagnostics)
+# ---------------------------------------------------------------------------
+
+def token_class_rates(tags: List[List[str]]) -> Dict[str, float]:
+    """Token-level O vs entity coverage.
+
+    Substantiates the *Lazy Erasure* claim (predictions collapse to the
+    background O class). Computed over a flat tag sequence set:
+
+      - o_rate       : fraction of tokens tagged ``O``
+      - entity_rate  : fraction of tokens tagged with a ``B-``/``I-`` entity
+                       (equals ``1 - o_rate`` for well-formed IOB2)
+
+    Compare a method's ``o_rate`` against the gold and the dirty-input
+    ``o_rate``: a large positive gap over gold is the signature of the
+    recall-collapse failure mode.
+    """
+    n_tok = n_o = 0
+    for sent in tags:
+        for tag in sent:
+            n_tok += 1
+            if tag == "O":
+                n_o += 1
+    if not n_tok:
+        return {"o_rate": 0.0, "entity_rate": 0.0}
+    o_rate = n_o / n_tok
+    return {"o_rate": float(o_rate), "entity_rate": float(1.0 - o_rate)}
+
+
+# ---------------------------------------------------------------------------
 # Paired bootstrap (sentence-level) — fast vectorized implementation
 # ---------------------------------------------------------------------------
 

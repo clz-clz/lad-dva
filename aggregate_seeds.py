@@ -18,19 +18,34 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from metrics import (compute_prf1, compute_ser,
+from metrics import (compute_prf1, compute_ser, token_class_rates,
                      paired_bootstrap_f1, significance_marker)
 from run_multiseed import (CONFIGURATIONS, DATASETS, NOISE_TYPES,
                            PRED_DIR, SEEDS, _pred_path)
 
 
 METHOD_LABEL = {
+    "selectdenoise_full":        r"\textbf{SelectDenoise (Ours)}",
+    "selectdenoise_no_verifier": r"SelectDenoise $-$Verifier",
+    "selectdenoise_no_deanchor": r"SelectDenoise $-$De-anchor",
+    "selectdenoise_verify_all":  r"SelectDenoise (verify all)",
+    "selectdenoise_vote":        r"SelectDenoise (vote only)",
+    "lad_rg_full":               r"\textbf{LAD-RG Full (LADS+RoR+GASD)}",
+    "lad_rg_no_ror":             r"LAD-RG $-$RoR",
+    "lad_rg_no_potentials":      r"LAD-RG $-$GASD potentials",
+    "lad_rg_ror_ungated":        r"LAD-RG (RoR ungated)",
     "lad_dva_full":              r"\textbf{LAD-DVA Full (DEER + DFA)}",
+    "td_dva_full":               r"LAD-DVA (old: DEER+DFA+voting)",
     "baseline_zero_shot":       "Zero-Shot (2025 baseline)",
     "baseline_cot_reasoning":   "CoT Reasoning",
     "baseline_self_refine":     "Self-Refine",
     "baseline_rule_only":       "Rule-Only (DFA fix)",
     "baseline_standard_prompting": "Standard Prompting (Nagar et al., 2024)",
+    # +structural floor (deterministic IOB2 repair applied post-hoc; 0% SER)
+    "baseline_zero_shot_sfloor":         "Zero-Shot + DFA",
+    "baseline_cot_reasoning_sfloor":     "CoT Reasoning + DFA",
+    "baseline_self_refine_sfloor":       "Self-Refine + DFA",
+    "baseline_standard_prompting_sfloor": "Standard Prompting + DFA",
 }
 
 
@@ -69,13 +84,18 @@ def _aggregate_cell(method: str, dataset: str, noise: str) -> Optional[dict]:
     if not seeds_data:
         return None
     f1s, ps, rs, sers = [], [], [], []
+    o_rates, gold_o_rates = [], []
     per_seed = []
     for s, g, pr in seeds_data:
         m = compute_prf1(g, pr)
         ser = compute_ser(pr)
+        o_pred = token_class_rates(pr)["o_rate"]
+        o_gold = token_class_rates(g)["o_rate"]
         f1s.append(m["f1"]); ps.append(m["precision"])
         rs.append(m["recall"]); sers.append(ser)
-        per_seed.append({"seed": s, **m, "ser": ser})
+        o_rates.append(o_pred); gold_o_rates.append(o_gold)
+        per_seed.append({"seed": s, **m, "ser": ser,
+                         "o_rate": o_pred, "gold_o_rate": o_gold})
 
     def m_sd(a):
         a = np.asarray(a)
@@ -85,12 +105,17 @@ def _aggregate_cell(method: str, dataset: str, noise: str) -> Optional[dict]:
     p_m,  p_sd  = m_sd(ps)
     r_m,  r_sd  = m_sd(rs)
     ser_m, ser_sd = m_sd(sers)
+    o_m,  o_sd  = m_sd(o_rates)
+    gold_o_m, _ = m_sd(gold_o_rates)
     return {
         "n_seeds":  len(seeds_data),
         "f1_mean":  f1_m,  "f1_std":  f1_sd,
         "p_mean":   p_m,   "p_std":   p_sd,
         "r_mean":   r_m,   "r_std":   r_sd,
         "ser_mean": ser_m, "ser_std": ser_sd,
+        # Lazy-Erasure diagnostics: pred O-rate vs. the gold O-rate reference.
+        "o_rate_mean": o_m, "o_rate_std": o_sd,
+        "gold_o_rate_mean": gold_o_m,
         "per_seed": per_seed,
     }
 
@@ -186,6 +211,62 @@ def emit_latex(cells: Dict[Tuple[str, str, str], dict],
     return "\n".join(L)
 
 
+def emit_prf_orate_latex(cells: Dict[Tuple[str, str, str], dict],
+                         methods: List[str]) -> str:
+    """Macro-averaged Precision / Recall / F1 / O-prediction-rate per
+    (method, noise), with the gold O-rate as the recall-collapse reference.
+
+    Substantiates *Lazy Erasure*: methods that collapse to O show an O-rate
+    well above gold and a depressed Recall while Precision stays comparatively
+    stable.
+    """
+    def macro(method: str, nt: str, key: str) -> Optional[float]:
+        vals = [cells[(method, ds, nt)][key]
+                for ds in DATASETS if (method, ds, nt) in cells]
+        return float(np.mean(vals)) if vals else None
+
+    L: List[str] = []
+    L.append(r"\begin{table*}[t]")
+    L.append(r"\centering\small")
+    L.append(r"\renewcommand{\arraystretch}{1.18}")
+    L.append(r"\begin{tabular}{lccccc}")
+    L.append(r"\toprule")
+    L.append(r"\textbf{Method} & \textbf{Precision} & \textbf{Recall} "
+             r"& \textbf{F1} & \textbf{SER} & \textbf{O-rate} \\")
+    for ni, nt in enumerate(NOISE_TYPES):
+        L.append(rf"\midrule \multicolumn{{6}}{{l}}{{\textit{{{nt} noise (15\%)}}}} \\")
+        gold_o = macro(methods[0], nt, "gold_o_rate_mean") if methods else None
+        if gold_o is not None:
+            # Gold is legal by construction: SER = 0.
+            L.append(rf"\textit{{Gold reference}} & --- & --- & --- "
+                     rf"& 0.00\% & {gold_o:.3f} \\")
+        for method in methods:
+            label = METHOD_LABEL.get(method, method.replace("_", r"\_"))
+            p, r = macro(method, nt, "p_mean"), macro(method, nt, "r_mean")
+            f1, o = macro(method, nt, "f1_mean"), macro(method, nt, "o_rate_mean")
+            ser = macro(method, nt, "ser_mean")
+            if p is None:
+                continue
+            ser_str = f"{ser * 100:.2f}\\%" if ser is not None else "---"
+            L.append(rf"{label} & {p:.4f} & {r:.4f} & {f1:.4f} "
+                     rf"& {ser_str} & {o:.3f} \\")
+    L.append(r"\bottomrule")
+    L.append(r"\end{tabular}")
+    L.append(r"\caption{Macro-averaged Precision, Recall, F1, "
+             r"structural-error rate (SER, fraction of IOB2-illegal tag "
+             r"transitions), and O-prediction-rate (fraction of tokens tagged "
+             r"$O$) across the five datasets, per noise type. \textit{Gold "
+             r"reference} is the gold O-rate (SER$=0$ by construction). SER "
+             r"exposes the legality gap: methods compared to a raw noisy input "
+             r"with SER$>0$ are not on equal footing, since strict seqeval "
+             r"ignores illegal fragments. An inflated O-rate with depressed "
+             r"Recall at stable Precision is the \textit{Lazy Erasure} "
+             r"signature.}")
+    L.append(r"\label{tab:prf_orate}")
+    L.append(r"\end{table*}")
+    return "\n".join(L)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -243,6 +324,8 @@ def main(argv=None):
     n_seeds_max = max(c["n_seeds"] for c in cells.values())
     print(emit_latex(cells, args.methods, args.reference,
                      args.bootstrap_iter, n_seeds_max))
+    print("\n\n% ===== Precision / Recall / O-rate (Lazy-Erasure evidence) =====")
+    print(emit_prf_orate_latex(cells, args.methods))
 
 
 if __name__ == "__main__":

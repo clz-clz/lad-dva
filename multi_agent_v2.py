@@ -12,23 +12,38 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
 
-from utils import enforce_iob2_syntax, extract_json_list
+from utils import enforce_iob2_syntax, legalize_noise_aware, extract_json_list
+from metrics import _is_valid_transition
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Backbone configuration (env-var driven, DeepSeek defaults).
+# Swap to any OpenAI-compatible endpoint (e.g. Qwen2.5 / Llama-3.1 via vLLM,
+# Together, OpenRouter) by exporting BACKBONE_MODEL / BACKBONE_BASE_URL /
+# BACKBONE_API_KEY — no code change needed. run_multiseed.py is already
+# backbone-agnostic; only these two client constructors bind the backbone.
+# ---------------------------------------------------------------------------
+BACKBONE_MODEL    = os.environ.get("BACKBONE_MODEL", "deepseek-chat")
+BACKBONE_BASE_URL = os.environ.get("BACKBONE_BASE_URL", "https://api.deepseek.com")
+BACKBONE_API_KEY  = (os.environ.get("BACKBONE_API_KEY")
+                     or os.environ.get("DEEPSEEK_API_KEY"))
+# Short tag for namespacing prediction files per backbone (cross-backbone runs).
+BACKBONE_TAG = os.environ.get("BACKBONE_TAG", "")
+
 llm = ChatOpenAI(
-    model="deepseek-chat",
+    model=BACKBONE_MODEL,
     temperature=0.7,
-    base_url="https://api.deepseek.com",
-    api_key=os.environ.get("DEEPSEEK_API_KEY")
+    base_url=BACKBONE_BASE_URL,
+    api_key=BACKBONE_API_KEY,
 )
 
 # Dedicated higher-temperature LLM for Coder to encourage diverse paths
 coder_llm = ChatOpenAI(
-    model="deepseek-chat",
+    model=BACKBONE_MODEL,
     temperature=1.0,
-    base_url="https://api.deepseek.com",
-    api_key=os.environ.get("DEEPSEEK_API_KEY")
+    base_url=BACKBONE_BASE_URL,
+    api_key=BACKBONE_API_KEY,
 )
 
 DEEPSEEK_NER_TOKEN_IDS = {
@@ -86,6 +101,20 @@ class State(TypedDict):
     use_wash: bool
     dataset_name: str
     noise_type: str
+    # --- Synergistic redesign (LAD-RG) — legacy, superseded by SelectDenoise ---
+    ror_proposals: dict          # {position: proposed_tag}  (empty if RoR off)
+    use_ror: bool                # enable the RoR recall stage
+    ror_ungated: bool            # ablation: fire RoR everywhere (no ω/conf gate)
+    gasd_potentials: bool        # integrate LADS ω(t) potentials in GASD decode
+    # --- SelectDenoise (two levers) ---
+    # Lever 1 (generation): de-anchor ATF entity types so the correct type
+    # becomes the majority across Coder paths instead of a minority.
+    deanchor_atf: bool
+    # Lever 2 (selection): LLM verifier picks the best complete labeling among
+    # the distinct candidate paths on contested sentences.
+    use_verifier: bool
+    verify_all: bool             # ablation: verify every sentence (no trigger)
+    verifier_topk: int           # max distinct candidate paths shown to verifier
 
     
 
@@ -116,6 +145,57 @@ def extract_float_weights(llm_output: str, expected_len: int = 5) -> List[float]
 
     logging.error(f" Warning: {llm_output[:50]}...")
     return [1.0] * expected_len 
+
+
+def _mask_entity_types(tags: List[str]) -> List[str]:
+    """Replace entity TYPES with a neutral 'ENT' placeholder, keeping the B/I/O
+    boundary structure. Used by Lever 1 (ATF de-anchoring): the Coder sees the
+    correct spans but no (possibly wrong) type suggestion, so it must re-derive
+    each type from context + calibration instead of anchoring on the dirty type."""
+    out = []
+    for t in tags:
+        if t == "O" or "-" not in t:
+            out.append("O")
+        else:
+            out.append(f"{t[0]}-ENT")
+    return out
+
+
+def _apply_types_to_boundaries(model_path: List[str],
+                               boundary_tags: List[str]) -> List[str]:
+    """Keep boundary_tags' B/I/O structure (correct under ATF) but adopt the
+    TYPE the model assigned to each span. Per span, the type is the majority of
+    the model's non-O tags over the span positions; ties/empties fall back to the
+    first assigned type, else keep the boundary tag's own type. Guarantees the
+    de-anchored path never introduces boundary errors on ATF."""
+    n = len(boundary_tags)
+    out = list(boundary_tags)
+    i = 0
+    while i < n:
+        bt = boundary_tags[i]
+        if bt.startswith("B-"):
+            j = i + 1
+            while j < n and boundary_tags[j].startswith("I-"):
+                j += 1
+            # collect model type votes over span [i, j)
+            votes: dict = {}
+            for k in range(i, j):
+                mk = model_path[k] if k < len(model_path) else "O"
+                if mk != "O" and "-" in mk:
+                    ty = mk.split("-", 1)[1]
+                    votes[ty] = votes.get(ty, 0) + 1
+            if votes:
+                ty = max(votes, key=votes.get)
+            else:
+                ty = bt.split("-", 1)[1]        # keep original type if no vote
+            out[i] = f"B-{ty}"
+            for k in range(i + 1, j):
+                out[k] = f"I-{ty}"
+            i = j
+        else:
+            out[i] = "O"
+            i += 1
+    return out
 
 
 def _format_sentence_initial_guidance(dataset_name: str) -> str:
@@ -163,6 +243,7 @@ async def coder_node(state: State):
     dirty_tags = state.get("dirty_tags", [])
     dataset_name = state.get("dataset_name", "conll2003")
     noise_type = state.get("noise_type", "BT")
+    deanchor_atf = state.get("deanchor_atf", False) and noise_type == "ATF"
     valid_tags_str = _format_valid_tags(dataset_name)
     misc_guidance = _format_misc_guidance(dataset_name)
     sentence_initial_guidance = _format_sentence_initial_guidance(dataset_name)
@@ -187,6 +268,20 @@ async def coder_node(state: State):
             2: "AGGRESSIVE FRAGMENT MERGE: Merge adjacent same-type entities with gaps up to 2 O tokens. Only skip merging when the gap token is clearly a sentence delimiter. Never change entity types. Target: comprehensive fragment repair — catch all splittings.",
             5: "OPTIMAL JOINT REPAIR: Merge fragments with balanced aggressiveness (Path 1 threshold for ambiguous gaps, Path 2 for clear gaps) plus false-positive cleanup. Demote to O any entity token that is a function word, common verb, punctuation, or bare number. Never change entity types for tokens that remain entities. Target: maximum accuracy.",
         }
+    elif noise_type == "ATF" and deanchor_atf:
+        # Lever 1: de-anchored ATF. The dirty TYPES are hidden (masked to ENT);
+        # boundaries are given and correct. Every path re-derives each span's
+        # type from scratch, so the correct type is the MAJORITY across paths
+        # (not a dirty-anchored minority). Boundaries are re-imposed afterward.
+        noise_policy = """
+    NOISE TYPE: Adversarial Type Flipping (ATF), TYPE-BLIND mode. You are given entity SPANS whose boundaries (B/I/O structure) are CORRECT, but whose TYPES are HIDDEN (shown as ENT). The original dirty types were unreliable and have been withheld ON PURPOSE. Your task: assign the CORRECT entity type (from the valid vocabulary) to EACH given span using ONLY the token semantics, sentence context, and calibration examples — never guess a default type. Do NOT add, remove, or resize spans; only fill in each span's type. All tokens within one span MUST share one type."""
+        path_strategies = {
+            1: "SEMANTIC TYPING: Assign each span's type from the real-world semantics of its head token (a person name -> PER, a place -> LOC, a company/institution -> ORG, else MISC). Decide independently for every span.",
+            2: "CALIBRATION TYPING: For each span, find similar tokens in the calibration examples and adopt the type they consistently receive there. If none match, fall back to semantics.",
+            3: "CONTEXT TYPING: Assign each span's type from the surrounding sentence context (verbs, prepositions, appositions, neighboring entities) that disambiguate person vs place vs organization.",
+            4: "CONSENSUS TYPING: For each span consider semantics, context, AND calibration together and pick the single most probable type; enforce one uniform type per span.",
+            5: "ROBUST TYPING + CLEANUP: Assign the most probable type per span (semantics+context+calibration); additionally, if a span is clearly a function word, bare number, or punctuation, you may mark it O.",
+        }
     elif noise_type == "ATF":
         noise_policy = """
     NOISE TYPE: Adversarial Type Flipping (ATF). Entity BOUNDARIES (B/I/O structure) are CORRECT — the spans are right, but the entity TYPES are all potentially wrong. CRITICAL: Do NOT change entity boundaries. Only verify and fix entity TYPES."""
@@ -205,11 +300,18 @@ async def coder_node(state: State):
             5: "DEFAULT REPAIR: Comprehensive repair including false-positive cleanup.",
         }
 
-    # Shared prompt prefix (identical for all paths)
+    # Shared prompt prefix (identical for all paths). Under Lever 1 de-anchoring
+    # the dirty TYPES are masked so the model cannot anchor on them.
+    if deanchor_atf:
+        presented_tags_line = (
+            f"Entity Spans (boundaries CORRECT; types HIDDEN — assign them): "
+            f"{_mask_entity_types(dirty_tags)}")
+    else:
+        presented_tags_line = f"Dirty IOB2 Tags: {dirty_tags}"
     shared_prefix = f"""
 You are an Elite AI Data Engineer performing IOB2 label denoising for Named Entity Recognition.
 Tokens: {tokens}
-Dirty IOB2 Tags: {dirty_tags}
+{presented_tags_line}
 {noise_policy}
 
 Calibration Examples (correct annotations from the TRAINING SET — retrieved via label-guided similarity. These show what valid output looks like for sentences similar to the current one. Your repairs MUST be consistent with these patterns):
@@ -261,6 +363,15 @@ Output ONLY the JSON list, no markdown, no explanation."""
     ds_name = state.get("dataset_name", "conll2003")
     valid_set = set(DATASET_ENTITY_TYPES.get(ds_name, ["PER", "LOC", "ORG"]))
     candidate_paths = [enforce_iob2_syntax(p, valid_entity_types=valid_set) for p in candidate_paths]
+
+    # ---- Lever 1: re-impose correct ATF boundaries, keep model TYPE ----
+    # De-anchored paths may drift on structure; ATF boundaries are given/correct,
+    # so force B/I/O = dirty and adopt only the model's per-span type assignment.
+    if deanchor_atf:
+        candidate_paths = [_apply_types_to_boundaries(p, dirty_tags)
+                           for p in candidate_paths]
+        print(f" [Coder] Lever 1 de-anchored ATF: types re-derived, "
+              f"boundaries re-imposed from spans")
 
     # ---- Hard constraint for BT/IF noise ----
     # BT/IF noise only drops entity tags (entity→O) and breaks boundaries.
@@ -487,6 +598,21 @@ def _get_deer_examples(query_tokens: List[str], top_k: int = 3,
             for _, score, tokens, tags in results]
 
 
+def _omega_weights(tokens: List[str], dataset_name: str) -> List[float]:
+    """Per-token LADS informativeness weight ω(t) = w_e·P(t|entity) +
+    w_c·P(t|context) (+ tiny w_o·P(t|other)), from DEER training statistics.
+
+    This is the *shared signal* of the LAD-RG architecture: it gates RoR's
+    recall recovery AND supplies GASD's soft entity potentials, so removing
+    LADS degrades both downstream modules. Returns 1.0 (neutral) per token if
+    stats are unavailable (e.g. dummy mode without DEER).
+    """
+    stats = _deer_stats.get(dataset_name)
+    if stats is None:
+        return [1.0] * len(tokens)
+    return [float(stats.token_weight(t)) for t in tokens]
+
+
 async def reviewer_node(state: State):
     print(f"\n [Reviewer]")
     tokens = state.get("tokens", [])
@@ -682,25 +808,337 @@ def physical_wash_node(state: State):
         return {"current_tags": ["O"] * len(tokens)}
 
 
+# =====================================================================
+# LAD-RG synergistic redesign: RoR (recall) + GASD (structural integrator)
+# These replace the old voting_node (flat, F1-negative λ-bias) and
+# physical_wash_node (greedy, F1-neutral DFA patch). The two new modules
+# share the LADS ω(t) signal and consume each other's output, so removing
+# any single module degrades F1 (non-substitutability).
+# =====================================================================
+
+def _ror_recover(tokens: List[str], base: List[str],
+                 candidate_paths: List[List[str]], weights: List[float],
+                 omega: List[float], *, ungated: bool = False,
+                 omega_quantile: float = 0.6,
+                 conf_thresh: float = 0.6) -> dict:
+    """RoR recall gate: at O-positions that are statistically entity-bearing
+    (high ω) yet low-confidence, propose the entity *type* most supported by
+    the candidate pool. Proposals are handed to GASD (never applied raw), which
+    reconciles them with IOB2 legality.
+
+    Gating uses the shared LADS ω(t) signal → remove LADS and the gate loses its
+    discriminative threshold (falls back toward the toxic ungated regime).
+
+    NOTE: this deterministic statistics+candidate recovery is the portable core;
+    for open-weight / high-compute runs it is refined by a focused span→type
+    reasoning call (ReCoT-style) that confirms whether an entity was truly erased.
+    """
+    import numpy as _np
+    proposals: dict = {}
+    n = len(tokens)
+    if n == 0 or not candidate_paths:
+        return proposals
+    o_positions = [i for i, t in enumerate(base) if t == "O"]
+    if not o_positions:
+        return proposals
+    omg = _np.array([omega[i] for i in o_positions], dtype=float)
+    thr = float(_np.quantile(omg, omega_quantile)) if len(omg) else 0.0
+    Wsum = sum(weights) or 1.0
+    for i in o_positions:
+        type_votes: dict = {}
+        agree_base = 0.0
+        for k, path in enumerate(candidate_paths):
+            tag = path[i] if i < len(path) else "O"
+            if tag == base[i]:
+                agree_base += weights[k]
+            if tag != "O" and "-" in tag:
+                et = tag.split("-", 1)[1]
+                type_votes[et] = type_votes.get(et, 0.0) + weights[k]
+        conf = agree_base / Wsum          # confidence that base (=O) is correct
+        gated = ungated or (omega[i] >= thr and conf < conf_thresh)
+        if not gated or not type_votes:
+            continue
+        proposals[i] = max(type_votes, key=type_votes.get)
+    return proposals
+
+
+def ror_node(state: State):
+    """Recall-Oriented Reasoning stage (replaces voting_node).
+
+    Produces the F1-neutral base selection (weighted vote, entity_boost=1.0 —
+    no uniform inflation) AND gated recovery proposals for GASD.
+    """
+    print(f"\n [RoR] recall-oriented recovery")
+    candidate_paths = state.get("candidate_paths", [])
+    rag_weights = state.get("rag_weights", [])
+    dirty_tags = state.get("dirty_tags", [])
+    tokens = state.get("tokens", [])
+    ds = state.get("dataset_name", "conll2003")
+
+    if not rag_weights or len(rag_weights) != len(candidate_paths):
+        rag_weights = [1.0] * len(candidate_paths)
+
+    base = _weighted_majority_voting(
+        candidate_paths, rag_weights, entity_boost=1.0,
+        dirty_tags=dirty_tags, consensus_ratio=0.6)
+
+    if not state.get("use_ror", True) or not candidate_paths:
+        return {"current_tags": base, "ror_proposals": {}}
+
+    omega = _omega_weights(tokens, ds)
+    proposals = _ror_recover(tokens, base, candidate_paths, rag_weights, omega,
+                             ungated=state.get("ror_ungated", False))
+    if proposals:
+        print(f" [RoR] {len(proposals)} gated entity-recovery proposals")
+    return {"current_tags": base, "ror_proposals": proposals}
+
+
+def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
+                         tokens: List[str], omega: List[float],
+                         proposals: dict, valid_types: List[str], *,
+                         use_potentials: bool = True,
+                         beta_omega: float = 0.5,
+                         gamma_prop: float = 1.0) -> List[str]:
+    """GASD-G: global IOB2-constrained inference (Viterbi) over the candidate
+    distribution. The per-position emission integrates three F1-relevant terms —
+    candidate fidelity, LADS ω(t) entity potentials, and RoR recovery proposals —
+    under hard IOB2 transition legality. Globally optimal, distribution-aware,
+    and 0.00% SER by construction (only legal transitions are ever taken).
+
+    This is the *integrator* where synergy is manufactured: it needs LADS
+    potentials to beat a greedy legal patch, and it preserves RoR's high-ω
+    recoveries as legal spans instead of deleting them.
+    """
+    n = len(tokens)
+    if n == 0:
+        return []
+    tagset = ["O"] + [f"{p}-{t}" for t in valid_types for p in ("B", "I")]
+    W = sum(weights) or 1.0
+    NEG = float("-inf")
+
+    def emission(pos: int, tag: str) -> float:
+        vote = 0.0
+        for i, path in enumerate(candidate_paths):
+            if pos < len(path) and path[pos] == tag:
+                vote += weights[i]
+        score = vote / W
+        if tag != "O":
+            etype = tag.split("-", 1)[1]
+            if use_potentials:
+                score += beta_omega * omega[pos]
+            prop = proposals.get(pos)
+            if prop is not None and (prop == etype or prop == "ENTITY"):
+                score += gamma_prop
+        return score
+
+    # Viterbi. prev="O" is the virtual start (matches compute_ser semantics).
+    dp = {tag: (emission(0, tag) if _is_valid_transition("O", tag) else NEG)
+          for tag in tagset}
+    back: List[dict] = [{}]
+    for pos in range(1, n):
+        new_dp, bp = {}, {}
+        for tag in tagset:
+            e = emission(pos, tag)
+            best_prev, best_score = None, NEG
+            for ptag in tagset:
+                if dp[ptag] == NEG or not _is_valid_transition(ptag, tag):
+                    continue
+                sc = dp[ptag] + e
+                if sc > best_score:
+                    best_score, best_prev = sc, ptag
+            new_dp[tag] = best_score
+            bp[tag] = best_prev
+        dp, _ = new_dp, back.append(bp)
+
+    last = max(tagset, key=lambda t: dp[t])
+    seq = [last]
+    for pos in range(n - 1, 0, -1):
+        last = back[pos][last]
+        seq.append(last)
+    seq.reverse()
+    return seq
+
+
+def gasd_node(state: State):
+    """GASD structural integrator (replaces physical_wash_node)."""
+    print(f"\n [GASD] global constrained decode")
+    tokens = state.get("tokens", [])
+    candidate_paths = state.get("candidate_paths", [])
+    weights = state.get("rag_weights", []) or [1.0] * len(candidate_paths)
+    base = state.get("current_tags", [])
+    proposals = state.get("ror_proposals", {}) or {}
+    ds = state.get("dataset_name", "conll2003")
+    valid_types = DATASET_ENTITY_TYPES.get(ds, ["PER", "LOC", "ORG"])
+    valid_set = set(valid_types)
+
+    try:
+        if not candidate_paths:
+            return {"current_tags": enforce_iob2_syntax(base, valid_set)}
+        omega = _omega_weights(tokens, ds)
+        decoded = _gasd_viterbi_decode(
+            candidate_paths, weights, tokens, omega, proposals, valid_types,
+            use_potentials=state.get("gasd_potentials", True))
+        if len(decoded) != len(tokens):
+            decoded = enforce_iob2_syntax(base, valid_set)
+            if len(decoded) != len(tokens):
+                decoded = (decoded[:len(tokens)]
+                           + ["O"] * max(0, len(tokens) - len(decoded)))
+        return {"current_tags": decoded}
+    except Exception as e:                                    # noqa: BLE001
+        logging.error(f"[GASD] decode failed ({e!r}); legalizing base")
+        return {"current_tags": enforce_iob2_syntax(base, valid_set)}
+
+
+# =====================================================================
+# SelectDenoise — Lever 2: verifier_node (replaces ror/gasd in the graph)
+# =====================================================================
+
+def _distinct_paths_by_weight(candidate_paths: List[List[str]],
+                              weights: List[float], topk: int
+                              ) -> List[Tuple[List[str], float]]:
+    """Deduplicate candidate paths, summing the Reviewer weight of identical
+    paths, and return the top-`topk` by aggregated weight (desc)."""
+    agg: dict = {}
+    for i, p in enumerate(candidate_paths):
+        key = tuple(p)
+        w = weights[i] if i < len(weights) else 1.0
+        agg[key] = agg.get(key, 0.0) + w
+    ranked = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
+    return [(list(k), v) for k, v in ranked[:topk]]
+
+
+def _is_type_contested(candidate_paths: List[List[str]]) -> bool:
+    """TYPE-contested = the selection-bound signature the verifier is good at:
+    a position where every candidate agrees it is an entity (none says O) but
+    they disagree on the TYPE. This is the ATF case (boundaries agreed, type
+    disputed). It deliberately excludes pure BOUNDARY disagreement (IF/BT: some
+    paths say O, others entity) where whole-path selection tends to hurt — so the
+    verifier does no harm on generation-bound noise and only fires where the
+    candidate pool holds a genuine type choice to make."""
+    if len(candidate_paths) < 2:
+        return False
+    n = min(len(p) for p in candidate_paths)
+    for pos in range(n):
+        labels = [p[pos] for p in candidate_paths]
+        if any(l == "O" for l in labels):
+            continue                                   # boundary dispute → skip
+        types = {l.split("-", 1)[1] for l in labels if "-" in l}
+        if len(types) >= 2:
+            return True
+    return False
+
+
+def _spans_str(tokens: List[str], tags: List[str]) -> str:
+    """Human-readable entity spans of a path, e.g. "[Jeff Dean]->PER"."""
+    out, i, n = [], 0, len(tags)
+    while i < n:
+        t = tags[i]
+        if t.startswith("B-") and "-" in t:
+            ty = t.split("-", 1)[1]; j = i + 1
+            while j < n and tags[j] == f"I-{ty}":
+                j += 1
+            span = " ".join(tokens[k] for k in range(i, min(j, len(tokens))))
+            out.append(f"[{span}]->{ty}"); i = j
+        else:
+            i += 1
+    return "; ".join(out) if out else "(no entities)"
+
+
+async def verifier_node(state: State):
+    """SelectDenoise Lever 2: on contested sentences, ask the LLM to SELECT the
+    single best complete IOB2 labeling among the distinct candidate paths (the
+    correct answer is provably in the pool — oracle analysis). Uncontested
+    sentences use the cheap weighted vote. Output is validated + legalized
+    (SER=0.00); any failure falls back to the vote, so it is never worse."""
+    print(f"\n [Verifier] selection")
+    tokens = state.get("tokens", [])
+    candidate_paths = state.get("candidate_paths", [])
+    weights = state.get("rag_weights", []) or [1.0] * len(candidate_paths)
+    dirty_tags = state.get("dirty_tags", [])
+    ds = state.get("dataset_name", "conll2003")
+    valid_set = set(DATASET_ENTITY_TYPES.get(ds, ["PER", "LOC", "ORG"]))
+
+    # Noise-aware final legalization. On IF, a residual dangling I- is a
+    # failed-merge artifact — DEMOTE it to O (promoting to B- invents a
+    # false-positive entity and collapses precision). BT/ATF keep the historical
+    # PROMOTE behavior (a dropped B- should be recovered as a real entity).
+    dangling_policy = "demote" if state.get("noise_type") == "IF" else "promote"
+
+    if not candidate_paths:
+        return {"current_tags": legalize_noise_aware(
+            list(dirty_tags), valid_set, dangling_policy)}
+    if len(weights) != len(candidate_paths):
+        weights = [1.0] * len(candidate_paths)
+
+    # Base / fallback = weighted vote. consensus_ratio=0.7 keeps more of the
+    # (reliable) dirty tag on low-agreement positions — a do-no-harm bias that
+    # helps generation-bound noise without hurting ATF (empirically >= 0.6).
+    base = _weighted_majority_voting(candidate_paths, weights, entity_boost=1.0,
+                                     dirty_tags=dirty_tags, consensus_ratio=0.7)
+    base = legalize_noise_aware(base, valid_set, dangling_policy)
+
+    # Fire only on TYPE-contested sentences (selection-bound / ATF signature);
+    # boundary-contested (IF/BT) sentences stay on the safe vote → do no harm.
+    fire = state.get("use_verifier", True) and (
+        state.get("verify_all", False) or _is_type_contested(candidate_paths))
+    if not fire:
+        return {"current_tags": base}
+
+    topk = int(state.get("verifier_topk", 4))
+    distinct = _distinct_paths_by_weight(candidate_paths, weights, topk)
+    if len(distinct) < 2:                       # nothing to choose between
+        return {"current_tags": base}
+
+    deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=ds)
+    cand_block = "\n".join(
+        f"  Candidate {idx+1} (score {w:.2f}): {json.dumps(p, ensure_ascii=False)}\n"
+        f"      entities: {_spans_str(tokens, p)}"
+        for idx, (p, w) in enumerate(distinct))
+    n = len(tokens)
+    prompt = f"""
+You are an IOB2 Selection Judge. Several candidate labelings were produced for the SAME sentence; each may be partly right. Choose the SINGLE most correct complete labeling. You MAY output one candidate verbatim, or combine their correct entity spans into one better labeling — but every tag must be legal IOB2.
+
+Tokens ({n}): {json.dumps(tokens, ensure_ascii=False)}
+Dirty tags (reference — contain ~15% noise, do NOT trust blindly): {json.dumps(dirty_tags, ensure_ascii=False)}
+
+VALID TAG VOCABULARY (use ONLY these; case-sensitive):
+{_format_valid_tags(ds)}
+
+Calibration Examples (correct annotations from the TRAINING SET, retrieved by label-guided similarity — use these to judge which candidate's entity TYPES are right):
+{json.dumps(deer_examples, indent=2) if deer_examples else '[]'}
+
+Candidate labelings to choose among:
+{cand_block}
+
+Decide by: (1) IOB2 legality; (2) entity TYPES consistent with the calibration examples and token semantics; (3) correct boundaries. When candidates disagree on an entity's type, pick the type the calibration/context best supports — the majority candidate is NOT automatically right.
+
+Output ONLY a JSON list of exactly {n} IOB2 tags — the single best labeling. No markdown, no explanation."""
+
+    try:
+        response = await asyncio.to_thread(llm.invoke, prompt)
+        picked = extract_json_list(response.content, fallback_length=n)
+        if not isinstance(picked, list) or len(picked) != n:
+            print(f" [Verifier] bad output (len {len(picked) if isinstance(picked,list) else '?'} != {n}); vote fallback")
+            return {"current_tags": base}
+        picked = legalize_noise_aware(picked, valid_set, dangling_policy)
+        if len(picked) != n:
+            return {"current_tags": base}
+        return {"current_tags": picked}
+    except Exception as e:                                    # noqa: BLE001
+        logging.error(f"[Verifier] failed ({e!r}); vote fallback")
+        return {"current_tags": base}
+
+
 workflow = StateGraph(State)
 
 workflow.add_node("coder", coder_node)
 workflow.add_node("reviewer", reviewer_node)
-workflow.add_node("voting", voting_node)  
-workflow.add_node("physical_wash", physical_wash_node)
+workflow.add_node("verifier", verifier_node)
 
 workflow.add_edge(START, "coder")
 workflow.add_edge("coder", "reviewer")
-workflow.add_edge("reviewer", "voting")
-
-
-def route_wash(state: State):
-    if state.get("use_wash", True) is False:
-        return END
-    return "physical_wash"
-
-workflow.add_conditional_edges("voting", route_wash)
-workflow.add_edge("physical_wash", END)
+workflow.add_edge("reviewer", "verifier")
+workflow.add_edge("verifier", END)
 
 multi_agent_graph = workflow.compile()
 
@@ -714,13 +1152,37 @@ multi_agent_graph = workflow.compile()
     # run_agent_pipeline(args.input, args.output)
 
 
+def _per_position_confidence(candidate_paths: List[List[str]],
+                             weights: List[float],
+                             predicted_tags: List[str]) -> List[float]:
+    """K-path agreement confidence: weighted fraction of Coder paths that
+    emitted the finally-decoded tag at each position. Used as the B4/B5
+    confidence proxy when the backbone does not expose token logprobs."""
+    n = len(predicted_tags)
+    W = sum(weights) or 1.0
+    conf: List[float] = []
+    for pos in range(n):
+        agree = 0.0
+        for k, path in enumerate(candidate_paths):
+            if pos < len(path) and path[pos] == predicted_tags[pos]:
+                agree += weights[k] if k < len(weights) else 1.0
+        conf.append(agree / W)
+    return conf
+
+
 async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
                               config: dict = None,
-                              dataset_name: str = None) -> List[str]:
+                              dataset_name: str = None):
     """
     `dataset_name` controls which entity-type ontology is injected into
     the Coder / Reviewer prompts. Allowed values: 'msra', 'conll2003', 'wnut17'.
     If omitted, falls back to config['__dataset__'], then to 'conll2003'.
+
+    Returns the decoded tag list (``List[str]``) by default. When
+    ``config['__return_candidates__']`` is set, instead returns a dict
+    ``{"pred_tags", "candidate_paths", "rag_weights", "confidence"}`` so the
+    driver can persist the Coder candidate pool for the B5 oracle-pool study
+    and the B4 logit/agreement analysis (backbone-agnostic; no extra LLM calls).
     """
     if config is None:
         config = {"lambda_bias": 1.0, "use_dfa": True}
@@ -750,19 +1212,41 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "use_wash": config.get("use_dfa", True),
         "dataset_name": dataset_name,
         "noise_type": noise_type,
+        # LAD-RG synergy controls (legacy; graph no longer uses ror/gasd nodes)
+        "ror_proposals": {},
+        "use_ror": config.get("use_ror", True),
+        "ror_ungated": config.get("ror_ungated", False),
+        "gasd_potentials": config.get("gasd_potentials", True),
+        # SelectDenoise controls (defaults = full system)
+        "deanchor_atf": config.get("deanchor_atf", True),
+        "use_verifier": config.get("use_verifier", True),
+        "verify_all": config.get("verify_all", False),
+        "verifier_topk": config.get("verifier_topk", 4),
     }
     
+    return_candidates = bool(config.get("__return_candidates__"))
+    cand: List[List[str]] = []
+    weights: List[float] = []
     try:
         final_state = await multi_agent_graph.ainvoke(initial_state)
         predicted_tags = final_state.get("current_tags", [])
-        
         if not predicted_tags or len(predicted_tags) != len(tokens):
-            return dirty_tags 
-            
-        return predicted_tags
+            predicted_tags = dirty_tags
+        else:
+            cand = final_state.get("candidate_paths", []) or []
+            weights = final_state.get("rag_weights", []) or [1.0] * len(cand)
     except Exception as e:
         logging.error(f"[-] Pipeline : {e}")
-        return dirty_tags
+        predicted_tags = dirty_tags
+
+    if not return_candidates:
+        return predicted_tags
+    return {
+        "pred_tags": predicted_tags,
+        "candidate_paths": cand,
+        "rag_weights": weights,
+        "confidence": _per_position_confidence(cand, weights, predicted_tags),
+    }
 
 
 # =========================================================================
