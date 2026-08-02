@@ -276,7 +276,8 @@ async def _run_one_cell(config_name: str, config: dict,
                 cfg["__seed__"] = seed
             # Log the Coder candidate pool for the main methods only (oracle /
             # selection analysis); keeps ablation prediction files lean.
-            if config_name in ("selectdenoise_full", "lad_rg_full"):
+            if config_name in ("selectdenoise_full", "selectdenoise_no_deanchor",
+                               "lad_rg_full"):
                 cfg["__return_candidates__"] = True
             extra: dict = {}
 
