@@ -81,6 +81,16 @@ NOISY_DIR = Path("results_multiseed")
 PRED_DIR  = Path("predictions_multiseed")
 PRED_DIR.mkdir(exist_ok=True)
 
+# Short tag namespacing prediction files per backbone, so a cross-backbone run
+# writes new files instead of being skipped by the resume check. Unset (the
+# default) reproduces the original, tag-free filenames byte for byte, keeping
+# every existing prediction addressable. Set it alongside BACKBONE_MODEL /
+# BACKBONE_BASE_URL / BACKBONE_API_KEY (read in multi_agent_v2.py), e.g.
+#     BACKBONE_TAG=llama8b python run_multiseed.py --configs selectdenoise_full
+# Downstream scripts (aggregate_seeds, derive_ablations, sweep_results) import
+# _pred_path, so they follow the same namespace automatically.
+BACKBONE_TAG = os.environ.get("BACKBONE_TAG", "").strip()
+
 
 # ---------------------------------------------------------------------------
 # Pipeline import (real or mock)
@@ -217,11 +227,16 @@ def _noisy_path(dataset: str, noise: str, seed: int, size: int,
 
 def _pred_path(config_name: str, dataset: str, noise: str, seed: int,
                ratio: float = 0.15) -> Path:
-    # Same backward-compat scheme as _noisy_path.
+    # Same backward-compat scheme as _noisy_path, plus an optional backbone tag
+    # appended last (empty by default → byte-identical to the original names).
+    # Note the noisy path takes no tag: noise data is backbone-independent.
+    tag_suffix = f"__{BACKBONE_TAG}" if BACKBONE_TAG else ""
     if abs(ratio - 0.15) < 1e-9:
-        return PRED_DIR / f"pred_seed{seed}__{config_name}__{dataset}__{noise}.jsonl"
+        return PRED_DIR / (f"pred_seed{seed}__{config_name}__{dataset}"
+                           f"__{noise}{tag_suffix}.jsonl")
     rate_pct = int(round(ratio * 100))
-    return PRED_DIR / f"pred_seed{seed}__{config_name}__{dataset}__{noise}__r{rate_pct}.jsonl"
+    return PRED_DIR / (f"pred_seed{seed}__{config_name}__{dataset}"
+                       f"__{noise}__r{rate_pct}{tag_suffix}.jsonl")
 
 
 def _load_noisy(p: Path) -> List[dict]:

@@ -13,7 +13,7 @@ Big oracle_sent - lad_rg gap  => selection is the bottleneck (better decode help
 Small gap (oracle_sent ~ lad_rg) => generation is the bottleneck (need better Coder).
 """
 from __future__ import annotations
-import argparse, json
+import argparse, json, os
 from pathlib import Path
 from typing import List
 
@@ -66,13 +66,18 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--method", default="selectdenoise_full",
                     help="prediction config whose logged candidate pool to analyse")
+    ap.add_argument("--tag", default=os.environ.get("BACKBONE_TAG", "").strip(),
+                    help="backbone tag suffix on prediction filenames "
+                         "(defaults to $BACKBONE_TAG; noisy files are untagged)")
     args = ap.parse_args(argv)
+    tag_suffix = f"__{args.tag}" if args.tag else ""
 
     print(f"\n{'cell':<18}{'dirty':>8}{'majority':>9}{'method':>8}"
           f"{'oracleS':>9}{'oracleT':>9}{'selGap':>8}")
     print("-" * 68)
     for nt in args.noise:
-        pf = PRED / f"pred_seed{args.seed}__{args.method}__{args.dataset}__{nt}.jsonl"
+        pf = (PRED / f"pred_seed{args.seed}__{args.method}__{args.dataset}"
+                     f"__{nt}{tag_suffix}.jsonl")
         nf = NOISY / f"noisy_seed{args.seed}__{nt}__{args.dataset}__N200.jsonl"
         if not pf.exists() or not nf.exists():
             print(f"{args.dataset}/{nt:<10} [missing]"); continue

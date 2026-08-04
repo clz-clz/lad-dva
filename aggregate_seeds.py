@@ -20,7 +20,7 @@ import numpy as np
 
 from metrics import (compute_prf1, compute_ser, token_class_rates,
                      paired_bootstrap_f1, significance_marker)
-from run_multiseed import (CONFIGURATIONS, DATASETS, NOISE_TYPES,
+from run_multiseed import (BACKBONE_TAG, CONFIGURATIONS, DATASETS, NOISE_TYPES,
                            PRED_DIR, SEEDS, _pred_path)
 
 
@@ -301,8 +301,10 @@ def main(argv=None):
         if bs is not None:
             cell["bootstrap_vs_ref"] = bs
 
-    # Persist JSON for downstream use
-    out_json = PRED_DIR / "aggregated.json"
+    # Persist JSON for downstream use. Namespaced by backbone so a second
+    # backbone's aggregate does not clobber the first (unset → aggregated.json).
+    out_json = PRED_DIR / (f"aggregated__{BACKBONE_TAG}.json" if BACKBONE_TAG
+                           else "aggregated.json")
     serial = {f"{m}|{d}|{n}": v for (m, d, n), v in cells.items()}
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(serial, f, indent=2)
