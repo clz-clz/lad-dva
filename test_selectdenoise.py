@@ -106,21 +106,34 @@ def test_noise_aware_legalization():
     assert legalize_noise_aware(["I-LOC", "O", "I-ORG"], V, "promote") \
         == enforce_iob2_syntax(["I-LOC", "O", "I-ORG"], V)
 
-    # verifier_node-level: same uncontested vote, opposite policy per noise_type.
-    # All paths identical -> vote = ["O","I-PER"] (dangling); verifier does not
-    # fire the LLM, so the only difference is the noise-aware legalization.
+    # verifier_node-level: same dangling input, opposite policy per noise_type.
+    # Driven through the no-candidates fallback, which legalizes dirty_tags
+    # directly. (The BT/IF *decode* path can no longer exercise this: since the
+    # noise-adaptive change, _base_decode runs a global IOB2-constrained
+    # Viterbi there, so it emits legal sequences by construction and never
+    # leaves a dangling I- for the policy to fix.)
     _patch_llm("llm", lambda p: (_ for _ in ()).throw(
         AssertionError("verifier must not call LLM here")))
     M._init_deer("conll2003")
-    cands = [["O", "I-PER"]] * 3
-    common = dict(tokens=["a", "b"], dirty_tags=["O", "I-PER"],
-                  candidate_paths=cands, rag_weights=[1, 1, 1],
-                  dataset_name="conll2003", use_verifier=True,
-                  verify_all=False, verifier_topk=4)
-    out_if = asyncio.run(M.verifier_node(dict(common, noise_type="IF")))
-    out_bt = asyncio.run(M.verifier_node(dict(common, noise_type="BT")))
+    fallback = dict(tokens=["a", "b"], dirty_tags=["O", "I-PER"],
+                    candidate_paths=[], rag_weights=[],
+                    dataset_name="conll2003", use_verifier=True,
+                    verify_all=False, verifier_topk=4)
+    out_if = asyncio.run(M.verifier_node(dict(fallback, noise_type="IF")))
+    out_bt = asyncio.run(M.verifier_node(dict(fallback, noise_type="BT")))
     assert out_if["current_tags"] == ["O", "O"], out_if       # demote: FP killed
     assert out_bt["current_tags"] == ["O", "B-PER"], out_bt    # promote: recovered
+
+    # The BT/IF global decode is legal by construction (SER=0 with no repair):
+    # an all-dangling candidate pool must still yield a legal sequence.
+    from metrics import compute_ser
+    for nt in ("BT", "IF"):
+        out = asyncio.run(M.verifier_node(dict(
+            tokens=["Peter", "Smith"], dirty_tags=["O", "I-PER"],
+            candidate_paths=[["O", "I-PER"]] * 3, rag_weights=[1, 1, 1],
+            dataset_name="conll2003", use_verifier=True, verify_all=False,
+            verifier_topk=4, noise_type=nt)))
+        assert compute_ser([out["current_tags"]]) == 0.0, (nt, out)
     print("[5] noise-aware legalization OK (IF demote, BT/ATF promote, SER=0)")
 
 

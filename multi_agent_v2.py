@@ -28,8 +28,8 @@ BACKBONE_MODEL    = os.environ.get("BACKBONE_MODEL", "deepseek-chat")
 BACKBONE_BASE_URL = os.environ.get("BACKBONE_BASE_URL", "https://api.deepseek.com")
 BACKBONE_API_KEY  = (os.environ.get("BACKBONE_API_KEY")
                      or os.environ.get("DEEPSEEK_API_KEY"))
-# Short tag for namespacing prediction files per backbone (cross-backbone runs).
-BACKBONE_TAG = os.environ.get("BACKBONE_TAG", "")
+# $BACKBONE_TAG namespaces prediction filenames per backbone; it is owned by
+# run_multiseed.py, which builds those paths (see _pred_path there).
 
 llm = ChatOpenAI(
     model=BACKBONE_MODEL,
@@ -1044,6 +1044,44 @@ def _spans_str(tokens: List[str], tags: List[str]) -> str:
     return "; ".join(out) if out else "(no entities)"
 
 
+# Entity-potential weight for the BT/IF global decode. ω(t) from DEER is small
+# (~0.001-0.03), so β scales it against candidate fidelity (which lives in
+# [0,1]). F1 sits on a flat plateau for β in [1,3] and collapses by β=10; the
+# value was selected on seed 13 alone and validated on the held-out seeds.
+GASD_BETA_OMEGA = 2.0
+
+
+def _base_decode(candidate_paths: List[List[str]], weights: List[float],
+                 tokens: List[str], dirty_tags: List[str],
+                 dataset_name: str, noise_type: str) -> List[str]:
+    """Noise-adaptive base decode over the candidate pool.
+
+    BT/IF corrupt entities *locally* (a dropped boundary or interior tag), so
+    the correct labeling is a globally coherent span that per-position voting
+    fragments. A global IOB2-constrained Viterbi over the candidate
+    distribution recovers it: +0.054 F1 on BT and +0.006 on IF (macro over 5
+    datasets x 3 seeds, re-decoded on fixed candidate pools), at SER=0.00 by
+    construction rather than by post-hoc repair.
+
+    ATF instead flips a whole span's TYPE, which is a selection problem the LLM
+    Verifier handles; there the global decode is slightly harmful (-0.004), so
+    ATF keeps the weighted vote. consensus_ratio=0.7 there keeps more of the
+    (reliable) dirty tag on low-agreement positions.
+
+    Falls back to the vote when DEER statistics are unavailable (e.g. dummy
+    mode): ω would degrade to a constant, making the entity potential a flat
+    bias that swamps candidate fidelity.
+    """
+    if noise_type in ("BT", "IF") and _deer_stats.get(dataset_name) is not None:
+        return _gasd_viterbi_decode(
+            candidate_paths, weights, tokens,
+            _omega_weights(tokens, dataset_name), {},
+            DATASET_ENTITY_TYPES.get(dataset_name, ["PER", "LOC", "ORG"]),
+            use_potentials=True, beta_omega=GASD_BETA_OMEGA)
+    return _weighted_majority_voting(candidate_paths, weights, entity_boost=1.0,
+                                     dirty_tags=dirty_tags, consensus_ratio=0.7)
+
+
 async def verifier_node(state: State):
     """SelectDenoise Lever 2: on contested sentences, ask the LLM to SELECT the
     single best complete IOB2 labeling among the distinct candidate paths (the
@@ -1070,11 +1108,9 @@ async def verifier_node(state: State):
     if len(weights) != len(candidate_paths):
         weights = [1.0] * len(candidate_paths)
 
-    # Base / fallback = weighted vote. consensus_ratio=0.7 keeps more of the
-    # (reliable) dirty tag on low-agreement positions — a do-no-harm bias that
-    # helps generation-bound noise without hurting ATF (empirically >= 0.6).
-    base = _weighted_majority_voting(candidate_paths, weights, entity_boost=1.0,
-                                     dirty_tags=dirty_tags, consensus_ratio=0.7)
+    # Base / fallback: noise-adaptive (global Viterbi on BT/IF, vote on ATF).
+    base = _base_decode(candidate_paths, weights, tokens, dirty_tags,
+                        ds, state.get("noise_type"))
     base = legalize_noise_aware(base, valid_set, dangling_policy)
 
     # Fire only on TYPE-contested sentences (selection-bound / ATF signature);
