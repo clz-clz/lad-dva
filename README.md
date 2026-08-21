@@ -93,7 +93,9 @@ Each line:
 
 ## Configuration
 
-The two main methods are enabled by default in `run_multiseed.py`:
+The legacy LAD-DVA examples below describe the original runner options.  For
+new denoising runs, `run_multiseed.py` defaults to the locked contextual-lattice
+terminal; the legacy SelectDenoise graph remains an explicit rollback option.
 
 ```python
 CONFIGURATIONS = {
@@ -118,6 +120,23 @@ python aggregate_seeds.py > smoke_table.tex     # confirm table format
 
 This verifies all four scripts work and your output paths are right *before*
 you spend any DeepSeek API quota.
+
+## Locked contextual-lattice terminal
+
+New future runs default to the versioned `selectdenoise_contextual_lattice`
+configuration when `CONTEXTUAL_LATTICE_BUNDLE` points at the frozen runtime
+bundle.  The terminal is an offline, exact interval decoder with an anchor
+fallback; it makes no additional provider calls.  The reversible
+`selectdenoise_full_legacy` configuration preserves the historical graph.
+
+The complete procedure, allow-list, provenance, and locked 450-row metrics are
+documented in
+[`docs/contextual_lattice/CONTEXTUAL_LATTICE_V1.md`](docs/contextual_lattice/CONTEXTUAL_LATTICE_V1.md),
+with machine-readable records in
+[`metrics_450.json`](docs/contextual_lattice/metrics_450.json) and
+[`frozen_manifest.json`](docs/contextual_lattice/frozen_manifest.json).  The
+artifact is a development candidate only: its locked gate is 12/15 positive
+cells, so the formal 13/15 requirement remains unmet.
 
 ## Cost estimate (real run)
 

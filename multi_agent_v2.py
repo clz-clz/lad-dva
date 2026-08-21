@@ -3,7 +3,10 @@ import logging
 import os
 import json
 import re
+import hashlib
+import threading
 from collections import Counter
+from pathlib import Path
 from typing import Annotated, TypedDict, List, Tuple
 from dotenv import load_dotenv
 import argparse
@@ -467,6 +470,122 @@ def _all_paths_identical(paths: List[List[str]]) -> bool:
 
 _deer_stats = {}     # dataset_name -> DEERStatistics
 _deer_retriever = {}  # dataset_name -> DEERRetriever
+
+# The contextual lattice is an optional terminal replacement.  It is loaded
+# once per process only when the versioned configuration requests it; legacy
+# SelectDenoise behavior does not import the frozen encoder or bundle.
+_contextual_lattice_terminal = None
+_contextual_lattice_bundle_path = None
+_contextual_lattice_load_lock = threading.Lock()
+
+
+class ContextualLatticeError(RuntimeError):
+    """A terminal configuration/input error that must not become dirty output."""
+
+
+def _load_contextual_lattice_terminal():
+    """Load the frozen, gold-free terminal bundle exactly once."""
+    global _contextual_lattice_terminal, _contextual_lattice_bundle_path
+    try:
+        bundle_text = os.environ.get("CONTEXTUAL_LATTICE_BUNDLE", "").strip()
+        if not bundle_text:
+            raise RuntimeError("CONTEXTUAL_LATTICE_BUNDLE is required for contextual-lattice-v1")
+        bundle_path = os.path.abspath(bundle_text)
+        with _contextual_lattice_load_lock:
+            if _contextual_lattice_terminal is not None:
+                if _contextual_lattice_bundle_path != bundle_path:
+                    raise RuntimeError("A different contextual lattice bundle was requested after initialization")
+                return _contextual_lattice_terminal
+            manifest_path = os.path.join(bundle_path, "manifest.json")
+            if not os.path.exists(manifest_path):
+                raise FileNotFoundError(f"Contextual lattice manifest not found: {manifest_path}")
+            from contextual_lattice_runtime import (
+                LOCKED_BUNDLE_MANIFEST_HASH,
+                LOCKED_CHECKPOINT_HASH,
+                LOCKED_DECODER_FILE_HASH,
+                LOCKED_DECODER_MODEL_HASH,
+                LOCKED_GATE_FILE_HASH,
+                LOCKED_SPLIT_HASH,
+                load_bundle,
+            )
+            if hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest() != LOCKED_BUNDLE_MANIFEST_HASH:
+                raise ValueError("Contextual lattice manifest is not the locked v1 artifact")
+            with open(manifest_path, "r", encoding="utf-8") as handle:
+                manifest = json.load(handle)
+            checkpoint = manifest.get("checkpoint")
+            checkpoint_hash = manifest.get("checkpoint_hash")
+            if not checkpoint or not checkpoint_hash:
+                raise ValueError("Contextual lattice bundle is missing checkpoint provenance")
+            if checkpoint_hash != LOCKED_CHECKPOINT_HASH or manifest.get("split_hash") != LOCKED_SPLIT_HASH:
+                raise ValueError("Contextual lattice bundle provenance does not match locked v1")
+            from selectdenoise_contextual_lattice import GLiNERContextEncoder
+
+            device = os.environ.get("CONTEXTUAL_LATTICE_DEVICE", "cuda")
+            cache_dir = os.environ.get(
+                "CONTEXTUAL_LATTICE_ENCODER_CACHE",
+                os.path.join(bundle_path, "embedding_cache"),
+            )
+            encoder = GLiNERContextEncoder(
+                checkpoint,
+                {"PER", "LOC", "ORG", "MISC"},
+                device=device,
+                cache_dir=cache_dir,
+            )
+            _contextual_lattice_terminal = load_bundle(
+                Path(bundle_path),
+                encoder,
+                expected_checkpoint_hash=LOCKED_CHECKPOINT_HASH,
+                expected_split_hash=LOCKED_SPLIT_HASH,
+                expected_manifest_hash=LOCKED_BUNDLE_MANIFEST_HASH,
+                expected_decoder_file_hash=LOCKED_DECODER_FILE_HASH,
+                expected_gate_file_hash=LOCKED_GATE_FILE_HASH,
+                expected_decoder_model_hash=LOCKED_DECODER_MODEL_HASH,
+            )
+            _contextual_lattice_bundle_path = bundle_path
+            logging.info(
+                "[ContextualLattice] loaded bundle=%s model=%s checkpoint=%s",
+                bundle_path,
+                _contextual_lattice_terminal.model_hash,
+                checkpoint_hash,
+            )
+            return _contextual_lattice_terminal
+    except ContextualLatticeError:
+        raise
+    except Exception as exc:
+        raise ContextualLatticeError("Contextual lattice bundle validation failed") from exc
+
+
+def _apply_contextual_lattice_terminal(state: State, terminal):
+    """Apply the terminal using only the allow-listed model-facing fields."""
+    tokens = list(state.get("tokens", []))
+    dirty_tags = list(state.get("dirty_tags", []))
+    anchor_tags = list(state.get("current_tags", [])) or list(dirty_tags)
+    candidate_paths = state.get("candidate_paths", []) or []
+    reviewer_weights = state.get("rag_weights", []) or []
+    dataset_name = state.get("dataset_name", "conll2003")
+    valid_types = frozenset(DATASET_ENTITY_TYPES.get(dataset_name, DATASET_ENTITY_TYPES["conll2003"]))
+    try:
+        result = terminal.decode(
+            tokens=tokens,
+            dirty_tags=dirty_tags,
+            anchor_tags=anchor_tags,
+            candidate_paths=candidate_paths,
+            reviewer_weights=reviewer_weights,
+            valid_types=valid_types,
+            deer_stats=terminal.sentence_deer_stats(tokens),
+        )
+    except Exception as exc:
+        raise ContextualLatticeError("Contextual lattice sentence validation failed") from exc
+    tags = list(result.tags)
+    if len(tags) != len(tokens):
+        tags = anchor_tags
+    return {
+        "current_tags": tags,
+        "terminal_model_hash": result.model_hash,
+        "terminal_used_anchor": bool(result.used_anchor),
+        "terminal_predicted_gain": float(result.predicted_gain),
+        "terminal_fallback_count": int(terminal.fallback_count),
+    }
 
 
 def _init_deer(dataset_name: str = "conll2003"):
@@ -1233,6 +1352,11 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         dataset_name = "conll2003"
 
     noise_type = config.get("__noise_type__", "BT")
+    terminal = None
+    if config.get("terminal_decoder") == "contextual-lattice-v1":
+        # Load before opening any sentence work so a missing/mismatched bundle
+        # is visible to the orchestrator instead of silently changing methods.
+        terminal = _load_contextual_lattice_terminal()
 
     initial_state = {
         "messages": [],
@@ -1263,16 +1387,21 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
     return_candidates = bool(config.get("__return_candidates__"))
     cand: List[List[str]] = []
     weights: List[float] = []
+    terminal_metadata = {}
     try:
         final_state = await multi_agent_graph.ainvoke(initial_state)
         predicted_tags = final_state.get("current_tags", [])
         if not predicted_tags or len(predicted_tags) != len(tokens):
             predicted_tags = dirty_tags
-        else:
-            cand = final_state.get("candidate_paths", []) or []
-            weights = final_state.get("rag_weights", []) or [1.0] * len(cand)
+        cand = final_state.get("candidate_paths", []) or []
+        weights = final_state.get("rag_weights", []) or [1.0] * len(cand)
+        if terminal is not None:
+            terminal_metadata = _apply_contextual_lattice_terminal(final_state, terminal)
+            predicted_tags = terminal_metadata["current_tags"]
     except Exception as e:
         logging.error(f"[-] Pipeline : {e}")
+        if terminal is not None:
+            raise
         predicted_tags = dirty_tags
 
     if not return_candidates:
@@ -1282,6 +1411,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "candidate_paths": cand,
         "rag_weights": weights,
         "confidence": _per_position_confidence(cand, weights, predicted_tags),
+        **terminal_metadata,
     }
 
 

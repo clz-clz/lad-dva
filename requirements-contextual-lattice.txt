@@ -1,0 +1,10 @@
+# Frozen offline runtime versions used for contextual-lattice-v1.
+# Interpreter: Python 3.9.7; the locked environment provides torch 2.5.1+cu121.
+torch==2.5.1
+scikit-learn==1.6.1
+transformers==4.57.6
+tokenizers==0.22.2
+joblib>=1.4
+
+# GLiNER is loaded from the project-local cached runtime instead of fetched
+# from the network.  Set PYTHONPATH to runtime_deps/gliner before execution.

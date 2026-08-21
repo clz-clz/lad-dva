@@ -1,0 +1,106 @@
+{
+  "artifact": "anchor-aware-contextual-lattice-v1",
+  "status": "locked-development-candidate",
+  "branch": "codex/selectdenoise-contextual-lattice",
+  "baseline_commit": "e1ae1d8a78ea36131d77270b748b92aa0730bbb7",
+  "historical_tag": "selectdenoise-full-historical-e1ae1d8",
+  "locked_tag": "selectdenoise-contextual-lattice-v1",
+  "schema_version": "contextual-lattice-v1",
+  "seed": 731,
+  "split_salt": "selectdenoise-contextual-lattice-v1-20260820",
+  "split_hash": "fe4b00d32e655a334e8451e57a49f8d505047b313308bb5d60df0084865d421a",
+  "rows": {
+    "source": 9000,
+    "train": 6201,
+    "calibration": 450,
+    "test": 450,
+    "groups_per_cell": 30,
+    "cells": 15
+  },
+  "training": {
+    "epochs": 20,
+    "batch_size": 16,
+    "device": "cuda",
+    "optimizer": "AdamW",
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "gradient_clip": 1.0,
+    "margin": -0.1,
+    "gate": "HistGradientBoostingRegressor(max_iter=200, learning_rate=0.05, max_leaf_nodes=15, min_samples_leaf=20, l2_regularization=1.0, random_state=731)"
+  },
+  "checkpoint": {
+    "path": "unified_experiment_20260816/hf_home/hub/models--urchade--gliner_multi-v2.1/snapshots/443d26d654e0324125a96bebd8e796c14ff2efe6",
+    "sha256": "2100142f31627531497850659dcb3821c99d5e71c08a8e01a98e4b11ef32a199"
+  },
+  "bundle": {
+    "path": "unified_experiment_20260816/contextual_lattice_run_lock_bundle_20260821/bundle",
+    "manifest_sha256": "b24d4d5485e92e5513db246c48ed8d5258bd70b69c31889ae7d393186bda7825",
+    "decoder_sha256": "cc12773a2ee56db0c79452fff10b9f1cd026219c0aada21805e728ab02f717ca",
+    "gate_sha256": "2cd1febab79bdb1293852e1c607cd3496e3133329d073d67cd9028d3c874097c",
+    "decoder_model_sha256": "2b45770a128cc5a716d3c7dbdc75ab059afc1a1b9ed471ea5cf1bd4f2a150e4e"
+  },
+  "trusted_runtime_hash_pins": {
+    "checkpoint_sha256": "2100142f31627531497850659dcb3821c99d5e71c08a8e01a98e4b11ef32a199",
+    "split_sha256": "fe4b00d32e655a334e8451e57a49f8d505047b313308bb5d60df0084865d421a",
+    "manifest_sha256": "b24d4d5485e92e5513db246c48ed8d5258bd70b69c31889ae7d393186bda7825",
+    "decoder_file_sha256": "cc12773a2ee56db0c79452fff10b9f1cd026219c0aada21805e728ab02f717ca",
+    "gate_file_sha256": "2cd1febab79bdb1293852e1c607cd3496e3133329d073d67cd9028d3c874097c",
+    "decoder_model_sha256": "2b45770a128cc5a716d3c7dbdc75ab059afc1a1b9ed471ea5cf1bd4f2a150e4e"
+  },
+  "predictions": {
+    "path": "unified_experiment_20260816/contextual_lattice_run_lock_bundle_20260821/predictions_gold_free.jsonl",
+    "sha256": "54b54b1cd37e24de8fd04d1e43b67cd674e58ef95a6648d071c819f63e763be1",
+    "repeat_sha256": "54b54b1cd37e24de8fd04d1e43b67cd674e58ef95a6648d071c819f63e763be1"
+  },
+  "replay": {
+    "command": "PYTHONPATH=runtime_deps/gliner D:/py/Anaconda3/python.exe run_contextual_lattice_gate.py --workspace C:/Users/LinzeChen/AI_Workspace --output unified_experiment_20260816/contextual_lattice_run_lock_bundle_20260821 --encoder-cache unified_experiment_20260816/contextual_lattice_run_retry_alignment_20260820/embedding_cache --device cuda --epochs 20",
+    "api_calls": 0,
+    "external_cost_usd": 0.0,
+    "locked_runtime_seconds": 1493.374335,
+    "replay_runtime_seconds": 1134.0702674,
+    "safety": {
+      "ser": 0,
+      "invalid_lengths": 0,
+      "clean_rows": 69,
+      "clean_changes": 0,
+      "clean_regressions": 0
+    }
+  },
+  "runtime_versions": {
+    "python": "3.9.7",
+    "torch": "2.5.1+cu121",
+    "scikit_learn": "1.6.1",
+    "transformers": "4.57.6",
+    "tokenizers": "0.22.2",
+    "gliner": "project-local cached runtime"
+  },
+  "source_sha256": {
+    "selectdenoise_contextual_lattice.py": "2d6e370468f0e4476841c2c665d9fe4a788db8cf958e31174945f14f6d92dce7",
+    "contextual_lattice_runtime.py": "3a381e6650fc194cb9acd010090b0af76fb028f271fb4e320326bd6d8c107853",
+    "run_contextual_lattice_gate.py": "3950140938b5f24d7a4672b0e5a6fdd21d53d6686ca7227cd6cda83c5c816a75",
+    "multi_agent_v2.py": "f0e4b9d0b05d8d9fe2c0f675c3d5c9a1dad07c9dabe2d30f056ae6b045fc978f",
+    "run_multiseed.py": "6bea2a6901538cc3c20b978dfaf40dd7addf7f2e86d6840a3a429bac43618e80",
+    "test_contextual_lattice.py": "f3d3dd873a1598334409476c4782d2fd94f28faae03b67c9cd6120b9e3735052",
+    "test_contextual_lattice_runtime.py": "13c24b3449579efd7b8f4b7598383ac2ac2a0654c94ab1561e911b4f06201a4c"
+  },
+  "preserved": {
+    "historical_worktree": ".worktrees/selectdenoise-e1ae1d8",
+    "dirty_worktree": "codex/unified-risk-calibrated-snapshot",
+    "prior_result_directories": [
+      "contextual_lattice_run_5f9fd961f40ae807_450",
+      "contextual_lattice_run_retry_dirty_20260820",
+      "contextual_lattice_run_retry_alignment_20260820",
+      "contextual_lattice_run_retry_batch_20260820",
+      "contextual_lattice_run_retry_batchedp_20260820",
+      "contextual_lattice_run_retry_evalfix_20260820",
+      "contextual_lattice_run_retry_envfix_20260820",
+      "contextual_lattice_run_lock_bundle_20260821",
+      "contextual_lattice_run_runtime_reload_20260821"
+    ]
+  },
+  "formal_gate": {
+    "required_positive_cells": 13,
+    "observed_positive_cells": 12,
+    "claim": "not met; development candidate only"
+  }
+}

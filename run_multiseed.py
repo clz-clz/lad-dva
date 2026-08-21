@@ -55,8 +55,19 @@ PER_REQUEST_TIMEOUT = 180  # seconds per sentence; straggler → dirty fallback
 
 # Configurations — each key maps to either a pipeline config or a standalone method.
 CONFIGURATIONS: Dict[str, dict] = {
+    # Locked v1 terminal: existing Coder/Reviewer graph plus the frozen
+    # contextual lattice replacement.  The bundle is loaded at inference time
+    # from CONTEXTUAL_LATTICE_BUNDLE; no fitting occurs here.
+    "selectdenoise_contextual_lattice": {
+        "terminal_decoder": "contextual-lattice-v1",
+        "deanchor_atf": True,
+        "use_verifier": True,
+    },
     # SelectDenoise: Coder(+ATF de-anchoring) -> Reviewer(LADS/DEER) -> Verifier
     "selectdenoise_full":        {"deanchor_atf": True,  "use_verifier": True},
+    # Explicit rollback name for new runs; historical selectdenoise_full files
+    # remain addressable and are never overwritten by the versioned config.
+    "selectdenoise_full_legacy": {"deanchor_atf": True,  "use_verifier": True},
     # Ablations to attribute the gain to each lever
     "selectdenoise_no_verifier": {"deanchor_atf": True,  "use_verifier": False},
     "selectdenoise_no_deanchor": {"deanchor_atf": False, "use_verifier": True},
@@ -80,6 +91,7 @@ CONFIGURATIONS: Dict[str, dict] = {
 NOISY_DIR = Path("results_multiseed")
 PRED_DIR  = Path("predictions_multiseed")
 PRED_DIR.mkdir(exist_ok=True)
+DEFAULT_CONFIGS = ["selectdenoise_contextual_lattice"]
 
 # Short tag namespacing prediction files per backbone, so a cross-backbone run
 # writes new files instead of being skipped by the resume check. Unset (the
@@ -291,7 +303,8 @@ async def _run_one_cell(config_name: str, config: dict,
                 cfg["__seed__"] = seed
             # Log the Coder candidate pool for the main methods only (oracle /
             # selection analysis); keeps ablation prediction files lean.
-            if config_name in ("selectdenoise_full", "selectdenoise_no_deanchor",
+            if config_name in ("selectdenoise_contextual_lattice", "selectdenoise_full",
+                               "selectdenoise_full_legacy", "selectdenoise_no_deanchor",
                                "lad_rg_full"):
                 cfg["__return_candidates__"] = True
             extra: dict = {}
@@ -314,16 +327,22 @@ async def _run_one_cell(config_name: str, config: dict,
                 # MSRA input) must not stall the whole cell's async gather.
                 pred = await asyncio.wait_for(_call(), timeout=PER_REQUEST_TIMEOUT)
             except asyncio.TimeoutError:
+                if config.get("terminal_decoder") == "contextual-lattice-v1":
+                    raise RuntimeError("Contextual lattice sentence timed out; refusing dirty substitution")
                 logging.warning(f"[timeout] sentence {i} exceeded "
                                 f"{PER_REQUEST_TIMEOUT}s; using dirty as fallback")
                 pred = list(dirty)
             except Exception as e:                       # noqa: BLE001
+                if config.get("terminal_decoder") == "contextual-lattice-v1":
+                    raise
                 logging.error(f"[!] sentence {i} failed ({e!r}); using dirty as fallback")
                 pred = list(dirty)
             # Candidate-rich return (dict) → unpack pred_tags + extra fields.
             if isinstance(pred, dict):
                 extra = {k: pred[k] for k in
-                         ("candidate_paths", "rag_weights", "confidence")
+                         ("candidate_paths", "rag_weights", "confidence",
+                          "terminal_model_hash", "terminal_used_anchor",
+                          "terminal_predicted_gain", "terminal_fallback_count")
                          if k in pred}
                 pred = pred.get("pred_tags", list(dirty))
             # Length alignment (defensive)
@@ -367,7 +386,7 @@ async def _run_one_cell(config_name: str, config: dict,
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--configs",  nargs="+", default=list(CONFIGURATIONS.keys()))
+    ap.add_argument("--configs",  nargs="+", default=DEFAULT_CONFIGS)
     ap.add_argument("--datasets", nargs="+", default=DATASETS)
     ap.add_argument("--noise",    nargs="+", default=NOISE_TYPES,
                     choices=NOISE_TYPES)
