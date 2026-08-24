@@ -84,18 +84,22 @@ def _aggregate_cell(method: str, dataset: str, noise: str) -> Optional[dict]:
     if not seeds_data:
         return None
     f1s, ps, rs, sers = [], [], [], []
-    o_rates, gold_o_rates = [], []
+    o_rates, entity_rates, gold_o_rates = [], [], []
     per_seed = []
     for s, g, pr in seeds_data:
         m = compute_prf1(g, pr)
         ser = compute_ser(pr)
-        o_pred = token_class_rates(pr)["o_rate"]
+        pred_rates = token_class_rates(pr)
+        o_pred = pred_rates["o_rate"]
+        entity_pred = pred_rates["entity_rate"]
         o_gold = token_class_rates(g)["o_rate"]
         f1s.append(m["f1"]); ps.append(m["precision"])
         rs.append(m["recall"]); sers.append(ser)
-        o_rates.append(o_pred); gold_o_rates.append(o_gold)
+        o_rates.append(o_pred); entity_rates.append(entity_pred)
+        gold_o_rates.append(o_gold)
         per_seed.append({"seed": s, **m, "ser": ser,
-                         "o_rate": o_pred, "gold_o_rate": o_gold})
+                         "o_rate": o_pred, "entity_rate": entity_pred,
+                         "gold_o_rate": o_gold})
 
     def m_sd(a):
         a = np.asarray(a)
@@ -106,6 +110,7 @@ def _aggregate_cell(method: str, dataset: str, noise: str) -> Optional[dict]:
     r_m,  r_sd  = m_sd(rs)
     ser_m, ser_sd = m_sd(sers)
     o_m,  o_sd  = m_sd(o_rates)
+    entity_m, entity_sd = m_sd(entity_rates)
     gold_o_m, _ = m_sd(gold_o_rates)
     return {
         "n_seeds":  len(seeds_data),
@@ -115,6 +120,7 @@ def _aggregate_cell(method: str, dataset: str, noise: str) -> Optional[dict]:
         "ser_mean": ser_m, "ser_std": ser_sd,
         # Lazy-Erasure diagnostics: pred O-rate vs. the gold O-rate reference.
         "o_rate_mean": o_m, "o_rate_std": o_sd,
+        "entity_rate_mean": entity_m, "entity_rate_std": entity_sd,
         "gold_o_rate_mean": gold_o_m,
         "per_seed": per_seed,
     }
