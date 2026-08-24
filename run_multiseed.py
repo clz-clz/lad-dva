@@ -272,6 +272,7 @@ async def _run_one_cell(config_name: str, config: dict,
                         ratio: float = 0.15):
     default_fn, baseline_fns = pipelines
     pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
+    pred_p.parent.mkdir(parents=True, exist_ok=True)
     if pred_p.exists() and pred_p.stat().st_size > 0:
         logging.info(f"[skip] {pred_p.name}")
         return

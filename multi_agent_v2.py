@@ -1325,6 +1325,26 @@ def _per_position_confidence(candidate_paths: List[List[str]],
     return conf
 
 
+def _normalize_candidate_evidence(candidate_paths: List[List[str]],
+                                  weights: List[float],
+                                  expected_length: int) -> Tuple[List[List[str]], List[float]]:
+    """Make candidate evidence safe to persist alongside a sentence.
+
+    Every path is clipped/padded to the sentence length, and weights are made
+    one-per-path so downstream consumers never need to special-case malformed
+    partial evidence from intermediate pipeline states.
+    """
+    normalized_paths = [
+        list(path[:expected_length]) + ["O"] * max(0, expected_length - len(path))
+        for path in candidate_paths
+    ]
+    normalized_weights = [
+        float(weights[i]) if i < len(weights) else 1.0
+        for i in range(len(normalized_paths))
+    ]
+    return normalized_paths, normalized_weights
+
+
 async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
                               config: dict = None,
                               dataset_name: str = None):
@@ -1406,6 +1426,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
 
     if not return_candidates:
         return predicted_tags
+    cand, weights = _normalize_candidate_evidence(cand, weights, len(predicted_tags))
     return {
         "pred_tags": predicted_tags,
         "candidate_paths": cand,
