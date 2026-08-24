@@ -131,3 +131,64 @@ Observed result:
 - regression reproduced with real file-backed aggregation inputs
 - fix is localized to gold-reference row selection
 - method ordering no longer affects whether the gold row appears
+
+---
+
+## Review Fix Round 2 — deduplicate gold reference by dataset
+
+### Finding
+
+The round-1 `gold_reference()` fix still averaged `gold_o_rate_mean` across every matching method/dataset cell for a noise type. Under uneven coverage, that over-counted datasets covered by more than one requested method. Example: dataset coverage `A,B` from one method plus `A` from another incorrectly averaged `A,B,A` instead of `A,B`.
+
+### RED evidence
+
+Test command:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest C:/Users/LinzeChen/AI_Workspace/.worktrees/selectdenoise-contextual-lattice/test_aggregate_seeds.py -q
+```
+
+Observed failure:
+
+```text
+FAILED test_aggregate_seeds.py::test_prf_orate_latex_keeps_gold_reference_with_partial_method_coverage
+E       AssertionError
+```
+
+The extended regression test writes real prediction JSONL files for two datasets with uneven method coverage:
+
+- `baseline_zero_shot`: `msra`, `conll2003`
+- `baseline_self_refine`: `msra` only
+
+The correct deduplicated gold reference is `(0.500 + 0.250) / 2 = 0.375`; the buggy implementation over-counted `msra` and failed that assertion.
+
+### Fix
+
+- kept the existing output contract
+- changed `gold_reference()` to scan datasets first and select one available `gold_o_rate_mean` per dataset for the noise type, using a stable method choice independent of the requested method order
+
+### GREEN evidence
+
+Re-run command:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest C:/Users/LinzeChen/AI_Workspace/.worktrees/selectdenoise-contextual-lattice/test_aggregate_seeds.py -q
+```
+
+Observed result:
+
+```text
+.......                                                                  [100%]
+7 passed in 1.32s
+```
+
+### Files changed in this round
+
+- `C:\Users\LinzeChen\AI_Workspace\.worktrees\selectdenoise-contextual-lattice\aggregate_seeds.py`
+- `C:\Users\LinzeChen\AI_Workspace\.worktrees\selectdenoise-contextual-lattice\test_aggregate_seeds.py`
+
+### Self-review
+
+- regression remains real file-backed
+- gold reference now uses each covered dataset once per noise type
+- requested method ordering no longer affects dataset inclusion or weighting

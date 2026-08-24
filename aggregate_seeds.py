@@ -232,11 +232,13 @@ def emit_prf_orate_latex(cells: Dict[Tuple[str, str, str], dict],
         return float(np.mean(vals)) if vals else None
 
     def gold_reference(nt: str) -> Optional[float]:
-        vals = [
-            cell["gold_o_rate_mean"]
-            for (method, ds, noise), cell in cells.items()
-            if noise == nt and method in methods
-        ]
+        vals = []
+        for ds in DATASETS:
+            for method in sorted(set(methods)):
+                cell = cells.get((method, ds, nt))
+                if cell is not None:
+                    vals.append(cell["gold_o_rate_mean"])
+                    break
         return float(np.mean(vals)) if vals else None
 
     L: List[str] = []

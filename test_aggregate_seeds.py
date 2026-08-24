@@ -99,12 +99,11 @@ def test_prf_orate_latex_keeps_gold_reference_with_partial_method_coverage(
     monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
     monkeypatch.setattr(run_multiseed, "BACKBONE_TAG", "")
     monkeypatch.setattr(aggregate_seeds, "SEEDS", [13])
-    monkeypatch.setattr(aggregate_seeds, "DATASETS", ["msra"])
+    monkeypatch.setattr(aggregate_seeds, "DATASETS", ["msra", "conll2003"])
     monkeypatch.setattr(aggregate_seeds, "NOISE_TYPES", ["BT"])
 
-    covered_path = run_multiseed._pred_path("baseline_zero_shot", "msra", "BT", 13)
     _write_jsonl(
-        covered_path,
+        run_multiseed._pred_path("baseline_zero_shot", "msra", "BT", 13),
         [
             {
                 "tokens": ["Alice", "met", "Bob", "today"],
@@ -113,15 +112,36 @@ def test_prf_orate_latex_keeps_gold_reference_with_partial_method_coverage(
             }
         ],
     )
+    _write_jsonl(
+        run_multiseed._pred_path("baseline_zero_shot", "conll2003", "BT", 13),
+        [
+            {
+                "tokens": ["New", "York", "hosts", "Alice"],
+                "gold_tags": ["B-LOC", "I-LOC", "O", "B-PER"],
+                "pred_tags": ["B-LOC", "I-LOC", "O", "O"],
+            }
+        ],
+    )
+    _write_jsonl(
+        run_multiseed._pred_path("baseline_self_refine", "msra", "BT", 13),
+        [
+            {
+                "tokens": ["Alice", "met", "Bob", "today"],
+                "gold_tags": ["B-PER", "O", "B-PER", "O"],
+                "pred_tags": ["B-PER", "O", "B-PER", "O"],
+            }
+        ],
+    )
 
     methods = ["baseline_self_refine", "baseline_zero_shot"]
     cells = {}
     for method in methods:
-        cell = aggregate_seeds._aggregate_cell(method, "msra", "BT")
-        if cell is not None:
-            cells[(method, "msra", "BT")] = cell
+        for dataset in aggregate_seeds.DATASETS:
+            cell = aggregate_seeds._aggregate_cell(method, dataset, "BT")
+            if cell is not None:
+                cells[(method, dataset, "BT")] = cell
 
     latex = aggregate_seeds.emit_prf_orate_latex(cells, methods)
 
-    assert r"\textit{Gold reference} & --- & --- & --- & 0.00\% & 0.500 \\" in latex
-    assert "0.500" in latex
+    assert r"\textit{Gold reference} & --- & --- & --- & 0.00\% & 0.375 \\" in latex
+    assert "0.375" in latex
