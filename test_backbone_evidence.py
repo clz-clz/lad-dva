@@ -10,6 +10,7 @@ import pytest
 
 import multi_agent_v2
 import run_multiseed
+from aggregate_seeds import METHOD_LABEL
 
 
 def test_backbone_env_configures_both_clients():
@@ -222,3 +223,52 @@ def test_run_multiseed_registers_lad_rg_variants_and_requests_candidate_evidence
     assert [cfg["use_lads"] for cfg in seen] == [False, True, False]
     assert [cfg["use_gasd"] for cfg in seen] == [True, False, True]
     assert all(cfg["__return_candidates__"] is True for cfg in seen)
+
+
+def test_dummy_mode_persists_candidate_evidence_for_lad_rg_configs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    noisy_dir = tmp_path / "noisy"
+    pred_dir = tmp_path / "pred"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
+    noisy_path = run_multiseed._noisy_path("conll2003", "BT", 13, 1)
+    noisy_path.parent.mkdir(parents=True, exist_ok=True)
+    noisy_path.write_text(
+        json.dumps(
+            {
+                "tokens": ["Alice", "Smith"],
+                "ner_tags": ["B-PER", "I-PER"],
+                "dirty_tags": ["O", "O"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    asyncio.run(
+        run_multiseed._run_one_cell(
+            "lad_rg_full",
+            run_multiseed.CONFIGURATIONS["lad_rg_full"],
+            "conll2003",
+            "BT",
+            13,
+            1,
+            run_multiseed._import_pipeline(True),
+            max_concurrency=1,
+            dummy=True,
+        )
+    )
+
+    pred_path = run_multiseed._pred_path("lad_rg_full", "conll2003", "BT", 13)
+    rows = [json.loads(line) for line in pred_path.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["pred_tags"] == ["B-PER", "I-PER"]
+    assert rows[0]["candidate_paths"]
+    assert rows[0]["rag_weights"]
+    assert rows[0]["confidence"]
+
+
+def test_aggregate_labels_cover_offline_oracle_pool_variants():
+    assert METHOD_LABEL["oracle_pool_sent"] == "Oracle Candidate Pool (sentence)"
+    assert METHOD_LABEL["oracle_pool_tok"] == "Oracle Candidate Pool (token)"

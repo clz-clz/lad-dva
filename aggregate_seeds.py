@@ -52,6 +52,8 @@ METHOD_LABEL = {
     "baseline_cot_reasoning_sfloor":     "CoT Reasoning + DFA",
     "baseline_self_refine_sfloor":       "Self-Refine + DFA",
     "baseline_standard_prompting_sfloor": "Standard Prompting + DFA",
+    "oracle_pool_sent": "Oracle Candidate Pool (sentence)",
+    "oracle_pool_tok": "Oracle Candidate Pool (token)",
 }
 
 

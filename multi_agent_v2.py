@@ -999,6 +999,14 @@ def ror_node(state: State):
     dirty_tags = state.get("dirty_tags", [])
     tokens = state.get("tokens", [])
     ds = state.get("dataset_name", "conll2003")
+    valid_types = DATASET_ENTITY_TYPES.get(ds, ["PER", "LOC", "ORG"])
+    valid_set = set(valid_types)
+
+    if not candidate_paths:
+        fallback = state.get("current_tags", []) or dirty_tags or ["O"] * len(tokens)
+        fallback = enforce_iob2_syntax(fallback, valid_set)
+        fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
+        return {"current_tags": fallback, "ror_proposals": {}}
 
     if not rag_weights or len(rag_weights) != len(candidate_paths):
         rag_weights = [1.0] * len(candidate_paths)
@@ -1007,7 +1015,7 @@ def ror_node(state: State):
         candidate_paths, rag_weights, entity_boost=1.0,
         dirty_tags=dirty_tags, consensus_ratio=0.6)
 
-    if not state.get("use_ror", True) or not candidate_paths:
+    if not state.get("use_ror", True):
         return {"current_tags": base, "ror_proposals": {}}
 
     use_lads = state.get("use_lads", True)

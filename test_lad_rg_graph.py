@@ -43,6 +43,13 @@ def test_lad_rg_configurations_select_lad_rg_graph_and_preserve_selectdenoise_co
     assert CONFIGURATIONS["selectdenoise_contextual_lattice"]["terminal_decoder"] == "contextual-lattice-v1"
 
 
+def test_oracle_pool_configs_are_registered_as_offline_only():
+    assert CONFIGURATIONS["oracle_pool_sent"]["offline_only"] == "oracle_gap.py"
+    assert CONFIGURATIONS["oracle_pool_sent"]["oracle_variant"] == "sentence_selection"
+    assert CONFIGURATIONS["oracle_pool_tok"]["offline_only"] == "oracle_gap.py"
+    assert CONFIGURATIONS["oracle_pool_tok"]["oracle_variant"] == "token_ceiling"
+
+
 def test_run_agent_pipeline_uses_lad_rg_graph_only_for_lad_rg_config(monkeypatch):
     calls: list[str] = []
 
@@ -180,6 +187,22 @@ def test_ror_output_is_proposals_not_raw_final_tags(monkeypatch):
     )
     assert result["ror_proposals"] == {0: "PER"}
     assert result["current_tags"] == ["O"]
+
+
+def test_ror_returns_legal_length_safe_fallback_when_candidate_pool_is_empty():
+    result = multi_agent_v2.ror_node(
+        _state(
+            tokens=["Alice", "arrived"],
+            dirty_tags=["I-PER"],
+            candidate_paths=[],
+            rag_weights=[],
+            current_tags=[],
+        )
+    )
+
+    assert result["current_tags"] == ["B-PER", "O"]
+    assert result["ror_proposals"] == {}
+    assert compute_ser([result["current_tags"]]) == 0.0
 
 
 def test_gasd_decodes_legal_iob2_from_candidates_potentials_and_proposals(monkeypatch):

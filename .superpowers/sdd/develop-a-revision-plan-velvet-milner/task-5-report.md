@@ -115,3 +115,100 @@ I did not update the frozen contextual-lattice inventory in this task because Ta
 
 - Full-suite green is blocked by the locked contextual-lattice manifest hash inventory, not by the new Task 5 logic.
 - No live API/GPU experiment results were run; only deterministic/offline tests were executed in this task.
+
+## Fix Round 1/5
+
+### Review findings addressed
+
+1. Added explicit offline oracle-pool registry keys and labels:
+   - `oracle_pool_sent`
+   - `oracle_pool_tok`
+2. Added an early empty-candidate fallback in `ror_node` so an empty pool no longer reaches `_weighted_majority_voting`.
+3. Made built-in dummy mode return deterministic candidate evidence when `__return_candidates__` is requested, so LAD-RG dummy runs persist oracle evidence through `_run_one_cell`.
+
+### RED
+
+Command:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest test_lad_rg_graph.py test_backbone_evidence.py -k "oracle_pool or dummy_mode or empty_candidate or offline_oracle"
+```
+
+Output:
+
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.9.7, pytest-6.2.4, py-1.10.0, pluggy-0.13.1
+rootdir: C:\Users\LinzeChen\AI_Workspace, configfile: pytest.ini
+plugins: anyio-4.12.1, langsmith-0.4.37
+collected 19 items / 16 deselected / 3 selected
+
+test_lad_rg_graph.py F                                                   [ 33%]
+test_backbone_evidence.py FF                                             [100%]
+
+================================== FAILURES ===================================
+KeyError: 'oracle_pool_sent'
+AssertionError
+KeyError: 'oracle_pool_sent'
+
+====================== 3 failed, 16 deselected in 9.69s =======================
+```
+
+Interpretation:
+
+- offline oracle config keys were absent
+- offline oracle labels were absent
+- dummy-mode candidate evidence was not being persisted
+
+### GREEN
+
+Targeted verification:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest test_lad_rg_graph.py test_backbone_evidence.py -k "oracle_pool or dummy_mode or empty_candidate or offline_oracle or ror_returns_legal"
+```
+
+Output:
+
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.9.7, pytest-6.2.4, py-1.10.0, pluggy-0.13.1
+rootdir: C:\Users\LinzeChen\AI_Workspace, configfile: pytest.ini
+plugins: anyio-4.12.1, langsmith-0.4.37
+collected 19 items / 15 deselected / 4 selected
+
+test_lad_rg_graph.py ..                                                  [ 50%]
+test_backbone_evidence.py ..                                             [100%]
+
+====================== 4 passed, 15 deselected in 9.40s =======================
+```
+
+Focused Task 5 suite:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest test_lad_rg_graph.py test_backbone_evidence.py test_oracle_gap.py
+```
+
+Output:
+
+```text
+============================= test session starts =============================
+platform win32 -- Python 3.9.7, pytest-6.2.4, py-1.10.0, pluggy-0.13.1
+rootdir: C:\Users\LinzeChen\AI_Workspace, configfile: pytest.ini
+plugins: anyio-4.12.1, langsmith-0.4.37
+collected 22 items
+
+test_lad_rg_graph.py ............                                        [ 54%]
+test_backbone_evidence.py .......                                        [ 86%]
+test_oracle_gap.py ...                                                   [100%]
+
+============================= 22 passed in 9.73s ==============================
+```
+
+### Files changed in fix round
+
+- `run_multiseed.py`
+- `multi_agent_v2.py`
+- `aggregate_seeds.py`
+- `test_lad_rg_graph.py`
+- `test_backbone_evidence.py`

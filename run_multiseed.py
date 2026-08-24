@@ -131,6 +131,16 @@ CONFIGURATIONS: Dict[str, dict] = {
         "offline_only": "apply_structural_floor_to_baselines.py",
         "source_method": "baseline_standard_prompting",
     },
+    "oracle_pool_sent": {
+        "offline_only": "oracle_gap.py",
+        "oracle_variant": "sentence_selection",
+        "source_method": "candidate-evidence prediction files",
+    },
+    "oracle_pool_tok": {
+        "offline_only": "oracle_gap.py",
+        "oracle_variant": "token_ceiling",
+        "source_method": "candidate-evidence prediction files",
+    },
 }
 
 NOISY_DIR = Path("results_multiseed")
@@ -245,6 +255,22 @@ def _import_pipeline(dummy: bool):
                 if j < len(gold) and t != gold[j] and rng.random() < rate:
                     out[j] = gold[j]
             await asyncio.sleep(0)
+            if config and config.get("__return_candidates__"):
+                candidate_paths = [
+                    list(dirty_tags[:len(gold)]) + ["O"] * max(0, len(gold) - len(dirty_tags)),
+                    list(gold[:len(gold)]),
+                ]
+                rag_weights = [0.25, 0.75]
+                confidence = [
+                    0.75 if j < len(gold) and candidate_paths[1][j] != candidate_paths[0][j] else 1.0
+                    for j in range(len(gold))
+                ]
+                return {
+                    "pred_tags": list(gold[:len(gold)]),
+                    "candidate_paths": candidate_paths,
+                    "rag_weights": rag_weights,
+                    "confidence": confidence,
+                }
             return out
         return mock_pipeline, baseline_pipelines
 
