@@ -81,7 +81,7 @@
     "multi_agent_v2.py": "7a133f046c729a78d42120a1f428cfa90f74a36089d0060df9ddffac4d78ece7",
     "run_multiseed.py": "2aacb825ebc4970d7219783b8806d92d298d8ab0e24d258be4e996bf9131de90",
     "test_contextual_lattice.py": "f3d3dd873a1598334409476c4782d2fd94f28faae03b67c9cd6120b9e3735052",
-    "test_contextual_lattice_runtime.py": "13c24b3449579efd7b8f4b7598383ac2ac2a0654c94ab1561e911b4f06201a4c"
+    "test_contextual_lattice_runtime.py": "e546d88acb1bb738ab52f457150150ae424e37d3ba70cd1a11a4fb1e36fc9c8c"
   },
   "preserved": {
     "historical_worktree": ".worktrees/selectdenoise-e1ae1d8",

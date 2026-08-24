@@ -479,3 +479,10 @@ def test_documented_metrics_and_manifest_have_locked_inventory():
     for name, expected in manifest["source_sha256"].items():
         digest = hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
         assert digest == expected
+
+
+def test_readme_cost_estimate_keeps_provider_call_arithmetic_consistent():
+    readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
+    assert "- **Coder calls**: 2 × 3 × 3 × 3 × 2000 = **108,000** calls returning 5 candidates each" in readme
+    assert "- **Reviewer calls**: 108,000 (one per sentence)" in readme
+    assert "- **Total**: ~216,000 provider calls" in readme

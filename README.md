@@ -150,8 +150,8 @@ For a representative two-method run
 (`selectdenoise_contextual_lattice` plus `selectdenoise_full_legacy`) across
 3 datasets × 3 noise × 3 seeds × 2000 samples × 5 candidates:
 - **Coder calls**: 2 × 3 × 3 × 3 × 2000 = **108,000** calls returning 5 candidates each
-- **Reviewer calls**: 10,800 (one per sentence)
-- **Total**: ~21,600 DeepSeek API calls
+- **Reviewer calls**: 108,000 (one per sentence)
+- **Total**: ~216,000 provider calls
 
 At ~$0.0001 / 1K input tokens for DeepSeek-V2 chat, this is ballpark **a few dollars**. Adding the three ablations multiplies this by 2.5×.
 
