@@ -231,6 +231,14 @@ def emit_prf_orate_latex(cells: Dict[Tuple[str, str, str], dict],
                 for ds in DATASETS if (method, ds, nt) in cells]
         return float(np.mean(vals)) if vals else None
 
+    def gold_reference(nt: str) -> Optional[float]:
+        vals = [
+            cell["gold_o_rate_mean"]
+            for (method, ds, noise), cell in cells.items()
+            if noise == nt and method in methods
+        ]
+        return float(np.mean(vals)) if vals else None
+
     L: List[str] = []
     L.append(r"\begin{table*}[t]")
     L.append(r"\centering\small")
@@ -241,7 +249,7 @@ def emit_prf_orate_latex(cells: Dict[Tuple[str, str, str], dict],
              r"& \textbf{F1} & \textbf{SER} & \textbf{O-rate} \\")
     for ni, nt in enumerate(NOISE_TYPES):
         L.append(rf"\midrule \multicolumn{{6}}{{l}}{{\textit{{{nt} noise (15\%)}}}} \\")
-        gold_o = macro(methods[0], nt, "gold_o_rate_mean") if methods else None
+        gold_o = gold_reference(nt)
         if gold_o is not None:
             # Gold is legal by construction: SER = 0.
             L.append(rf"\textit{{Gold reference}} & --- & --- & --- "

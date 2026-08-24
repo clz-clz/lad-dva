@@ -75,3 +75,59 @@ No existing local test file in this worktree covered `aggregate_seeds.py` or `me
 
 - No functional blockers found for Task 2
 - I did not run unrelated full-suite tests because the only available local coverage for the changed files was the new aggregation test file
+
+---
+
+## Review Fix Round 1 — gold O-rate reference independent of method ordering
+
+### Finding
+
+`emit_prf_orate_latex(...)` derived the gold O-rate reference from `methods[0]`. When the first requested method had no cell for a noise type but a later requested method did, the LaTeX gold reference row disappeared even though the gold O-rate was available from existing cells.
+
+### RED evidence
+
+Test command:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest C:/Users/LinzeChen/AI_Workspace/.worktrees/selectdenoise-contextual-lattice/test_aggregate_seeds.py -q
+```
+
+Observed failure:
+
+```text
+FAILED test_aggregate_seeds.py::test_prf_orate_latex_keeps_gold_reference_with_partial_method_coverage
+E       AssertionError
+```
+
+The regression test writes a real prediction JSONL file for the second requested method only, requests methods in the order `baseline_self_refine`, `baseline_zero_shot`, and asserts that the concrete LaTeX gold-reference row remains present for `BT`.
+
+### Fix
+
+- kept the existing output contract
+- changed gold-reference selection in `aggregate_seeds.py` to derive `gold_o_rate_mean` from any available requested-method cell for the current noise type instead of assuming `methods[0]` has coverage
+
+### GREEN evidence
+
+Re-run command:
+
+```powershell
+D:/py/Anaconda3/python.exe -m pytest C:/Users/LinzeChen/AI_Workspace/.worktrees/selectdenoise-contextual-lattice/test_aggregate_seeds.py -q
+```
+
+Observed result:
+
+```text
+.......                                                                  [100%]
+7 passed in 1.26s
+```
+
+### Files changed in this round
+
+- `C:\Users\LinzeChen\AI_Workspace\.worktrees\selectdenoise-contextual-lattice\aggregate_seeds.py`
+- `C:\Users\LinzeChen\AI_Workspace\.worktrees\selectdenoise-contextual-lattice\test_aggregate_seeds.py`
+
+### Self-review
+
+- regression reproduced with real file-backed aggregation inputs
+- fix is localized to gold-reference row selection
+- method ordering no longer affects whether the gold row appears
