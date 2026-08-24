@@ -29,7 +29,13 @@ def _state(**overrides):
 
 def test_lad_rg_configurations_select_lad_rg_graph_and_preserve_selectdenoise_configs():
     assert CONFIGURATIONS["lad_rg_full"]["terminal_graph"] == "lad-rg"
+    assert CONFIGURATIONS["lad_rg_no_lads"]["terminal_graph"] == "lad-rg"
     assert CONFIGURATIONS["lad_rg_no_ror"]["terminal_graph"] == "lad-rg"
+    assert CONFIGURATIONS["lad_rg_no_gasd"]["terminal_graph"] == "lad-rg"
+    assert CONFIGURATIONS["lad_rg_lads_ror"]["terminal_graph"] == "lad-rg"
+    assert CONFIGURATIONS["lad_rg_lads_gasd"]["terminal_graph"] == "lad-rg"
+    assert CONFIGURATIONS["lad_rg_ror_gasd"]["terminal_graph"] == "lad-rg"
+    assert CONFIGURATIONS["lad_rg_coder_only"]["terminal_graph"] == "lad-rg"
     assert CONFIGURATIONS["lad_rg_no_potentials"]["terminal_graph"] == "lad-rg"
     assert CONFIGURATIONS["lad_rg_ror_ungated"]["terminal_graph"] == "lad-rg"
 
@@ -72,6 +78,82 @@ def test_run_agent_pipeline_uses_lad_rg_graph_only_for_lad_rg_config(monkeypatch
         )
     ) == ["B-PER"]
     assert calls == ["lad-rg", "selectdenoise"]
+
+
+def test_run_agent_pipeline_threads_leave_one_out_and_pairwise_flags_into_lad_rg_state(
+    monkeypatch,
+):
+    seen_states = []
+
+    class _FakeGraph:
+        async def ainvoke(self, state):
+            seen_states.append(dict(state))
+            return {
+                "current_tags": ["B-PER"],
+                "candidate_paths": [["B-PER"]],
+                "rag_weights": [1.0],
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _FakeGraph())
+
+    for config_name in ("lad_rg_no_lads", "lad_rg_no_gasd", "lad_rg_ror_gasd"):
+        asyncio.run(
+            multi_agent_v2.run_agent_pipeline(
+                ["Alice"],
+                ["O"],
+                CONFIGURATIONS[config_name],
+                dataset_name="conll2003",
+            )
+        )
+
+    assert [state["use_lads"] for state in seen_states] == [False, True, False]
+    assert [state["use_gasd"] for state in seen_states] == [True, False, True]
+    assert [state["use_ror"] for state in seen_states] == [True, True, True]
+
+
+def test_reviewer_disables_lads_weighting_without_calling_llm(monkeypatch):
+    called = {"n": 0}
+
+    def _boom(_prompt):
+        called["n"] += 1
+        raise AssertionError("reviewer LLM should be bypassed when use_lads is false")
+
+    class _FakeLLM:
+        def invoke(self, prompt):
+            return _boom(prompt)
+
+    monkeypatch.setattr(multi_agent_v2, "llm", _FakeLLM())
+
+    result = asyncio.run(
+        multi_agent_v2.reviewer_node(
+            {
+                "tokens": ["Alice", "arrived"],
+                "dirty_tags": ["O", "O"],
+                "candidate_paths": [["O", "O"], ["B-PER", "O"], ["O", "O"]],
+                "dataset_name": "conll2003",
+                "use_lads": False,
+            }
+        )
+    )
+
+    assert called["n"] == 0
+    assert result["rag_weights"] == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+
+
+def test_gasd_can_be_disabled_without_running_decoder(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise AssertionError("GASD decoder should be bypassed when use_gasd is false")
+
+    monkeypatch.setattr(multi_agent_v2, "_gasd_viterbi_decode", _boom)
+    result = multi_agent_v2.gasd_node(
+        _state(
+            tokens=["Alice", "arrived"],
+            current_tags=["I-PER", "O"],
+            use_gasd=False,
+        )
+    )
+
+    assert result["current_tags"] == ["B-PER", "O"]
 
 
 def test_ror_gate_uses_omega_and_ungated_diagnostic(monkeypatch):

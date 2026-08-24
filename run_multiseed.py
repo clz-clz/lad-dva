@@ -76,13 +76,35 @@ CONFIGURATIONS: Dict[str, dict] = {
     "selectdenoise_vote":        {"deanchor_atf": False, "use_verifier": False},
     # LAD-RG: Coder -> Reviewer/LADS -> RoR proposals -> GASD global decode
     "lad_rg_full":               {"terminal_graph": "lad-rg",
-                                  "use_ror": True,  "gasd_potentials": True},
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": True, "gasd_potentials": True},
+    "lad_rg_no_lads":            {"terminal_graph": "lad-rg",
+                                  "use_lads": False, "use_ror": True,
+                                  "use_gasd": True,  "gasd_potentials": False},
     "lad_rg_no_ror":             {"terminal_graph": "lad-rg",
-                                  "use_ror": False, "gasd_potentials": True},
+                                  "use_lads": True, "use_ror": False,
+                                  "use_gasd": True, "gasd_potentials": True},
+    "lad_rg_no_gasd":            {"terminal_graph": "lad-rg",
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": False, "gasd_potentials": True},
+    "lad_rg_lads_ror":           {"terminal_graph": "lad-rg",
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": False, "gasd_potentials": True},
+    "lad_rg_lads_gasd":          {"terminal_graph": "lad-rg",
+                                  "use_lads": True, "use_ror": False,
+                                  "use_gasd": True, "gasd_potentials": True},
+    "lad_rg_ror_gasd":           {"terminal_graph": "lad-rg",
+                                  "use_lads": False, "use_ror": True,
+                                  "use_gasd": True,  "gasd_potentials": False},
+    "lad_rg_coder_only":         {"terminal_graph": "lad-rg",
+                                  "use_lads": False, "use_ror": False,
+                                  "use_gasd": False, "gasd_potentials": False},
     "lad_rg_no_potentials":      {"terminal_graph": "lad-rg",
-                                  "use_ror": True,  "gasd_potentials": False},
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": True, "gasd_potentials": False},
     "lad_rg_ror_ungated":        {"terminal_graph": "lad-rg",
-                                  "use_ror": True,  "gasd_potentials": True,
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": True, "gasd_potentials": True,
                                   "ror_ungated": True},
     # Baselines (2024-2025 published & standard)
     "baseline_zero_shot":         {"method": "zero_shot"},
@@ -90,6 +112,25 @@ CONFIGURATIONS: Dict[str, dict] = {
     "baseline_self_refine":       {"method": "self_refine"},
     "baseline_rule_only":         {"method": "rule_only"},
     "baseline_standard_prompting": {"method": "standard_prompting"},
+    # Offline-derived post-hoc methods. These are registered here so downstream
+    # tooling can refer to them by explicit key, but the runner itself only
+    # emits a clear error telling the user which offline utility to use.
+    "baseline_zero_shot_sfloor": {
+        "offline_only": "apply_structural_floor_to_baselines.py",
+        "source_method": "baseline_zero_shot",
+    },
+    "baseline_cot_reasoning_sfloor": {
+        "offline_only": "apply_structural_floor_to_baselines.py",
+        "source_method": "baseline_cot_reasoning",
+    },
+    "baseline_self_refine_sfloor": {
+        "offline_only": "apply_structural_floor_to_baselines.py",
+        "source_method": "baseline_self_refine",
+    },
+    "baseline_standard_prompting_sfloor": {
+        "offline_only": "apply_structural_floor_to_baselines.py",
+        "source_method": "baseline_standard_prompting",
+    },
 }
 
 NOISY_DIR = Path("results_multiseed")
@@ -265,6 +306,17 @@ def _load_noisy(p: Path) -> List[dict]:
     return rows
 
 
+def _supports_candidate_evidence(config_name: str, config: dict) -> bool:
+    if config.get("terminal_graph") == "lad-rg":
+        return True
+    return config_name in {
+        "selectdenoise_contextual_lattice",
+        "selectdenoise_full",
+        "selectdenoise_full_legacy",
+        "selectdenoise_no_deanchor",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-cell async runner
 # ---------------------------------------------------------------------------
@@ -274,6 +326,12 @@ async def _run_one_cell(config_name: str, config: dict,
                         size: int, pipelines,
                         *, max_concurrency: int, dummy: bool,
                         ratio: float = 0.15):
+    if config.get("offline_only"):
+        raise RuntimeError(
+            f"Config '{config_name}' is offline-only; derive it with "
+            f"{config['offline_only']} from {config.get('source_method', 'existing prediction')} files."
+        )
+
     default_fn, baseline_fns = pipelines
     pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
     pred_p.parent.mkdir(parents=True, exist_ok=True)
@@ -308,9 +366,7 @@ async def _run_one_cell(config_name: str, config: dict,
                 cfg["__seed__"] = seed
             # Log the Coder candidate pool for the main methods only (oracle /
             # selection analysis); keeps ablation prediction files lean.
-            if config_name in ("selectdenoise_contextual_lattice", "selectdenoise_full",
-                               "selectdenoise_full_legacy", "selectdenoise_no_deanchor",
-                               "lad_rg_full"):
+            if _supports_candidate_evidence(config_name, config):
                 cfg["__return_candidates__"] = True
             extra: dict = {}
 

@@ -738,6 +738,12 @@ async def reviewer_node(state: State):
     dirty_tags = state.get("dirty_tags", [])
     candidate_paths = state.get("candidate_paths", [])
     ds_name = state.get("dataset_name", "conll2003")
+    use_lads = state.get("use_lads", True)
+
+    if not candidate_paths:
+        return {"rag_weights": []}
+    if not use_lads:
+        return {"rag_weights": [1.0 / len(candidate_paths)] * len(candidate_paths)}
 
     # Skip Reviewer when all Coder paths are identical (no diversity to judge)
     if _all_paths_identical(candidate_paths):
@@ -1004,9 +1010,10 @@ def ror_node(state: State):
     if not state.get("use_ror", True) or not candidate_paths:
         return {"current_tags": base, "ror_proposals": {}}
 
-    omega = _omega_weights(tokens, ds)
+    use_lads = state.get("use_lads", True)
+    omega = _omega_weights(tokens, ds) if use_lads else [0.0] * len(tokens)
     proposals = _ror_recover(tokens, base, candidate_paths, rag_weights, omega,
-                             ungated=state.get("ror_ungated", False))
+                             ungated=(state.get("ror_ungated", False) or not use_lads))
     if proposals:
         print(f" [RoR] {len(proposals)} gated entity-recovery proposals")
     return {"current_tags": base, "ror_proposals": proposals}
@@ -1091,6 +1098,11 @@ def gasd_node(state: State):
     valid_set = set(valid_types)
 
     try:
+        if not state.get("use_gasd", True):
+            fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
+            fallback = enforce_iob2_syntax(fallback, valid_set)
+            fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
+            return {"current_tags": fallback}
         if len(weights) != len(candidate_paths):
             weights = [1.0] * len(candidate_paths)
         if not candidate_paths:
@@ -1098,10 +1110,11 @@ def gasd_node(state: State):
             fallback = enforce_iob2_syntax(fallback, valid_set)
             fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
             return {"current_tags": fallback}
-        omega = _omega_weights(tokens, ds)
+        use_lads = state.get("use_lads", True)
+        omega = _omega_weights(tokens, ds) if use_lads else [0.0] * len(tokens)
         decoded = _gasd_viterbi_decode(
             candidate_paths, weights, tokens, omega, proposals, valid_types,
-            use_potentials=state.get("gasd_potentials", True),
+            use_potentials=(state.get("gasd_potentials", True) and use_lads),
             beta_omega=GASD_BETA_OMEGA)
         if len(decoded) != len(tokens):
             decoded = enforce_iob2_syntax(base, valid_set)
@@ -1426,7 +1439,9 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "noise_type": noise_type,
         # LAD-RG synergy controls. Used only by the opt-in lad-rg graph.
         "ror_proposals": {},
+        "use_lads": config.get("use_lads", True),
         "use_ror": config.get("use_ror", True),
+        "use_gasd": config.get("use_gasd", True),
         "ror_ungated": config.get("ror_ungated", False),
         "gasd_potentials": config.get("gasd_potentials", True),
         # SelectDenoise controls (defaults = full system)

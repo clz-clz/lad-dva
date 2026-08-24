@@ -59,6 +59,118 @@ def _majority(cands: List[List[str]]) -> List[str]:
             for i in range(n)]
 
 
+def _load_jsonl(path: Path) -> List[dict]:
+    return [json.loads(line) for line in path.open(encoding="utf-8") if line.strip()]
+
+
+def _prediction_file(dataset: str, noise: str, seed: int, method: str, tag: str) -> Path:
+    tag_suffix = f"__{tag}" if tag else ""
+    return PRED / f"pred_seed{seed}__{method}__{dataset}__{noise}{tag_suffix}.jsonl"
+
+
+def _noisy_file(dataset: str, noise: str, seed: int) -> Path:
+    return NOISY / f"noisy_seed{seed}__{noise}__{dataset}__N200.jsonl"
+
+
+def _sanitize_candidates(row: dict) -> List[List[str]]:
+    gold = row.get("gold_tags") or []
+    expected_len = len(gold)
+    cleaned: List[List[str]] = []
+    for path in row.get("candidate_paths") or []:
+        if not isinstance(path, list) or not path:
+            continue
+        clipped = list(path[:expected_len])
+        if len(clipped) < expected_len:
+            clipped.extend(["O"] * (expected_len - len(clipped)))
+        cleaned.append(clipped)
+    return cleaned
+
+
+def _best_single_path(gold: List[List[str]], rows: List[dict]) -> float:
+    max_paths = max((len(_sanitize_candidates(row)) for row in rows), default=0)
+    if max_paths == 0:
+        return 0.0
+    pooled: List[List[str]] = []
+    best = 0.0
+    for idx in range(max_paths):
+        pooled.clear()
+        for row in rows:
+            cands = _sanitize_candidates(row)
+            pooled.append(cands[idx] if idx < len(cands) else list(row["pred_tags"]))
+        best = max(best, compute_prf1(gold, pooled)["f1"])
+    return best
+
+
+def analyze_cell(*, dataset: str, noise: str, seed: int,
+                 method: str, tag: str = "") -> dict:
+    pred_file = _prediction_file(dataset, noise, seed, method, tag)
+    noisy_file = _noisy_file(dataset, noise, seed)
+    if not pred_file.exists() or not noisy_file.exists():
+        return {
+            "status": "missing",
+            "dataset": dataset,
+            "noise": noise,
+            "seed": seed,
+            "method_name": method,
+            "message": f"missing files: pred={pred_file.exists()} noisy={noisy_file.exists()}",
+        }
+
+    rows = _load_jsonl(pred_file)
+    noisy_rows = _load_jsonl(noisy_file)
+    n = min(len(rows), len(noisy_rows))
+    rows = rows[:n]
+    noisy_rows = noisy_rows[:n]
+    if not rows:
+        return {
+            "status": "missing",
+            "dataset": dataset,
+            "noise": noise,
+            "seed": seed,
+            "method_name": method,
+            "message": "empty prediction or noisy file",
+        }
+
+    gold = [row["gold_tags"] for row in rows]
+    pred = [row["pred_tags"] for row in rows]
+    dirty = [row["dirty_tags"] for row in noisy_rows]
+    maj, or_sent, or_tok = [], [], []
+    candidate_rows = 0
+    for row in rows:
+        cands = _sanitize_candidates(row)
+        g = row["gold_tags"]
+        if cands:
+            candidate_rows += 1
+            m = _majority(cands)
+            m = m[:len(g)] + ["O"] * max(0, len(g) - len(m))
+            maj.append(m)
+            or_sent.append(_oracle_sentence(g, cands))
+            or_tok.append(_oracle_token(g, cands))
+        else:
+            maj.append(list(row["pred_tags"]))
+            or_sent.append(list(row["pred_tags"]))
+            or_tok.append(list(row["pred_tags"]))
+
+    score = lambda paths: compute_prf1(gold, paths)["f1"]
+    summary = {
+        "status": "ok" if candidate_rows else "no_candidate_evidence",
+        "dataset": dataset,
+        "noise": noise,
+        "seed": seed,
+        "method_name": method,
+        "n_rows": len(rows),
+        "dirty": score(dirty),
+        "majority": score(maj),
+        "method": score(pred),
+        "oracle_sent": score(or_sent),
+        "oracle_tok": score(or_tok),
+        "best_path": _best_single_path(gold, rows) if candidate_rows else score(pred),
+    }
+    summary["sel_gap"] = summary["oracle_sent"] - summary["method"]
+    if candidate_rows == 0:
+        summary["message"] = "Prediction file has no candidate_paths evidence for oracle analysis."
+    return summary
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", default="conll2003")
@@ -73,35 +185,26 @@ def main(argv=None):
     tag_suffix = f"__{args.tag}" if args.tag else ""
 
     print(f"\n{'cell':<18}{'dirty':>8}{'majority':>9}{'method':>8}"
-          f"{'oracleS':>9}{'oracleT':>9}{'selGap':>8}")
+          f"{'oracleS':>9}{'oracleT':>9}{'bestK':>8}{'selGap':>8}")
     print("-" * 68)
     for nt in args.noise:
-        pf = (PRED / f"pred_seed{args.seed}__{args.method}__{args.dataset}"
-                     f"__{nt}{tag_suffix}.jsonl")
-        nf = NOISY / f"noisy_seed{args.seed}__{nt}__{args.dataset}__N200.jsonl"
-        if not pf.exists() or not nf.exists():
-            print(f"{args.dataset}/{nt:<10} [missing]"); continue
-        rows = [json.loads(l) for l in pf.open(encoding="utf-8") if l.strip()]
-        noisy = [json.loads(l) for l in nf.open(encoding="utf-8") if l.strip()]
-        gold = [r["gold_tags"] for r in rows]
-        pred = [r["pred_tags"] for r in rows]
-        dirty = [noisy[i]["dirty_tags"] for i in range(len(rows))]
-        maj, orS, orT = [], [], []
-        for r in rows:
-            c = r.get("candidate_paths") or []
-            g = r["gold_tags"]
-            if c:
-                m = _majority(c)
-                m = m[:len(g)] + ["O"] * max(0, len(g) - len(m))
-                maj.append(m)
-                orS.append(_oracle_sentence(g, c))
-                orT.append(_oracle_token(g, c))
-            else:
-                maj.append(r["pred_tags"]); orS.append(r["pred_tags"]); orT.append(r["pred_tags"])
-        f = lambda P: compute_prf1(gold, P)["f1"]
-        d, mj, lr, os_, ot = f(dirty), f(maj), f(pred), f(orS), f(orT)
-        print(f"{args.dataset}/{nt:<10}{d:8.4f}{mj:9.4f}{lr:8.4f}"
-              f"{os_:9.4f}{ot:9.4f}{os_-lr:+8.4f}")
+        summary = analyze_cell(
+            dataset=args.dataset,
+            noise=nt,
+            seed=args.seed,
+            method=args.method,
+            tag=args.tag,
+        )
+        if summary["status"] == "missing":
+            print(f"{args.dataset}/{nt:<10} [missing] {summary['message']}")
+            continue
+        if summary["status"] == "no_candidate_evidence":
+            print(f"{args.dataset}/{nt:<10} [no-cands] {summary['message']}")
+            continue
+        print(f"{args.dataset}/{nt:<10}{summary['dirty']:8.4f}{summary['majority']:9.4f}"
+              f"{summary['method']:8.4f}{summary['oracle_sent']:9.4f}"
+              f"{summary['oracle_tok']:9.4f}{summary['best_path']:8.4f}"
+              f"{summary['sel_gap']:+8.4f}")
     print("-" * 68)
     print("selGap = oracleS - method.  Large => selection-bound; ~0 => generation-bound.")
 

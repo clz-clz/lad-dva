@@ -169,3 +169,56 @@ def test_run_multiseed_persists_candidate_evidence_fields(
             "confidence": [1.0, 1.0, 1.0],
         }
     ]
+
+
+def test_run_multiseed_registers_lad_rg_variants_and_requests_candidate_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    noisy_dir = tmp_path / "noisy"
+    pred_dir = tmp_path / "pred"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
+    noisy_path = run_multiseed._noisy_path("conll2003", "BT", 13, 1)
+    noisy_path.parent.mkdir(parents=True, exist_ok=True)
+    noisy_path.write_text(
+        json.dumps(
+            {
+                "tokens": ["Alice"],
+                "ner_tags": ["B-PER"],
+                "dirty_tags": ["O"],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    seen = []
+
+    async def fake_pipeline(tokens, dirty_tags, config=None, dataset_name=None):
+        seen.append(dict(config or {}))
+        return {
+            "pred_tags": ["B-PER"],
+            "candidate_paths": [["B-PER"]],
+            "rag_weights": [1.0],
+            "confidence": [1.0],
+        }
+
+    for config_name in ("lad_rg_no_lads", "lad_rg_no_gasd", "lad_rg_ror_gasd"):
+        asyncio.run(
+            run_multiseed._run_one_cell(
+                config_name,
+                run_multiseed.CONFIGURATIONS[config_name],
+                "conll2003",
+                "BT",
+                13,
+                1,
+                (fake_pipeline, {}),
+                max_concurrency=1,
+                dummy=False,
+            )
+        )
+
+    assert [cfg["use_lads"] for cfg in seen] == [False, True, False]
+    assert [cfg["use_gasd"] for cfg in seen] == [True, False, True]
+    assert all(cfg["__return_candidates__"] is True for cfg in seen)
