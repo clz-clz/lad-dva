@@ -1,4 +1,4 @@
-# Multi-seed runner for LAD-DVA
+# Multi-seed runner for SelectDenoise and LAD-RG
 
 Drop these five files alongside your existing `multi_agent_v2.py`,
 `rag_voting_engine.py`, `utils.py`, and `chroma_db/`. Then:
@@ -93,9 +93,13 @@ Each line:
 
 ## Configuration
 
-The legacy LAD-DVA examples below describe the original runner options.  For
-new denoising runs, `run_multiseed.py` defaults to the locked contextual-lattice
-terminal; the legacy SelectDenoise graph remains an explicit rollback option.
+The legacy LAD-DVA-style examples below are preserved for historical file and
+rollback-name continuity. For new denoising runs, `run_multiseed.py` defaults
+to the locked contextual-lattice terminal via
+`selectdenoise_contextual_lattice`; the pre-terminal SelectDenoise graph remains
+addressable through the explicit `selectdenoise_full_legacy` rollback name, and
+the modern LAD-RG ablations stay opt-in under the `lad_rg_*` configuration
+keys.
 
 ```python
 CONFIGURATIONS = {
@@ -114,7 +118,7 @@ Adding all five gives you the full ablation table (5 methods × 3 datasets × 3 
 
 ```bash
 python gen_noisy.py --dummy --size 30          # 27 tiny noisy files
-python run_multiseed.py --dummy                 # mock pipeline; 54 cells in seconds
+python run_multiseed.py --dummy                 # mock pipeline; 27 default cells in seconds
 python aggregate_seeds.py > smoke_table.tex     # confirm table format
 ```
 
@@ -134,13 +138,17 @@ documented in
 [`docs/contextual_lattice/CONTEXTUAL_LATTICE_V1.md`](docs/contextual_lattice/CONTEXTUAL_LATTICE_V1.md),
 with machine-readable records in
 [`metrics_450.json`](docs/contextual_lattice/metrics_450.json) and
-[`frozen_manifest.json`](docs/contextual_lattice/frozen_manifest.json).  The
+[`frozen_manifest.json`](docs/contextual_lattice/frozen_manifest.json), plus a
+snapshot-boundary note in
+[`AVAILABLE_ARTIFACTS.md`](docs/contextual_lattice/AVAILABLE_ARTIFACTS.md). The
 artifact is a development candidate only: its locked gate is 12/15 positive
 cells, so the formal 13/15 requirement remains unmet.
 
 ## Cost estimate (real run)
 
-For the default (2 methods × 3 datasets × 3 noise × 3 seeds × 2000 samples × 5 candidates):
+For a representative two-method run
+(`selectdenoise_contextual_lattice` plus `selectdenoise_full_legacy`) across
+3 datasets × 3 noise × 3 seeds × 2000 samples × 5 candidates:
 - **Coder calls**: 2 × 3 × 3 × 3 × 2000 = **108,000** calls returning 5 candidates each
 - **Reviewer calls**: 10,800 (one per sentence)
 - **Total**: ~21,600 DeepSeek API calls

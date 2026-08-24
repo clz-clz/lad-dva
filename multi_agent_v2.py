@@ -105,7 +105,7 @@ class State(TypedDict):
     dataset_name: str
     noise_type: str
     # --- Synergistic redesign (LAD-RG) — legacy, superseded by SelectDenoise ---
-    ror_proposals: dict          # {position: proposed_tag}  (empty if RoR off)
+    ror_proposals: dict          # token-index -> proposed tag from RoR; empty when none fire
     use_ror: bool                # enable the RoR recall stage
     ror_ungated: bool            # ablation: fire RoR everywhere (no ω/conf gate)
     gasd_potentials: bool        # integrate LADS ω(t) potentials in GASD decode
