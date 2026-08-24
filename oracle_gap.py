@@ -17,7 +17,7 @@ import argparse, json, os
 from pathlib import Path
 from typing import List
 
-from metrics import f1_only, compute_prf1
+from metrics import _is_valid_transition, f1_only, compute_prf1
 
 PRED = Path("predictions_multiseed")
 NOISY = Path("results_multiseed")
@@ -35,20 +35,43 @@ def _oracle_sentence(gold: List[str], cands: List[List[str]]) -> List[str]:
 
 
 def _oracle_token(gold: List[str], cands: List[List[str]]) -> List[str]:
-    """Per position, emit gold tag if ANY candidate got it right, else the
-    majority candidate tag. Loose upper bound (may break IOB2, but f1_only is
-    span-strict so illegal picks just don't score)."""
+    """Legal token-match ceiling over candidate-supported tags.
+
+    Dynamic programming maximizes gold-token matches while enforcing hard IOB2
+    transitions. ``O`` is always available as a length-safe legal fallback.
+    """
     n = len(gold)
-    out = []
+    if n == 0:
+        return []
+    choices = []
     for i in range(n):
         picks = [c[i] for c in cands if i < len(c)]
-        if gold[i] in picks:
-            out.append(gold[i])
-        elif picks:
-            out.append(max(set(picks), key=picks.count))
-        else:
-            out.append("O")
-    return out
+        choices.append(sorted(set(picks) | {"O"}))
+
+    def local_score(pos: int, tag: str) -> float:
+        support = sum(1 for c in cands if pos < len(c) and c[pos] == tag)
+        return (1.0 if tag == gold[pos] else 0.0) + support * 1e-6
+
+    dp = {tag: local_score(0, tag) for tag in choices[0]
+          if _is_valid_transition("O", tag)}
+    back = [{}]
+    for pos in range(1, n):
+        next_dp, bp = {}, {}
+        for tag in choices[pos]:
+            legal = [(score, prev) for prev, score in dp.items()
+                     if _is_valid_transition(prev, tag)]
+            if legal:
+                best_score, best_prev = max(legal)
+                next_dp[tag] = best_score + local_score(pos, tag)
+                bp[tag] = best_prev
+        dp = next_dp or {"O": 0.0}
+        back.append(bp)
+    last = max(dp, key=dp.get)
+    out = [last]
+    for pos in range(n - 1, 0, -1):
+        last = back[pos].get(last, "O")
+        out.append(last)
+    return list(reversed(out))
 
 
 def _majority(cands: List[List[str]]) -> List[str]:
@@ -152,17 +175,24 @@ def analyze_cell(*, dataset: str, noise: str, seed: int,
 
     score = lambda paths: compute_prf1(gold, paths)["f1"]
     summary = {
-        "status": "ok" if candidate_rows else "no_candidate_evidence",
+        "status": ("no_candidate_evidence" if candidate_rows == 0 else
+                   "ok" if candidate_rows == len(rows) else
+                   "partial_candidate_evidence"),
         "dataset": dataset,
         "noise": noise,
         "seed": seed,
         "method_name": method,
         "n_rows": len(rows),
+        "candidate_rows": candidate_rows,
+        "candidate_coverage": candidate_rows / len(rows),
+        "candidate_evidence": ("none" if candidate_rows == 0 else
+                               "complete" if candidate_rows == len(rows) else "partial"),
         "dirty": score(dirty),
         "majority": score(maj),
         "method": score(pred),
         "oracle_sent": score(or_sent),
         "oracle_tok": score(or_tok),
+        "oracle_tok_legal": score(or_tok),
         "best_path": _best_single_path(gold, rows) if candidate_rows else score(pred),
     }
     summary["sel_gap"] = summary["oracle_sent"] - summary["method"]
@@ -201,12 +231,16 @@ def main(argv=None):
         if summary["status"] == "no_candidate_evidence":
             print(f"{args.dataset}/{nt:<10} [no-cands] {summary['message']}")
             continue
+        coverage = ""
+        if summary["status"] == "partial_candidate_evidence":
+            coverage = f" [partial {summary['candidate_rows']}/{summary['n_rows']}]"
         print(f"{args.dataset}/{nt:<10}{summary['dirty']:8.4f}{summary['majority']:9.4f}"
               f"{summary['method']:8.4f}{summary['oracle_sent']:9.4f}"
               f"{summary['oracle_tok']:9.4f}{summary['best_path']:8.4f}"
-              f"{summary['sel_gap']:+8.4f}")
+              f"{summary['sel_gap']:+8.4f}{coverage}")
     print("-" * 68)
-    print("selGap = oracleS - method.  Large => selection-bound; ~0 => generation-bound.")
+    print("oracleT = legal IOB2 token ceiling. selGap = oracleS - method. "
+          "Large => selection-bound; ~0 => generation-bound.")
 
 
 if __name__ == "__main__":

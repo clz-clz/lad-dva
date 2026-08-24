@@ -16,7 +16,7 @@ Resumable: cells whose prediction file already exists are skipped.
 Usage:
     python run_multiseed.py                 # full matrix, real pipeline
     python run_multiseed.py --dummy         # offline; mocks run_agent_pipeline
-    python run_multiseed.py --configs lad_dva_full semantic_rag_baseline
+    python run_multiseed.py --configs lad_rg_full lad_rg_gasd_r lad_rg_gasd_both
     python run_multiseed.py --seeds 13 42 2024
 """
 from __future__ import annotations
@@ -77,7 +77,16 @@ CONFIGURATIONS: Dict[str, dict] = {
     # LAD-RG: Coder -> Reviewer/LADS -> RoR proposals -> GASD global decode
     "lad_rg_full":               {"terminal_graph": "lad-rg",
                                   "use_lads": True, "use_ror": True,
-                                  "use_gasd": True, "gasd_potentials": True},
+                                  "use_gasd": True, "gasd_potentials": True,
+                                  "gasd_variant": "g"},
+    "lad_rg_gasd_r":             {"terminal_graph": "lad-rg",
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": True, "gasd_potentials": True,
+                                  "gasd_variant": "r"},
+    "lad_rg_gasd_both":          {"terminal_graph": "lad-rg",
+                                  "use_lads": True, "use_ror": True,
+                                  "use_gasd": True, "gasd_potentials": True,
+                                  "gasd_variant": "both"},
     "lad_rg_no_lads":            {"terminal_graph": "lad-rg",
                                   "use_lads": False, "use_ror": True,
                                   "use_gasd": True,  "gasd_potentials": False},
@@ -166,7 +175,7 @@ BACKBONE_TAG = os.environ.get("BACKBONE_TAG", "").strip()
 def _import_pipeline(dummy: bool):
     """Return (default_pipeline, baseline_pipelines_dict).
 
-    default_pipeline: async fn for lad_dva_full.
+    default_pipeline: async fn for SelectDenoise and opt-in LAD-RG configurations.
     baseline_pipelines: dict mapping method_name -> async fn for standalone baselines.
     """
     from utils import enforce_iob2_syntax

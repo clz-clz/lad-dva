@@ -61,7 +61,7 @@ Field names match what `multi_agent_v2.run_agent_pipeline` expects.
 One file per `(config, dataset, noise_type, seed)`:
 
 ```
-pred_seed13__lad_dva_full__msra__BT.jsonl
+pred_seed13__lad_rg_full__msra__BT.jsonl
 pred_seed13__semantic_rag_baseline__msra__BT.jsonl
 ...
 ```
@@ -75,7 +75,7 @@ Each line:
 
 ```json
 {
-  "lad_dva_full|msra|BT": {
+  "lad_rg_full|msra|BT": {
     "n_seeds": 3,
     "f1_mean": 0.6312, "f1_std": 0.0091,
     "p_mean":  0.7104, "p_std":  0.0156,
@@ -93,17 +93,19 @@ Each line:
 
 ## Configuration
 
-The legacy LAD-DVA-style examples below are preserved for historical file and
-rollback-name continuity. For new denoising runs, `run_multiseed.py` defaults
-to the locked contextual-lattice terminal via
-`selectdenoise_contextual_lattice`; the pre-terminal SelectDenoise graph remains
+Historical `lad_dva_full` filenames and rollback labels remain addressable, but
+new revision experiments use LAD-RG names. `run_multiseed.py` also exposes the
+locked contextual-lattice terminal as `selectdenoise_contextual_lattice`; the
+pre-terminal SelectDenoise graph remains
 addressable through the explicit `selectdenoise_full_legacy` rollback name, and
 the modern LAD-RG ablations stay opt-in under the `lad_rg_*` configuration
 keys.
 
 ```python
 CONFIGURATIONS = {
-    "lad_dva_full":           {"lambda_bias": 1.0, "use_dfa": True,  "use_topology_rag": True},
+    "lad_rg_full":      {"terminal_graph": "lad-rg", "gasd_variant": "g"},
+    "lad_rg_gasd_r":    {"terminal_graph": "lad-rg", "gasd_variant": "r"},
+    "lad_rg_gasd_both": {"terminal_graph": "lad-rg", "gasd_variant": "both"},
     "semantic_rag_baseline": {"lambda_bias": 1.0, "use_dfa": False, "use_topology_rag": False},
     # uncomment to add ablations:
     # "wo_topology_rag":     {"lambda_bias": 1.0, "use_dfa": True,  "use_topology_rag": False},
@@ -153,7 +155,10 @@ For a representative two-method run
 - **Reviewer calls**: 108,000 (one per sentence)
 - **Total**: ~216,000 provider calls
 
-At ~$0.0001 / 1K input tokens for DeepSeek-V2 chat, this is ballpark **a few dollars**. Adding the three ablations multiplies this by 2.5×.
+Cost depends on the active providers and prompt lengths. The approved two-backbone
+matrix targets DeepSeek-V4-Flash plus Qwen3-32B-Instruct-AWQ; calculate API and
+rented-GPU cost from the rates in force when the live run is authorized. Adding
+ablations increases the call/runtime budget proportionally.
 
 If your budget is tight: drop `--seeds` to `13 42` (2 seeds still gives std), or `--size 100`.
 

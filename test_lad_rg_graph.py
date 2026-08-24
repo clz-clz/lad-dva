@@ -189,6 +189,49 @@ def test_ror_output_is_proposals_not_raw_final_tags(monkeypatch):
     assert result["current_tags"] == ["O"]
 
 
+def test_ror_two_stage_reasoner_detects_span_then_assigns_type_without_applying_raw_tags(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0, 1.0])
+    calls = []
+
+    def fake_reasoner(stage, payload):
+        calls.append((stage, payload))
+        if stage == "span_detection":
+            return {"spans": [{"start": 0, "end": 2}]}
+        return {"types": [{"start": 0, "end": 2, "type": "ORG"}]}
+
+    result = multi_agent_v2.ror_node(
+        _state(
+            tokens=["Acme", "Labs"],
+            dirty_tags=["O", "O"],
+            candidate_paths=[["O", "O"], ["B-PER", "I-PER"]],
+            rag_weights=[0.5, 0.5],
+            ror_reasoner=fake_reasoner,
+        )
+    )
+
+    assert [stage for stage, _ in calls] == ["span_detection", "type_assignment"]
+    assert result["ror_proposals"] == {0: "ORG", 1: "ORG"}
+    assert result["ror_reasoning"]["source"] == "callback"
+    assert result["current_tags"] == ["O", "O"]
+
+
+def test_ror_reasoner_malformed_response_falls_back_to_gated_candidate_vote(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+
+    result = multi_agent_v2.ror_node(
+        _state(
+            tokens=["Alice"],
+            dirty_tags=["O"],
+            candidate_paths=[["O"], ["B-PER"]],
+            rag_weights=[0.5, 0.5],
+            ror_reasoner=lambda stage, payload: {"unexpected": True},
+        )
+    )
+
+    assert result["ror_proposals"] == {0: "PER"}
+    assert result["ror_reasoning"]["source"] == "deterministic_fallback"
+
+
 def test_ror_returns_legal_length_safe_fallback_when_candidate_pool_is_empty():
     result = multi_agent_v2.ror_node(
         _state(
@@ -220,6 +263,85 @@ def test_gasd_decodes_legal_iob2_from_candidates_potentials_and_proposals(monkey
     decoded = multi_agent_v2.gasd_node(state)["current_tags"]
     assert compute_ser([decoded]) == 0.0
     assert decoded == ["O", "B-LOC"]
+
+
+def test_gasd_r_reason_then_constrain_uses_callback_evidence_but_blocks_illegal_iob2():
+    seen = []
+
+    def fake_decoder(payload):
+        seen.append(payload)
+        return {
+            "reason": "both tokens form a location",
+            "tag_scores": [
+                {"I-LOC": 20.0, "B-LOC": 10.0},
+                {"I-LOC": 20.0},
+            ],
+        }
+
+    result = multi_agent_v2.gasd_node(
+        _state(
+            tokens=["New", "York"],
+            dirty_tags=["O", "O"],
+            current_tags=["O", "O"],
+            candidate_paths=[["O", "O"]],
+            rag_weights=[1.0],
+            ror_proposals={0: "LOC", 1: "LOC"},
+            ror_reasoning={"source": "callback", "spans": [{"start": 0, "end": 2}]},
+            gasd_variant="r",
+            gasd_reason_decoder=fake_decoder,
+        )
+    )
+
+    assert seen[0]["ror_reasoning"]["source"] == "callback"
+    assert result["current_tags"] == ["B-LOC", "I-LOC"]
+    assert compute_ser([result["current_tags"]]) == 0.0
+    assert result["gasd_variant_used"] == "r"
+
+
+def test_gasd_r_without_decoder_falls_back_safely_to_gasd_g(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+    result = multi_agent_v2.gasd_node(
+        _state(
+            tokens=["Alice"],
+            dirty_tags=["O"],
+            current_tags=["O"],
+            candidate_paths=[["O"], ["B-PER"]],
+            rag_weights=[0.5, 0.5],
+            ror_proposals={0: "PER"},
+            gasd_variant="r",
+        )
+    )
+
+    assert result["current_tags"] == ["B-PER"]
+    assert result["gasd_variant_used"] == "g_fallback"
+
+
+def test_gasd_r_decoder_error_falls_back_to_gasd_g(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+
+    def failed_decoder(payload):
+        raise RuntimeError("offline decoder unavailable")
+
+    result = multi_agent_v2.gasd_node(
+        _state(
+            tokens=["Alice"],
+            current_tags=["O"],
+            candidate_paths=[["O"], ["B-PER"]],
+            rag_weights=[0.5, 0.5],
+            ror_proposals={0: "PER"},
+            gasd_variant="r",
+            gasd_reason_decoder=failed_decoder,
+        )
+    )
+
+    assert result["current_tags"] == ["B-PER"]
+    assert result["gasd_variant_used"] == "g_fallback"
+
+
+def test_lad_rg_registers_gasd_g_r_and_both_variants():
+    assert CONFIGURATIONS["lad_rg_full"]["gasd_variant"] == "g"
+    assert CONFIGURATIONS["lad_rg_gasd_r"]["gasd_variant"] == "r"
+    assert CONFIGURATIONS["lad_rg_gasd_both"]["gasd_variant"] == "both"
 
 
 def test_gasd_potentials_false_removes_only_omega_not_proposal_bonus(monkeypatch):

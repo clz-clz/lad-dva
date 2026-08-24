@@ -7,7 +7,7 @@ import hashlib
 import threading
 from collections import Counter
 from pathlib import Path
-from typing import Annotated, TypedDict, List, Tuple
+from typing import Annotated, TypedDict, List, Optional, Tuple
 from dotenv import load_dotenv
 import argparse
 
@@ -106,9 +106,11 @@ class State(TypedDict):
     noise_type: str
     # --- Synergistic redesign (LAD-RG) — legacy, superseded by SelectDenoise ---
     ror_proposals: dict          # token-index -> proposed tag from RoR; empty when none fire
+    ror_reasoning: dict          # auditable span/type reasoning evidence; never final tags
     use_ror: bool                # enable the RoR recall stage
     ror_ungated: bool            # ablation: fire RoR everywhere (no ω/conf gate)
     gasd_potentials: bool        # integrate LADS ω(t) potentials in GASD decode
+    gasd_variant: str            # g, r, or both
     # --- SelectDenoise (two levers) ---
     # Lever 1 (generation): de-anchor ATF entity types so the correct type
     # becomes the majority across Coder paths instead of a minority.
@@ -1022,9 +1024,47 @@ def ror_node(state: State):
     omega = _omega_weights(tokens, ds) if use_lads else [0.0] * len(tokens)
     proposals = _ror_recover(tokens, base, candidate_paths, rag_weights, omega,
                              ungated=(state.get("ror_ungated", False) or not use_lads))
+    reasoning = {"source": "deterministic_fallback", "spans": []}
+    reasoner = state.get("ror_reasoner")
+    if callable(reasoner) and proposals:
+        payload = {
+            "tokens": list(tokens),
+            "base_tags": list(base),
+            "gated_positions": sorted(proposals),
+            "candidate_type_proposals": dict(proposals),
+            "valid_types": list(valid_types),
+        }
+        try:
+            span_response = reasoner("span_detection", payload)
+            spans = span_response.get("spans", []) if isinstance(span_response, dict) else []
+            valid_spans = []
+            gated = set(proposals)
+            for span in spans:
+                start, end = span.get("start"), span.get("end")
+                if (isinstance(start, int) and isinstance(end, int)
+                        and 0 <= start < end <= len(tokens)
+                        and all(i in gated for i in range(start, end))):
+                    valid_spans.append({"start": start, "end": end})
+            if valid_spans:
+                type_response = reasoner(
+                    "type_assignment", {**payload, "spans": valid_spans})
+                typed = type_response.get("types", []) if isinstance(type_response, dict) else []
+                reasoned = {}
+                for item in typed:
+                    start, end, entity_type = item.get("start"), item.get("end"), item.get("type")
+                    if ({"start": start, "end": end} in valid_spans
+                            and entity_type in valid_set):
+                        reasoned.update({i: entity_type for i in range(start, end)})
+                if reasoned:
+                    proposals = reasoned
+                    reasoning = {"source": "callback", "spans": valid_spans,
+                                 "type_assignments": typed}
+        except Exception as exc:                              # noqa: BLE001
+            logging.warning(f"[RoR] reasoner unavailable ({exc!r}); using deterministic fallback")
     if proposals:
         print(f" [RoR] {len(proposals)} gated entity-recovery proposals")
-    return {"current_tags": base, "ror_proposals": proposals}
+    return {"current_tags": base, "ror_proposals": proposals,
+            "ror_reasoning": reasoning}
 
 
 def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
@@ -1032,7 +1072,9 @@ def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
                          proposals: dict, valid_types: List[str], *,
                          use_potentials: bool = True,
                          beta_omega: float = 0.5,
-                         gamma_prop: float = 1.0) -> List[str]:
+                         gamma_prop: float = 1.0,
+                         reason_tag_scores: Optional[List[dict]] = None,
+                         candidate_scale: float = 1.0) -> List[str]:
     """GASD-G: global IOB2-constrained inference (Viterbi) over the candidate
     distribution. The per-position emission integrates three F1-relevant terms —
     candidate fidelity, LADS ω(t) entity potentials, and RoR recovery proposals —
@@ -1055,7 +1097,13 @@ def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
         for i, path in enumerate(candidate_paths):
             if pos < len(path) and path[pos] == tag:
                 vote += weights[i]
-        score = vote / W
+        score = candidate_scale * vote / W
+        if reason_tag_scores and pos < len(reason_tag_scores):
+            scores = reason_tag_scores[pos]
+            if isinstance(scores, dict):
+                raw = scores.get(tag, 0.0)
+                if isinstance(raw, (int, float)):
+                    score += float(raw)
         if tag != "O":
             etype = tag.split("-", 1)[1]
             if use_potentials:
@@ -1120,16 +1168,42 @@ def gasd_node(state: State):
             return {"current_tags": fallback}
         use_lads = state.get("use_lads", True)
         omega = _omega_weights(tokens, ds) if use_lads else [0.0] * len(tokens)
+        variant = str(state.get("gasd_variant", "g")).lower()
+        reason_scores = None
+        variant_used = "g"
+        if variant in {"r", "both"}:
+            decoder = state.get("gasd_reason_decoder")
+            if callable(decoder):
+                try:
+                    evidence = decoder({
+                        "tokens": list(tokens),
+                        "base_tags": list(base),
+                        "candidate_paths": [list(path) for path in candidate_paths],
+                        "ror_proposals": dict(proposals),
+                        "ror_reasoning": state.get("ror_reasoning", {}),
+                        "valid_tags": ["O"] + [f"{p}-{t}" for t in valid_types for p in ("B", "I")],
+                        "constraint": "hard_iob2",
+                    })
+                except Exception as exc:                      # noqa: BLE001
+                    logging.warning(f"[GASD-R] decoder unavailable ({exc!r}); using GASD-G")
+                    evidence = None
+                if isinstance(evidence, dict) and isinstance(evidence.get("tag_scores"), list):
+                    reason_scores = evidence["tag_scores"]
+                    variant_used = variant
+            if reason_scores is None:
+                variant_used = "g_fallback"
         decoded = _gasd_viterbi_decode(
             candidate_paths, weights, tokens, omega, proposals, valid_types,
             use_potentials=(state.get("gasd_potentials", True) and use_lads),
-            beta_omega=GASD_BETA_OMEGA)
+            beta_omega=GASD_BETA_OMEGA,
+            reason_tag_scores=reason_scores,
+            candidate_scale=0.0 if variant == "r" and reason_scores is not None else 1.0)
         if len(decoded) != len(tokens):
             decoded = enforce_iob2_syntax(base, valid_set)
             if len(decoded) != len(tokens):
                 decoded = (decoded[:len(tokens)]
                            + ["O"] * max(0, len(tokens) - len(decoded)))
-        return {"current_tags": decoded}
+        return {"current_tags": decoded, "gasd_variant_used": variant_used}
     except Exception as e:                                    # noqa: BLE001
         logging.error(f"[GASD] decode failed ({e!r}); legalizing base")
         fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
@@ -1349,7 +1423,7 @@ def _select_pipeline_graph(config: dict):
 
 
 #if __name__ == "__main__":
-    #parser = argparse.ArgumentParser(description="LAD-DVA Agent Runner")
+    #parser = argparse.ArgumentParser(description="LAD-RG Agent Runner")
     #parser.add_argument("--input", required=True, help="Path to input noisy jsonl")
     #parser.add_argument("--output", required=True, help="Path to save predictions")
     #args = parser.parse_args()
@@ -1447,11 +1521,15 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "noise_type": noise_type,
         # LAD-RG synergy controls. Used only by the opt-in lad-rg graph.
         "ror_proposals": {},
+        "ror_reasoning": {},
         "use_lads": config.get("use_lads", True),
         "use_ror": config.get("use_ror", True),
         "use_gasd": config.get("use_gasd", True),
         "ror_ungated": config.get("ror_ungated", False),
         "gasd_potentials": config.get("gasd_potentials", True),
+        "gasd_variant": config.get("gasd_variant", "g"),
+        "ror_reasoner": config.get("ror_reasoner"),
+        "gasd_reason_decoder": config.get("gasd_reason_decoder"),
         # SelectDenoise controls (defaults = full system)
         "deanchor_atf": config.get("deanchor_atf", True),
         "use_verifier": config.get("use_verifier", True),

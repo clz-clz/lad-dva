@@ -78,8 +78,11 @@
     "selectdenoise_contextual_lattice.py": "2d6e370468f0e4476841c2c665d9fe4a788db8cf958e31174945f14f6d92dce7",
     "contextual_lattice_runtime.py": "3a381e6650fc194cb9acd010090b0af76fb028f271fb4e320326bd6d8c107853",
     "run_contextual_lattice_gate.py": "3950140938b5f24d7a4672b0e5a6fdd21d53d6686ca7227cd6cda83c5c816a75",
-    "multi_agent_v2.py": "7a133f046c729a78d42120a1f428cfa90f74a36089d0060df9ddffac4d78ece7",
-    "run_multiseed.py": "2aacb825ebc4970d7219783b8806d92d298d8ab0e24d258be4e996bf9131de90",
+    "multi_agent_v2.py": "67865b6a8497a206fe244ad2ccc5486770d82817799f334921cbd172d9f414bf",
+    "run_multiseed.py": "55ea7e891c11280053b7126613ac9e60d1c8f67ee8b17571a4238f89b44867e3",
+    "oracle_gap.py": "5c371172dc2a65b89efe47776b9f2eae5875542d78887971986846a1d3ac6e77",
+    "test_lad_rg_graph.py": "703ec21ba2926ee85a9ff957149c7a9fe34466ddcbd2e1313a07fc5856c8446f",
+    "test_oracle_gap.py": "8726ba397e262ac74e7202fad2b0b6b4c32d38a729ea506a8d0e77051e84e8cc",
     "test_contextual_lattice.py": "f3d3dd873a1598334409476c4782d2fd94f28faae03b67c9cd6120b9e3735052",
     "test_contextual_lattice_runtime.py": "e546d88acb1bb738ab52f457150150ae424e37d3ba70cd1a11a4fb1e36fc9c8c"
   },
