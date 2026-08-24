@@ -102,11 +102,11 @@ def test_run_agent_pipeline_returns_length_safe_candidate_evidence(
 
     assert result["pred_tags"] == ["B-PER", "I-PER", "O"]
     assert result["candidate_paths"] == [
-        ["B-PER", "O", "O"],
+        ["B-PER"],
         ["B-PER", "I-PER", "O"],
     ]
     assert result["rag_weights"] == [0.25, 1.0]
-    assert result["confidence"] == pytest.approx([1.0, 0.8, 1.0])
+    assert result["confidence"] == pytest.approx([1.0, 1.0, 1.0])
 
 
 def test_run_multiseed_persists_candidate_evidence_fields(
@@ -137,9 +137,9 @@ def test_run_multiseed_persists_candidate_evidence_fields(
         captured_cfg.update(config or {})
         return {
             "pred_tags": ["B-PER", "I-PER", "O"],
-            "candidate_paths": [["B-PER", "O", "O"], ["B-PER", "I-PER", "O"]],
+            "candidate_paths": [["B-PER"], ["B-PER", "I-PER", "O"]],
             "rag_weights": [0.25, 1.0],
-            "confidence": [1.0, 0.8, 1.0],
+            "confidence": [1.0, 1.0, 1.0],
         }
 
     asyncio.run(
@@ -164,8 +164,8 @@ def test_run_multiseed_persists_candidate_evidence_fields(
             "tokens": ["Alice", "Smith", "arrived"],
             "gold_tags": ["B-PER", "I-PER", "O"],
             "pred_tags": ["B-PER", "I-PER", "O"],
-            "candidate_paths": [["B-PER", "O", "O"], ["B-PER", "I-PER", "O"]],
+            "candidate_paths": [["B-PER"], ["B-PER", "I-PER", "O"]],
             "rag_weights": [0.25, 1.0],
-            "confidence": [1.0, 0.8, 1.0],
+            "confidence": [1.0, 1.0, 1.0],
         }
     ]

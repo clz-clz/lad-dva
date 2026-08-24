@@ -1318,10 +1318,14 @@ def _per_position_confidence(candidate_paths: List[List[str]],
     conf: List[float] = []
     for pos in range(n):
         agree = 0.0
+        available_weight = 0.0
         for k, path in enumerate(candidate_paths):
-            if pos < len(path) and path[pos] == predicted_tags[pos]:
-                agree += weights[k] if k < len(weights) else 1.0
-        conf.append(agree / W)
+            if pos < len(path):
+                weight = weights[k] if k < len(weights) else 1.0
+                available_weight += weight
+                if path[pos] == predicted_tags[pos]:
+                    agree += weight
+        conf.append(agree / (available_weight or 1.0))
     return conf
 
 
@@ -1330,18 +1334,17 @@ def _normalize_candidate_evidence(candidate_paths: List[List[str]],
                                   expected_length: int) -> Tuple[List[List[str]], List[float]]:
     """Make candidate evidence safe to persist alongside a sentence.
 
-    Every path is clipped/padded to the sentence length, and weights are made
-    one-per-path so downstream consumers never need to special-case malformed
-    partial evidence from intermediate pipeline states.
+    Every usable path is clipped to the sentence length without inventing
+    synthetic suffix tags, and weights are made one-per-path so downstream
+    consumers never need to special-case malformed partial evidence.
     """
-    normalized_paths = [
-        list(path[:expected_length]) + ["O"] * max(0, expected_length - len(path))
-        for path in candidate_paths
-    ]
-    normalized_weights = [
-        float(weights[i]) if i < len(weights) else 1.0
-        for i in range(len(normalized_paths))
-    ]
+    normalized_paths: List[List[str]] = []
+    normalized_weights: List[float] = []
+    for i, path in enumerate(candidate_paths):
+        if not isinstance(path, list) or not path:
+            continue
+        normalized_paths.append(list(path[:expected_length]))
+        normalized_weights.append(float(weights[i]) if i < len(weights) else 1.0)
     return normalized_paths, normalized_weights
 
 
