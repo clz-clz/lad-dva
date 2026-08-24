@@ -74,11 +74,15 @@ CONFIGURATIONS: Dict[str, dict] = {
     "selectdenoise_verify_all":  {"deanchor_atf": True,  "use_verifier": True,
                                   "verify_all": True},
     "selectdenoise_vote":        {"deanchor_atf": False, "use_verifier": False},
-    # Legacy LAD-RG (graph no longer wires ror/gasd; kept for filename compat)
-    "lad_rg_full":               {"use_ror": True,  "gasd_potentials": True},
-    "lad_rg_no_ror":             {"use_ror": False, "gasd_potentials": True},
-    "lad_rg_no_potentials":      {"use_ror": True,  "gasd_potentials": False},
-    "lad_rg_ror_ungated":        {"use_ror": True,  "gasd_potentials": True,
+    # LAD-RG: Coder -> Reviewer/LADS -> RoR proposals -> GASD global decode
+    "lad_rg_full":               {"terminal_graph": "lad-rg",
+                                  "use_ror": True,  "gasd_potentials": True},
+    "lad_rg_no_ror":             {"terminal_graph": "lad-rg",
+                                  "use_ror": False, "gasd_potentials": True},
+    "lad_rg_no_potentials":      {"terminal_graph": "lad-rg",
+                                  "use_ror": True,  "gasd_potentials": False},
+    "lad_rg_ror_ungated":        {"terminal_graph": "lad-rg",
+                                  "use_ror": True,  "gasd_potentials": True,
                                   "ror_ungated": True},
     # Baselines (2024-2025 published & standard)
     "baseline_zero_shot":         {"method": "zero_shot"},

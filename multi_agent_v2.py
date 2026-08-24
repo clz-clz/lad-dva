@@ -1091,12 +1091,18 @@ def gasd_node(state: State):
     valid_set = set(valid_types)
 
     try:
+        if len(weights) != len(candidate_paths):
+            weights = [1.0] * len(candidate_paths)
         if not candidate_paths:
-            return {"current_tags": enforce_iob2_syntax(base, valid_set)}
+            fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
+            fallback = enforce_iob2_syntax(fallback, valid_set)
+            fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
+            return {"current_tags": fallback}
         omega = _omega_weights(tokens, ds)
         decoded = _gasd_viterbi_decode(
             candidate_paths, weights, tokens, omega, proposals, valid_types,
-            use_potentials=state.get("gasd_potentials", True))
+            use_potentials=state.get("gasd_potentials", True),
+            beta_omega=GASD_BETA_OMEGA)
         if len(decoded) != len(tokens):
             decoded = enforce_iob2_syntax(base, valid_set)
             if len(decoded) != len(tokens):
@@ -1105,7 +1111,10 @@ def gasd_node(state: State):
         return {"current_tags": decoded}
     except Exception as e:                                    # noqa: BLE001
         logging.error(f"[GASD] decode failed ({e!r}); legalizing base")
-        return {"current_tags": enforce_iob2_syntax(base, valid_set)}
+        fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
+        fallback = enforce_iob2_syntax(fallback, valid_set)
+        fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
+        return {"current_tags": fallback}
 
 
 # =====================================================================
@@ -1298,6 +1307,26 @@ workflow.add_edge("verifier", END)
 multi_agent_graph = workflow.compile()
 
 
+lad_rg_workflow = StateGraph(State)
+
+lad_rg_workflow.add_node("coder", coder_node)
+lad_rg_workflow.add_node("reviewer", reviewer_node)
+lad_rg_workflow.add_node("ror", ror_node)
+lad_rg_workflow.add_node("gasd", gasd_node)
+
+lad_rg_workflow.add_edge(START, "coder")
+lad_rg_workflow.add_edge("coder", "reviewer")
+lad_rg_workflow.add_edge("reviewer", "ror")
+lad_rg_workflow.add_edge("ror", "gasd")
+lad_rg_workflow.add_edge("gasd", END)
+
+lad_rg_graph = lad_rg_workflow.compile()
+
+
+def _select_pipeline_graph(config: dict):
+    return lad_rg_graph if config.get("terminal_graph") == "lad-rg" else multi_agent_graph
+
+
 #if __name__ == "__main__":
     #parser = argparse.ArgumentParser(description="LAD-DVA Agent Runner")
     #parser.add_argument("--input", required=True, help="Path to input noisy jsonl")
@@ -1395,7 +1424,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "use_wash": config.get("use_dfa", True),
         "dataset_name": dataset_name,
         "noise_type": noise_type,
-        # LAD-RG synergy controls (legacy; graph no longer uses ror/gasd nodes)
+        # LAD-RG synergy controls. Used only by the opt-in lad-rg graph.
         "ror_proposals": {},
         "use_ror": config.get("use_ror", True),
         "ror_ungated": config.get("ror_ungated", False),
@@ -1412,7 +1441,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
     weights: List[float] = []
     terminal_metadata = {}
     try:
-        final_state = await multi_agent_graph.ainvoke(initial_state)
+        final_state = await _select_pipeline_graph(config).ainvoke(initial_state)
         predicted_tags = final_state.get("current_tags", [])
         if not predicted_tags or len(predicted_tags) != len(tokens):
             predicted_tags = dirty_tags
