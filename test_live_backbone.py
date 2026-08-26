@@ -14,8 +14,8 @@ from live_backbone import (
 PINNED_QWEN_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
-def _response(payload: dict) -> dict:
-    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+def _response(payload: dict, **metadata) -> dict:
+    return {"choices": [{"message": {"content": json.dumps(payload)}}], **metadata}
 
 
 class _RecordingTransport:
@@ -139,6 +139,56 @@ def test_deepseek_v4_flash_ror_enables_thinking():
     assert adapter.ror_reasoner("span_detection", _payload()) == {"spans": []}
     assert transport.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
     assert adapter.settings.revision == "2026-08-01"
+
+
+def test_callback_result_retains_independent_response_metadata_without_changing_dict_api():
+    transport = _RecordingTransport(
+        [
+            _response(
+                {"spans": [{"start": 0, "end": 2}]},
+                model="qwen-served",
+                system_fingerprint="fp-span",
+                usage={"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+            ),
+            _response(
+                {"types": [{"start": 0, "end": 2, "type": "ORG"}]},
+                model="qwen-served",
+                system_fingerprint="fp-type",
+                usage={"prompt_tokens": 13, "completion_tokens": 4, "total_tokens": 17},
+            ),
+        ]
+    )
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm",
+            model="qwen",
+            base_url="http://localhost/v1",
+            api_key="x",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=transport,
+    )
+
+    span_result = adapter.ror_reasoner("span_detection", _payload())
+    type_result = adapter.ror_reasoner(
+        "type_assignment", {**_payload(), "spans": [{"start": 0, "end": 2}]}
+    )
+
+    assert span_result == {"spans": [{"start": 0, "end": 2}]}
+    assert type_result == {"types": [{"start": 0, "end": 2, "type": "ORG"}]}
+    assert span_result.provider_metadata == {
+        "stage": "ror_span_detection",
+        "provider": "vllm",
+        "model": "qwen-served",
+        "served_model": f"qwen@{PINNED_QWEN_REVISION}",
+        "revision": PINNED_QWEN_REVISION,
+        "system_fingerprint": "fp-span",
+        "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+    }
+    assert type_result.provider_metadata["stage"] == "ror_type_assignment"
+    assert type_result.provider_metadata["system_fingerprint"] == "fp-type"
+    assert type_result.provider_metadata["usage"]["total_tokens"] == 17
+    assert span_result.provider_metadata is not type_result.provider_metadata
 
 
 def test_type_assignment_requires_one_valid_type_for_every_requested_span():

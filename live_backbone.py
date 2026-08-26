@@ -18,6 +18,14 @@ class LiveBackboneError(RuntimeError):
     """A provider, response-schema, or live-backbone validation failure."""
 
 
+class LiveBackboneResult(dict):
+    """Dict-compatible callback result carrying immutable per-call evidence."""
+
+    def __init__(self, value: Mapping[str, Any], provider_metadata: Mapping[str, Any]):
+        super().__init__(value)
+        self.provider_metadata = dict(provider_metadata)
+
+
 @dataclass(frozen=True)
 class LiveBackboneSettings:
     """Configuration for one OpenAI-compatible LAD-RG provider client."""
@@ -183,26 +191,30 @@ class OpenAICompatibleLADRGAdapter:
         tokens = _tokens(payload)
         valid_types = _valid_types(payload)
         if stage == "span_detection":
-            response = self._request(
+            response, response_metadata = self._request(
                 name="lad_rg_span_detection",
                 schema=_SPAN_SCHEMA,
                 messages=_ror_messages("span_detection", payload, valid_types),
                 enable_thinking=True,
             )
-            return {"spans": _validate_spans(response, len(tokens))}
+            return LiveBackboneResult(
+                {"spans": _validate_spans(response, len(tokens))},
+                self._stage_metadata("ror_span_detection", response_metadata),
+            )
         if stage == "type_assignment":
             requested_spans = _validate_spans({"spans": payload.get("spans")}, len(tokens))
-            response = self._request(
+            response, response_metadata = self._request(
                 name="lad_rg_type_assignment",
                 schema=_TYPE_SCHEMA,
                 messages=_ror_messages("type_assignment", payload, valid_types),
                 enable_thinking=True,
             )
-            return {
-                "types": _validate_complete_types(
+            return LiveBackboneResult(
+                {"types": _validate_complete_types(
                     response, requested_spans, valid_types, len(tokens)
-                )
-            }
+                )},
+                self._stage_metadata("ror_type_assignment", response_metadata),
+            )
         raise LiveBackboneError(f"unsupported RoR stage: {stage!r}")
 
     def gasd_reason_decoder(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -214,17 +226,33 @@ class OpenAICompatibleLADRGAdapter:
         """
         tokens = _tokens(payload)
         valid_tags = _valid_tags(payload)
-        response = self._request(
+        response, response_metadata = self._request(
             name="lad_rg_gasd_r",
             schema=_GASD_SCHEMA,
             messages=_gasd_messages(payload, valid_tags),
             enable_thinking=self.settings.provider == "vllm",
         )
         reason, tags = _validate_gasd(response, len(tokens), valid_tags)
+        return LiveBackboneResult(
+            {
+                "reason": reason,
+                "tags": tags,
+                "tag_scores": [{tag: self.REASON_BONUS} for tag in tags],
+            },
+            self._stage_metadata("gasd_r", response_metadata),
+        )
+
+    def _stage_metadata(
+        self, stage: str, response_metadata: Mapping[str, Any]
+    ) -> dict[str, Any]:
         return {
-            "reason": reason,
-            "tags": tags,
-            "tag_scores": [{tag: self.REASON_BONUS} for tag in tags],
+            "stage": stage,
+            "provider": self.settings.provider,
+            "model": response_metadata.get("model") or self.settings.model,
+            "served_model": self.settings.served_model,
+            "revision": self.settings.revision,
+            "system_fingerprint": response_metadata.get("system_fingerprint"),
+            "usage": dict(response_metadata.get("usage") or {}),
         }
 
     def _request(
@@ -234,7 +262,7 @@ class OpenAICompatibleLADRGAdapter:
         schema: Mapping[str, Any],
         messages: list[dict[str, str]],
         enable_thinking: bool,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         request: dict[str, Any] = {
             "model": self.settings.model,
             "messages": messages,
@@ -253,7 +281,11 @@ class OpenAICompatibleLADRGAdapter:
                 request["extra_body"] = {"thinking": {"type": "enabled"}}
         try:
             raw = self._transport(**request)
-            return _json_response(raw)
+            return _json_response(raw), {
+                "model": _get(raw, "model"),
+                "system_fingerprint": _get(raw, "system_fingerprint"),
+                "usage": _mapping_value(_get(raw, "usage")),
+            }
         except LiveBackboneError:
             raise
         except Exception as exc:  # SDK has already applied its configured retries.
@@ -303,6 +335,18 @@ def _get(value: Any, key: str) -> Any:
     if isinstance(value, Mapping):
         return value.get(key)
     return getattr(value, key, None)
+
+
+def _mapping_value(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    for method_name in ("model_dump", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            dumped = method()
+            if isinstance(dumped, Mapping):
+                return dict(dumped)
+    return {}
 
 
 def _validate_spans(response: Mapping[str, Any], token_count: int) -> list[dict[str, int]]:

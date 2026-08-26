@@ -7,7 +7,7 @@ import hashlib
 import threading
 from collections import Counter
 from pathlib import Path
-from typing import Annotated, TypedDict, List, Optional, Tuple
+from typing import Annotated, Any, Mapping, TypedDict, List, Optional, Tuple
 from dotenv import load_dotenv
 import argparse
 
@@ -111,6 +111,10 @@ class State(TypedDict):
     ror_ungated: bool            # ablation: fire RoR everywhere (no ω/conf gate)
     gasd_potentials: bool        # integrate LADS ω(t) potentials in GASD decode
     gasd_variant: str            # g, r, or both
+    official: bool               # fail-closed launch semantics
+    provider_settings: dict      # immutable provider settings supplied by runner
+    provider_metadata: dict      # stage-separated per-response evidence
+    fallback_used: bool
     # --- SelectDenoise (two levers) ---
     # Lever 1 (generation): de-anchor ATF entity types so the correct type
     # becomes the majority across Coder paths instead of a minority.
@@ -121,6 +125,103 @@ class State(TypedDict):
     verify_all: bool             # ablation: verify every sentence (no trigger)
     verifier_topk: int           # max distinct candidate paths shown to verifier
 
+
+_PROVIDER_STAGES = ("coder", "reviewer", "ror", "gasd")
+
+
+def _provider_evidence(value: Any = None) -> dict[str, list[dict[str, Any]]]:
+    source = value if isinstance(value, Mapping) else {}
+    return {
+        stage: [dict(record) for record in source.get(stage, [])
+                if isinstance(record, Mapping)]
+        for stage in _PROVIDER_STAGES
+    }
+
+
+def _plain_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    for method_name in ("model_dump", "to_dict"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            mapped = method()
+            if isinstance(mapped, Mapping):
+                return dict(mapped)
+    return {}
+
+
+def _response_stage_record(response: Any, stage: str,
+                           provider_settings: Any = None) -> dict[str, Any]:
+    settings = _plain_mapping(provider_settings)
+    response_metadata = _plain_mapping(getattr(response, "response_metadata", None))
+    usage = _plain_mapping(getattr(response, "usage_metadata", None))
+    if not usage:
+        usage = _plain_mapping(response_metadata.get("token_usage"))
+    return {
+        "stage": stage,
+        "provider": settings.get("provider"),
+        "model": (response_metadata.get("model_name")
+                  or response_metadata.get("model")
+                  or settings.get("model")),
+        "served_model": settings.get("served_model"),
+        "revision": settings.get("revision"),
+        "system_fingerprint": response_metadata.get("system_fingerprint"),
+        "usage": usage,
+    }
+
+
+def _callback_stage_record(result: Any, stage: str,
+                           provider_settings: Any = None) -> dict[str, Any]:
+    callback_metadata = getattr(result, "provider_metadata", None)
+    if isinstance(callback_metadata, Mapping):
+        record = dict(callback_metadata)
+        record.setdefault("stage", stage)
+        record.setdefault("provider", None)
+        record.setdefault("model", None)
+        record.setdefault("served_model", None)
+        record.setdefault("revision", None)
+        record.setdefault("system_fingerprint", None)
+        record["usage"] = _plain_mapping(record.get("usage"))
+        return record
+    return _response_stage_record(None, stage, provider_settings)
+
+
+def _with_stage_records(state: Mapping[str, Any], stage: str,
+                        records: List[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    evidence = _provider_evidence(state.get("provider_metadata"))
+    evidence[stage].extend(records)
+    return evidence
+
+
+def _official_tag_path(content: Any, expected_length: int,
+                       valid_tags: set[str]) -> List[str]:
+    if not isinstance(content, str):
+        raise ValueError("official Coder response content must be a JSON string")
+    try:
+        path = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("official Coder response must be valid JSON") from exc
+    if not isinstance(path, list) or not all(isinstance(tag, str) for tag in path):
+        raise ValueError("official Coder response must be a JSON tag list")
+    if len(path) != expected_length:
+        raise ValueError("official Coder response must contain exactly one tag per token")
+    if any(tag not in valid_tags for tag in path):
+        raise ValueError("official Coder response uses a tag outside the dataset ontology")
+    return list(path)
+
+
+def _official_reviewer_weights(content: Any, expected_length: int) -> List[float]:
+    if not isinstance(content, str):
+        raise ValueError("official Reviewer response content must be a JSON string")
+    try:
+        values = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError("official Reviewer response must be valid JSON") from exc
+    if (not isinstance(values, list) or len(values) != expected_length
+            or not all(type(value) in (int, float) and 0.0 <= value <= 1.0
+                       for value in values)):
+        raise ValueError("official Reviewer response must contain one score in [0, 1] per path")
+    return [float(value) for value in values]
     
 
 def extract_nested_json_list(llm_output: str, expected_paths: int = 5) -> List[List[str]]:
@@ -247,6 +348,7 @@ async def coder_node(state: State):
     tokens = state.get("tokens", [])
     dirty_tags = state.get("dirty_tags", [])
     dataset_name = state.get("dataset_name", "conll2003")
+    official = bool(state.get("official", False))
     noise_type = state.get("noise_type", "BT")
     deanchor_atf = state.get("deanchor_atf", False) and noise_type == "ATF"
     valid_tags_str = _format_valid_tags(dataset_name)
@@ -358,8 +460,19 @@ Output ONLY the JSON list, no markdown, no explanation."""
 
     candidate_paths = []
     for r in responses:
-        path = extract_json_list(r.content, fallback_length=len(tokens))
+        valid_types = DATASET_ENTITY_TYPES.get(dataset_name, ["PER", "LOC", "ORG"])
+        valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                              for entity_type in valid_types for prefix in ("B", "I")}
+        path = (_official_tag_path(r.content, len(tokens), valid_tags) if official
+                else extract_json_list(r.content, fallback_length=len(tokens)))
         candidate_paths.append(path)
+
+    coder_records = [
+        _response_stage_record(
+            response, f"coder_path_{index}", state.get("provider_settings")
+        )
+        for index, response in enumerate(responses, start=1)
+    ]
 
     # Length normalization
     candidate_paths = [p[:len(tokens)] + ["O"] * max(0, len(tokens) - len(p)) for p in candidate_paths]
@@ -441,6 +554,7 @@ Output ONLY the JSON list, no markdown, no explanation."""
                   f"(BT/IF: O-tag + type + boundary protection)")
 
     # Diversity check: if all paths identical, fallback to dirty when harmful
+    fallback_used = bool(state.get("fallback_used", False))
     if _all_paths_identical(candidate_paths):
         only_path = candidate_paths[0]
         all_o = all(t == "O" for t in only_path)
@@ -450,13 +564,19 @@ Output ONLY the JSON list, no markdown, no explanation."""
             print(f" [Coder] All paths identical (all O) with entities in dirty — "
                   f"overriding with dirty tags")
             candidate_paths = [list(dirty_tags) for _ in range(5)]
+            fallback_used = True
         else:
             # Paths identical but not all-O: LLM is confident, proceed
             n_diff = sum(1 for a, b in zip(only_path, dirty_tags) if a != b)
             print(f" [Coder] All {len(candidate_paths)} paths identical "
                   f"({n_diff} diffs vs dirty) — LLM consensus, skipping diversity")
 
-    return {"candidate_paths": candidate_paths, "iterations": state.get("iterations", 0) + 1}
+    return {
+        "candidate_paths": candidate_paths,
+        "iterations": state.get("iterations", 0) + 1,
+        "provider_metadata": _with_stage_records(state, "coder", coder_records),
+        "fallback_used": fallback_used,
+    }
 
 def _all_paths_identical(paths: List[List[str]]) -> bool:
     """Check if all candidate paths are identical."""
@@ -807,8 +927,20 @@ async def reviewer_node(state: State):
     """
 
     response = await asyncio.to_thread(llm.invoke, reviewer_prompt)
-    rag_weights = extract_float_weights(response.content, expected_len=len(candidate_paths))
-    return {"rag_weights": rag_weights}
+    rag_weights = (
+        _official_reviewer_weights(response.content, len(candidate_paths))
+        if state.get("official", False)
+        else extract_float_weights(response.content, expected_len=len(candidate_paths))
+    )
+    reviewer_record = _response_stage_record(
+        response, "reviewer", state.get("provider_settings")
+    )
+    return {
+        "rag_weights": rag_weights,
+        "provider_metadata": _with_stage_records(
+            state, "reviewer", [reviewer_record]
+        ),
+    }
 
 def _weighted_majority_voting(candidate_paths: List[List[str]],
                               weights: List[float],
@@ -989,6 +1121,57 @@ def _ror_recover(tokens: List[str], base: List[str],
     return proposals
 
 
+def _official_ror_spans(response: Any, token_count: int,
+                        gated_positions: set[int]) -> List[dict[str, int]]:
+    if (not isinstance(response, Mapping) or set(response) != {"spans"}
+            or not isinstance(response.get("spans"), list)):
+        raise ValueError("official RoR span response has an invalid schema")
+    validated = []
+    seen = set()
+    for span in response["spans"]:
+        if not isinstance(span, Mapping) or set(span) != {"start", "end"}:
+            raise ValueError("official RoR span item has an invalid schema")
+        start, end = span["start"], span["end"]
+        pair = (start, end)
+        if (type(start) is not int or type(end) is not int
+                or not 0 <= start < end <= token_count
+                or not all(index in gated_positions for index in range(start, end))
+                or pair in seen):
+            raise ValueError("official RoR span is invalid or outside the gated positions")
+        seen.add(pair)
+        validated.append({"start": start, "end": end})
+    return validated
+
+
+def _official_ror_types(response: Any, spans: List[dict[str, int]],
+                        valid_types: set[str]) -> tuple[List[dict[str, Any]], dict[int, str]]:
+    if (not isinstance(response, Mapping) or set(response) != {"types"}
+            or not isinstance(response.get("types"), list)):
+        raise ValueError("official RoR type response has an invalid schema")
+    requested = {(span["start"], span["end"]) for span in spans}
+    seen = set()
+    typed = []
+    proposals = {}
+    for item in response["types"]:
+        if (not isinstance(item, Mapping)
+                or set(item) != {"start", "end", "type"}):
+            raise ValueError("official RoR type item has an invalid schema")
+        start, end, entity_type = item["start"], item["end"], item["type"]
+        span = (start, end)
+        if (type(start) is not int or type(end) is not int
+                or not isinstance(entity_type, str)
+                or span not in requested or span in seen
+                or entity_type not in valid_types):
+            raise ValueError("official RoR type item is incomplete or outside the ontology")
+        seen.add(span)
+        record = {"start": start, "end": end, "type": entity_type}
+        typed.append(record)
+        proposals.update({index: entity_type for index in range(start, end)})
+    if seen != requested:
+        raise ValueError("official RoR type response must type every live span")
+    return typed, proposals
+
+
 def ror_node(state: State):
     """Recall-Oriented Reasoning stage (replaces voting_node).
 
@@ -1003,30 +1186,59 @@ def ror_node(state: State):
     ds = state.get("dataset_name", "conll2003")
     valid_types = DATASET_ENTITY_TYPES.get(ds, ["PER", "LOC", "ORG"])
     valid_set = set(valid_types)
+    official = bool(state.get("official", False))
+    fallback_used = bool(state.get("fallback_used", False))
 
     if not candidate_paths:
+        if official:
+            raise ValueError("official RoR requires a non-empty candidate pool")
         fallback = state.get("current_tags", []) or dirty_tags or ["O"] * len(tokens)
         fallback = enforce_iob2_syntax(fallback, valid_set)
         fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
-        return {"current_tags": fallback, "ror_proposals": {}}
+        return {"current_tags": fallback, "ror_proposals": {},
+                "ror_reasoning": {"source": "not_triggered", "spans": []},
+                "fallback_used": True}
 
     if not rag_weights or len(rag_weights) != len(candidate_paths):
+        if official:
+            raise ValueError("official RoR requires one Reviewer weight per candidate")
         rag_weights = [1.0] * len(candidate_paths)
+
+    if official:
+        valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                              for entity_type in valid_types for prefix in ("B", "I")}
+        if any(not isinstance(path, list) or len(path) != len(tokens)
+               or any(tag not in valid_tags for tag in path)
+               for path in candidate_paths):
+            raise ValueError("official RoR candidate path has invalid length or ontology")
 
     base = _weighted_majority_voting(
         candidate_paths, rag_weights, entity_boost=1.0,
         dirty_tags=dirty_tags, consensus_ratio=0.6)
 
     if not state.get("use_ror", True):
-        return {"current_tags": base, "ror_proposals": {}}
+        return {"current_tags": base, "ror_proposals": {},
+                "ror_reasoning": {"source": "disabled", "spans": []},
+                "fallback_used": fallback_used}
 
     use_lads = state.get("use_lads", True)
     omega = _omega_weights(tokens, ds) if use_lads else [0.0] * len(tokens)
     proposals = _ror_recover(tokens, base, candidate_paths, rag_weights, omega,
                              ungated=(state.get("ror_ungated", False) or not use_lads))
+    if not proposals:
+        return {
+            "current_tags": base,
+            "ror_proposals": {},
+            "ror_reasoning": {"source": "not_triggered", "spans": []},
+            "fallback_used": fallback_used,
+        }
+
     reasoning = {"source": "deterministic_fallback", "spans": []}
+    ror_records = []
     reasoner = state.get("ror_reasoner")
-    if callable(reasoner) and proposals:
+    if official and not callable(reasoner):
+        raise RuntimeError("official RoR requires a live ror_reasoner callback")
+    if callable(reasoner):
         payload = {
             "tokens": list(tokens),
             "base_tags": list(base),
@@ -1036,35 +1248,62 @@ def ror_node(state: State):
         }
         try:
             span_response = reasoner("span_detection", payload)
-            spans = span_response.get("spans", []) if isinstance(span_response, dict) else []
-            valid_spans = []
             gated = set(proposals)
-            for span in spans:
-                start, end = span.get("start"), span.get("end")
-                if (isinstance(start, int) and isinstance(end, int)
-                        and 0 <= start < end <= len(tokens)
-                        and all(i in gated for i in range(start, end))):
-                    valid_spans.append({"start": start, "end": end})
+            ror_records.append(_callback_stage_record(
+                span_response, "ror_span_detection", state.get("provider_settings")))
+            if official:
+                valid_spans = _official_ror_spans(span_response, len(tokens), gated)
+            else:
+                spans = span_response.get("spans", []) if isinstance(span_response, dict) else []
+                valid_spans = []
+                for span in spans:
+                    start, end = span.get("start"), span.get("end")
+                    if (isinstance(start, int) and isinstance(end, int)
+                            and 0 <= start < end <= len(tokens)
+                            and all(i in gated for i in range(start, end))):
+                        valid_spans.append({"start": start, "end": end})
+            live_rejected_all = (
+                isinstance(span_response, Mapping)
+                and isinstance(span_response.get("spans"), list)
+                and len(span_response["spans"]) == 0
+            )
+            if not valid_spans and (official or live_rejected_all):
+                proposals = {}
+                reasoning = {"source": "live", "spans": []}
             if valid_spans:
                 type_response = reasoner(
                     "type_assignment", {**payload, "spans": valid_spans})
-                typed = type_response.get("types", []) if isinstance(type_response, dict) else []
-                reasoned = {}
-                for item in typed:
-                    start, end, entity_type = item.get("start"), item.get("end"), item.get("type")
-                    if ({"start": start, "end": end} in valid_spans
-                            and entity_type in valid_set):
-                        reasoned.update({i: entity_type for i in range(start, end)})
+                ror_records.append(_callback_stage_record(
+                    type_response, "ror_type_assignment", state.get("provider_settings")))
+                if official:
+                    typed, reasoned = _official_ror_types(
+                        type_response, valid_spans, valid_set)
+                else:
+                    typed = type_response.get("types", []) if isinstance(type_response, dict) else []
+                    reasoned = {}
+                    for item in typed:
+                        start, end, entity_type = item.get("start"), item.get("end"), item.get("type")
+                        if ({"start": start, "end": end} in valid_spans
+                                and entity_type in valid_set):
+                            reasoned.update({i: entity_type for i in range(start, end)})
                 if reasoned:
                     proposals = reasoned
-                    reasoning = {"source": "callback", "spans": valid_spans,
+                    reasoning = {"source": "live" if official else "callback",
+                                 "spans": valid_spans,
                                  "type_assignments": typed}
         except Exception as exc:                              # noqa: BLE001
+            if official:
+                raise
             logging.warning(f"[RoR] reasoner unavailable ({exc!r}); using deterministic fallback")
+            fallback_used = True
+    elif proposals:
+        fallback_used = True
     if proposals:
         print(f" [RoR] {len(proposals)} gated entity-recovery proposals")
     return {"current_tags": base, "ror_proposals": proposals,
-            "ror_reasoning": reasoning}
+            "ror_reasoning": reasoning,
+            "provider_metadata": _with_stage_records(state, "ror", ror_records),
+            "fallback_used": fallback_used}
 
 
 def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
@@ -1141,6 +1380,40 @@ def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
     return seq
 
 
+def _official_reason_scores(evidence: Any, token_count: int,
+                            valid_tags: set[str]) -> List[dict[str, float]]:
+    if (not isinstance(evidence, Mapping)
+            or not isinstance(evidence.get("reason"), str)
+            or not isinstance(evidence.get("tags"), list)
+            or not isinstance(evidence.get("tag_scores"), list)):
+        raise ValueError("official GASD-R response has an invalid schema")
+    tags = evidence["tags"]
+    if (len(tags) != token_count
+            or any(not isinstance(tag, str) or tag not in valid_tags for tag in tags)):
+        raise ValueError("official GASD-R tags have invalid length or ontology")
+    scores = evidence["tag_scores"]
+    if len(scores) != token_count:
+        raise ValueError("official GASD-R response must score every token")
+    normalized = []
+    for token_scores in scores:
+        if (not isinstance(token_scores, Mapping) or not token_scores
+                or any(tag not in valid_tags
+                       or type(score) not in (int, float)
+                       for tag, score in token_scores.items())):
+            raise ValueError("official GASD-R scores use an invalid ontology or schema")
+        normalized.append({tag: float(score) for tag, score in token_scores.items()})
+    return normalized
+
+
+def _is_legal_tag_sequence(tags: List[str]) -> bool:
+    previous = "O"
+    for tag in tags:
+        if not _is_valid_transition(previous, tag):
+            return False
+        previous = tag
+    return True
+
+
 def gasd_node(state: State):
     """GASD structural integrator (replaces physical_wash_node)."""
     print(f"\n [GASD] global constrained decode")
@@ -1152,27 +1425,49 @@ def gasd_node(state: State):
     ds = state.get("dataset_name", "conll2003")
     valid_types = DATASET_ENTITY_TYPES.get(ds, ["PER", "LOC", "ORG"])
     valid_set = set(valid_types)
+    valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                          for entity_type in valid_types for prefix in ("B", "I")}
+    official = bool(state.get("official", False))
+    fallback_used = bool(state.get("fallback_used", False))
+    variant = str(state.get("gasd_variant", "g")).lower()
+    gasd_records = []
 
     try:
         if not state.get("use_gasd", True):
             fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
             fallback = enforce_iob2_syntax(fallback, valid_set)
             fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
-            return {"current_tags": fallback}
+            return {"current_tags": fallback,
+                    "gasd_variant_requested": variant,
+                    "gasd_variant_used": "disabled",
+                    "fallback_used": fallback_used}
         if len(weights) != len(candidate_paths):
+            if official:
+                raise ValueError("official GASD requires one weight per candidate")
             weights = [1.0] * len(candidate_paths)
         if not candidate_paths:
+            if official:
+                raise ValueError("official GASD requires a non-empty candidate pool")
             fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
             fallback = enforce_iob2_syntax(fallback, valid_set)
             fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
-            return {"current_tags": fallback}
+            return {"current_tags": fallback,
+                    "gasd_variant_requested": variant,
+                    "gasd_variant_used": "g_fallback",
+                    "fallback_used": True}
+        if official and (variant not in {"g", "r", "both"}
+                         or any(not isinstance(path, list) or len(path) != len(tokens)
+                                or any(tag not in valid_tags for tag in path)
+                                for path in candidate_paths)):
+            raise ValueError("official GASD variant or candidate ontology is invalid")
         use_lads = state.get("use_lads", True)
         omega = _omega_weights(tokens, ds) if use_lads else [0.0] * len(tokens)
-        variant = str(state.get("gasd_variant", "g")).lower()
         reason_scores = None
         variant_used = "g"
         if variant in {"r", "both"}:
             decoder = state.get("gasd_reason_decoder")
+            if official and not callable(decoder):
+                raise RuntimeError("official GASD-R requires a live gasd_reason_decoder callback")
             if callable(decoder):
                 try:
                     evidence = decoder({
@@ -1185,13 +1480,23 @@ def gasd_node(state: State):
                         "constraint": "hard_iob2",
                     })
                 except Exception as exc:                      # noqa: BLE001
+                    if official:
+                        raise
                     logging.warning(f"[GASD-R] decoder unavailable ({exc!r}); using GASD-G")
                     evidence = None
-                if isinstance(evidence, dict) and isinstance(evidence.get("tag_scores"), list):
+                if evidence is not None:
+                    gasd_records.append(_callback_stage_record(
+                        evidence, "gasd_r", state.get("provider_settings")))
+                if official:
+                    reason_scores = _official_reason_scores(
+                        evidence, len(tokens), valid_tags)
+                    variant_used = variant
+                elif isinstance(evidence, dict) and isinstance(evidence.get("tag_scores"), list):
                     reason_scores = evidence["tag_scores"]
                     variant_used = variant
             if reason_scores is None:
                 variant_used = "g_fallback"
+                fallback_used = True
         decoded = _gasd_viterbi_decode(
             candidate_paths, weights, tokens, omega, proposals, valid_types,
             use_potentials=(state.get("gasd_potentials", True) and use_lads),
@@ -1199,17 +1504,32 @@ def gasd_node(state: State):
             reason_tag_scores=reason_scores,
             candidate_scale=0.0 if variant == "r" and reason_scores is not None else 1.0)
         if len(decoded) != len(tokens):
+            if official:
+                raise ValueError("official GASD decoder returned the wrong sequence length")
             decoded = enforce_iob2_syntax(base, valid_set)
             if len(decoded) != len(tokens):
                 decoded = (decoded[:len(tokens)]
                            + ["O"] * max(0, len(tokens) - len(decoded)))
-        return {"current_tags": decoded, "gasd_variant_used": variant_used}
+                fallback_used = True
+        if official and (any(tag not in valid_tags for tag in decoded)
+                         or not _is_legal_tag_sequence(decoded)):
+            raise ValueError("official GASD decoder violated hard IOB2 legality")
+        return {"current_tags": decoded,
+                "gasd_variant_requested": variant,
+                "gasd_variant_used": variant_used,
+                "provider_metadata": _with_stage_records(state, "gasd", gasd_records),
+                "fallback_used": fallback_used}
     except Exception as e:                                    # noqa: BLE001
+        if official:
+            raise
         logging.error(f"[GASD] decode failed ({e!r}); legalizing base")
         fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
         fallback = enforce_iob2_syntax(fallback, valid_set)
         fallback = fallback[:len(tokens)] + ["O"] * max(0, len(tokens) - len(fallback))
-        return {"current_tags": fallback}
+        return {"current_tags": fallback,
+                "gasd_variant_requested": variant,
+                "gasd_variant_used": "g_fallback",
+                "fallback_used": True}
 
 
 # =====================================================================
@@ -1488,11 +1808,14 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
     """
     if config is None:
         config = {"lambda_bias": 1.0, "use_dfa": True}
+    official = bool(config.get("official", False))
 
     # Dataset name resolution: explicit arg → config["__dataset__"] → default
     if dataset_name is None:
         dataset_name = config.get("__dataset__", "conll2003")
     if dataset_name not in DATASET_ENTITY_TYPES:
+        if official:
+            raise ValueError(f"unknown official dataset ontology: {dataset_name!r}")
         logging.warning(f"[!] Unknown dataset_name={dataset_name!r}; "
                        f"defaulting to conll2003 ontology. "
                        f"Known: {list(DATASET_ENTITY_TYPES)}")
@@ -1530,6 +1853,12 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "gasd_variant": config.get("gasd_variant", "g"),
         "ror_reasoner": config.get("ror_reasoner"),
         "gasd_reason_decoder": config.get("gasd_reason_decoder"),
+        "official": official,
+        "provider_settings": (dict(config.get("provider_metadata", {}))
+                              if isinstance(config.get("provider_metadata"), Mapping)
+                              else {}),
+        "provider_metadata": _provider_evidence(),
+        "fallback_used": False,
         # SelectDenoise controls (defaults = full system)
         "deanchor_atf": config.get("deanchor_atf", True),
         "use_verifier": config.get("use_verifier", True),
@@ -1541,19 +1870,46 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
     cand: List[List[str]] = []
     weights: List[float] = []
     terminal_metadata = {}
+    official_metadata = {}
     try:
         final_state = await _select_pipeline_graph(config).ainvoke(initial_state)
         predicted_tags = final_state.get("current_tags", [])
         if not predicted_tags or len(predicted_tags) != len(tokens):
+            if official:
+                raise ValueError("official pipeline returned the wrong tag sequence length")
             predicted_tags = dirty_tags
         cand = final_state.get("candidate_paths", []) or []
         weights = final_state.get("rag_weights", []) or [1.0] * len(cand)
         if terminal is not None:
             terminal_metadata = _apply_contextual_lattice_terminal(final_state, terminal)
             predicted_tags = terminal_metadata["current_tags"]
+        if official:
+            valid_types = DATASET_ENTITY_TYPES[dataset_name]
+            valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                                  for entity_type in valid_types for prefix in ("B", "I")}
+            if (any(tag not in valid_tags for tag in predicted_tags)
+                    or not _is_legal_tag_sequence(predicted_tags)):
+                raise ValueError("official pipeline returned an illegal or out-of-ontology sequence")
+            reasoning = final_state.get("ror_reasoning", {})
+            requested = str(final_state.get(
+                "gasd_variant_requested", config.get("gasd_variant", "g"))).lower()
+            used = final_state.get("gasd_variant_used")
+            if requested in {"r", "both"} and used == "g_fallback":
+                raise RuntimeError("official GASD-R cannot use g_fallback")
+            official_metadata = {
+                "ror_reasoning_source": (
+                    reasoning.get("source") if isinstance(reasoning, Mapping) else None
+                ),
+                "gasd_variant_requested": requested,
+                "gasd_variant_used": used,
+                "provider_metadata": _provider_evidence(
+                    final_state.get("provider_metadata")
+                ),
+                "fallback_used": bool(final_state.get("fallback_used", False)),
+            }
     except Exception as e:
         logging.error(f"[-] Pipeline : {e}")
-        if terminal is not None:
+        if official or terminal is not None:
             raise
         predicted_tags = dirty_tags
 
@@ -1566,6 +1922,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "rag_weights": weights,
         "confidence": _per_position_confidence(cand, weights, predicted_tags),
         **terminal_metadata,
+        **official_metadata,
     }
 
 

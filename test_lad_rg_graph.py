@@ -232,6 +232,95 @@ def test_ror_reasoner_malformed_response_falls_back_to_gated_candidate_vote(monk
     assert result["ror_reasoning"]["source"] == "deterministic_fallback"
 
 
+def test_ror_reports_not_triggered_without_calling_provider(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+
+    def should_not_run(stage, payload):
+        raise AssertionError("RoR provider must not run without gated proposals")
+
+    result = multi_agent_v2.ror_node(
+        _state(
+            tokens=["arrived"],
+            dirty_tags=["O"],
+            candidate_paths=[["O"], ["O"]],
+            rag_weights=[0.5, 0.5],
+            official=True,
+            ror_reasoner=should_not_run,
+        )
+    )
+
+    assert result["ror_proposals"] == {}
+    assert result["ror_reasoning"]["source"] == "not_triggered"
+
+
+def test_ror_live_empty_span_response_rejects_all_deterministic_proposals(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+    calls = []
+
+    def reasoner(stage, payload):
+        calls.append(stage)
+        return {"spans": []}
+
+    result = multi_agent_v2.ror_node(
+        _state(
+            tokens=["Alice"],
+            dirty_tags=["O"],
+            candidate_paths=[["O"], ["B-PER"]],
+            rag_weights=[0.5, 0.5],
+            official=True,
+            ror_reasoner=reasoner,
+        )
+    )
+
+    assert calls == ["span_detection"]
+    assert result["ror_proposals"] == {}
+    assert result["ror_reasoning"] == {"source": "live", "spans": []}
+
+
+@pytest.mark.parametrize(
+    "reasoner",
+    [
+        None,
+        lambda stage, payload: (_ for _ in ()).throw(RuntimeError("provider down")),
+        lambda stage, payload: {"unexpected": True},
+    ],
+)
+def test_official_ror_missing_failed_or_malformed_callback_raises(monkeypatch, reasoner):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+    with pytest.raises(Exception):
+        multi_agent_v2.ror_node(
+            _state(
+                tokens=["Alice"],
+                dirty_tags=["O"],
+                candidate_paths=[["O"], ["B-PER"]],
+                rag_weights=[0.5, 0.5],
+                official=True,
+                ror_reasoner=reasoner,
+            )
+        )
+
+
+def test_official_ror_rejects_boolean_offsets_in_type_response(monkeypatch):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+
+    def reasoner(stage, payload):
+        if stage == "span_detection":
+            return {"spans": [{"start": 0, "end": 1}]}
+        return {"types": [{"start": False, "end": 1, "type": "PER"}]}
+
+    with pytest.raises(ValueError, match="type item"):
+        multi_agent_v2.ror_node(
+            _state(
+                tokens=["Alice"],
+                dirty_tags=["O"],
+                candidate_paths=[["O"], ["B-PER"]],
+                rag_weights=[0.5, 0.5],
+                official=True,
+                ror_reasoner=reasoner,
+            )
+        )
+
+
 def test_ror_returns_legal_length_safe_fallback_when_candidate_pool_is_empty():
     result = multi_agent_v2.ror_node(
         _state(
@@ -336,6 +425,184 @@ def test_gasd_r_decoder_error_falls_back_to_gasd_g(monkeypatch):
 
     assert result["current_tags"] == ["B-PER"]
     assert result["gasd_variant_used"] == "g_fallback"
+
+
+@pytest.mark.parametrize("variant", ["r", "both"])
+@pytest.mark.parametrize(
+    "decoder",
+    [
+        None,
+        lambda payload: (_ for _ in ()).throw(RuntimeError("provider down")),
+        lambda payload: {"tag_scores": [{"B-NOT-IN-ONTOLOGY": 2.0}]},
+        lambda payload: {
+            "reason": "inconsistent",
+            "tags": ["B-NOT-IN-ONTOLOGY"],
+            "tag_scores": [{"B-PER": 2.0}],
+        },
+    ],
+)
+def test_official_gasd_reason_variants_fail_closed(monkeypatch, variant, decoder):
+    monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
+    with pytest.raises(Exception):
+        multi_agent_v2.gasd_node(
+            _state(
+                tokens=["Alice"],
+                dirty_tags=["O"],
+                current_tags=["O"],
+                candidate_paths=[["O"], ["B-PER"]],
+                rag_weights=[0.5, 0.5],
+                ror_proposals={0: "PER"},
+                gasd_variant=variant,
+                gasd_reason_decoder=decoder,
+                official=True,
+            )
+        )
+
+
+def test_official_pipeline_propagates_graph_failures_while_legacy_falls_back(monkeypatch):
+    class _FailedGraph:
+        async def ainvoke(self, state):
+            raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _FailedGraph())
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(
+            multi_agent_v2.run_agent_pipeline(
+                ["Alice"],
+                ["O"],
+                {"terminal_graph": "lad-rg", "official": True},
+                dataset_name="conll2003",
+            )
+        )
+
+    assert asyncio.run(
+        multi_agent_v2.run_agent_pipeline(
+            ["Alice"],
+            ["O"],
+            {"terminal_graph": "lad-rg"},
+            dataset_name="conll2003",
+        )
+    ) == ["O"]
+
+
+def test_official_pipeline_rejects_unknown_dataset_ontology_before_graph(monkeypatch):
+    class _Graph:
+        async def ainvoke(self, state):
+            return {"current_tags": ["O"], "candidate_paths": [["O"]], "rag_weights": [1.0]}
+
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _Graph())
+    with pytest.raises(ValueError, match="dataset ontology"):
+        asyncio.run(
+            multi_agent_v2.run_agent_pipeline(
+                ["Alice"],
+                ["O"],
+                {"terminal_graph": "lad-rg", "official": True},
+                dataset_name="unknown-dataset",
+            )
+        )
+
+
+def test_official_candidate_evidence_exposes_stage_separated_launch_fields(monkeypatch):
+    provider_metadata = {
+        "coder": [{"stage": "coder_path_1", "model": "m", "revision": None,
+                   "system_fingerprint": None, "usage": {}}],
+        "reviewer": [],
+        "ror": [{"stage": "ror_span_detection", "model": "m", "revision": None,
+                 "system_fingerprint": "fp", "usage": {}}],
+        "gasd": [{"stage": "gasd_r", "model": "m", "revision": None,
+                  "system_fingerprint": "fp", "usage": {}}],
+    }
+
+    class _EvidenceGraph:
+        async def ainvoke(self, state):
+            return {
+                "current_tags": ["B-PER"],
+                "candidate_paths": [["B-PER"]],
+                "rag_weights": [1.0],
+                "ror_reasoning": {"source": "live", "spans": [{"start": 0, "end": 1}]},
+                "gasd_variant_requested": "r",
+                "gasd_variant_used": "r",
+                "provider_metadata": provider_metadata,
+                "fallback_used": False,
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _EvidenceGraph())
+    result = asyncio.run(
+        multi_agent_v2.run_agent_pipeline(
+            ["Alice"],
+            ["O"],
+            {
+                "terminal_graph": "lad-rg",
+                "official": True,
+                "gasd_variant": "r",
+                "__return_candidates__": True,
+            },
+            dataset_name="conll2003",
+        )
+    )
+
+    assert result["ror_reasoning_source"] == "live"
+    assert result["gasd_variant_requested"] == "r"
+    assert result["gasd_variant_used"] == "r"
+    assert result["provider_metadata"] == provider_metadata
+    assert result["fallback_used"] is False
+
+
+def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(monkeypatch):
+    class _Message:
+        def __init__(self, content, stage):
+            self.content = content
+            self.response_metadata = {
+                "model_name": "served-model",
+                "system_fingerprint": f"fp-{stage}",
+                "token_usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            }
+            self.usage_metadata = None
+
+    class _CoderLLM:
+        def invoke(self, prompt):
+            return _Message('["O", "O"]', "coder")
+
+    class _ReviewerLLM:
+        def invoke(self, prompt):
+            return _Message("[0.75, 0.25]", "reviewer")
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
+    coded = asyncio.run(
+        multi_agent_v2.coder_node(
+            _state(
+                official=True,
+                tokens=["Alice", "arrived"],
+                dirty_tags=["O", "O"],
+                candidate_paths=[],
+                provider_settings={"provider": "vllm", "revision": "rev-1"},
+                provider_metadata={"coder": [], "reviewer": [], "ror": [], "gasd": []},
+            )
+        )
+    )
+    assert len(coded["provider_metadata"]["coder"]) == 3
+    assert coded["provider_metadata"]["reviewer"] == []
+    assert coded["provider_metadata"]["coder"][0]["system_fingerprint"] == "fp-coder"
+
+    monkeypatch.setattr(multi_agent_v2, "llm", _ReviewerLLM())
+    reviewed = asyncio.run(
+        multi_agent_v2.reviewer_node(
+            _state(
+                official=True,
+                candidate_paths=[["O", "O"], ["B-PER", "O"]],
+                provider_settings={"provider": "vllm", "revision": "rev-1"},
+                provider_metadata=coded["provider_metadata"],
+            )
+        )
+    )
+    assert len(reviewed["provider_metadata"]["coder"]) == 3
+    assert reviewed["provider_metadata"]["reviewer"][0]["stage"] == "reviewer"
+    assert reviewed["provider_metadata"]["reviewer"][0]["usage"] == {
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+    }
 
 
 def test_lad_rg_registers_gasd_g_r_and_both_variants():
