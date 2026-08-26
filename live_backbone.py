@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -37,11 +38,25 @@ class LiveBackboneSettings:
             raise ValueError("BACKBONE_MODEL must not be empty")
         if not self.base_url:
             raise ValueError("BACKBONE_BASE_URL must not be empty")
+        if provider == "deepseek" and self.model != "deepseek-v4-flash":
+            raise ValueError("DeepSeek LAD-RG requires BACKBONE_MODEL=deepseek-v4-flash")
+        if provider == "vllm" and (
+            not isinstance(self.revision, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", self.revision)
+        ):
+            raise ValueError("vLLM/Qwen requires an immutable 40-hex BACKBONE_REVISION")
         if self.timeout_seconds != 120.0:
             raise ValueError("live LAD-RG provider timeout must be 120 seconds")
         if not 0 <= self.max_retries <= 2:
             raise ValueError("live LAD-RG SDK retries must be between 0 and 2")
         object.__setattr__(self, "provider", provider)
+
+    @property
+    def served_model(self) -> str:
+        """The provider model identifier that binds vLLM requests to a revision."""
+        if self.provider == "vllm":
+            return f"{self.model}@{self.revision}"
+        return self.model
 
     @classmethod
     def from_env(cls) -> "LiveBackboneSettings":
@@ -156,6 +171,7 @@ class OpenAICompatibleLADRGAdapter:
         return {
             "provider": self.settings.provider,
             "model": self.settings.model,
+            "served_model": self.settings.served_model,
             "revision": self.settings.revision,
             "base_url": self.settings.base_url,
             "timeout_seconds": self.settings.timeout_seconds,
@@ -220,7 +236,7 @@ class OpenAICompatibleLADRGAdapter:
         enable_thinking: bool,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
-            "model": self.settings.model,
+            "model": self.settings.served_model,
             "messages": messages,
             "timeout": self.settings.timeout_seconds,
         }
@@ -233,7 +249,7 @@ class OpenAICompatibleLADRGAdapter:
                 request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
         else:
             request["response_format"] = {"type": "json_object"}
-            if enable_thinking and self.settings.model == "deepseek-v4-flash":
+            if enable_thinking:
                 request["extra_body"] = {"thinking": {"type": "enabled"}}
         try:
             raw = self._transport(**request)

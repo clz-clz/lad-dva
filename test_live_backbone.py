@@ -11,6 +11,9 @@ from live_backbone import (
 )
 
 
+PINNED_QWEN_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
 def _response(payload: dict) -> dict:
     return {"choices": [{"message": {"content": json.dumps(payload)}}]}
 
@@ -46,7 +49,7 @@ def test_vllm_ror_requests_thinking_and_json_schema_then_returns_valid_spans():
             model="Qwen/Qwen3-32B-AWQ",
             base_url="http://127.0.0.1:8000/v1",
             api_key="offline-key",
-            revision="main",
+            revision=PINNED_QWEN_REVISION,
         ),
         transport=transport,
     )
@@ -56,6 +59,7 @@ def test_vllm_ror_requests_thinking_and_json_schema_then_returns_valid_spans():
     }
     request = transport.calls[0]
     assert request["timeout"] == 120.0
+    assert request["model"] == f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
     assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
     assert request["response_format"]["type"] == "json_schema"
     assert request["response_format"]["json_schema"]["schema"] == {
@@ -77,6 +81,42 @@ def test_vllm_ror_requests_thinking_and_json_schema_then_returns_valid_spans():
             }
         },
     }
+
+
+def test_deepseek_settings_reject_any_model_except_deepseek_v4_flash():
+    with pytest.raises(ValueError, match="deepseek-v4-flash"):
+        LiveBackboneSettings(
+            provider="deepseek",
+            model="deepseek-chat",
+            base_url="https://api.deepseek.com",
+            api_key="test-key",
+        )
+
+
+@pytest.mark.parametrize("revision", [None, "", "main", "v1.0", "0123456"])
+def test_vllm_settings_reject_missing_or_mutable_qwen_revisions(revision):
+    with pytest.raises(ValueError, match="immutable"):
+        LiveBackboneSettings(
+            provider="vllm",
+            model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="offline-key",
+            revision=revision,
+        )
+
+
+def test_immutable_qwen_revision_is_enforced_in_served_model_evidence():
+    settings = LiveBackboneSettings(
+        provider="vllm",
+        model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1",
+        api_key="offline-key",
+        revision=PINNED_QWEN_REVISION,
+    )
+
+    assert settings.served_model == f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    adapter = OpenAICompatibleLADRGAdapter(settings, transport=_RecordingTransport([]))
+    assert adapter.provider_metadata()["served_model"] == settings.served_model
 
 
 def test_deepseek_v4_flash_ror_enables_thinking():
@@ -102,7 +142,7 @@ def test_type_assignment_requires_one_valid_type_for_every_requested_span():
         [_response({"types": [{"start": 0, "end": 1, "type": "ORG"}]})]
     )
     adapter = OpenAICompatibleLADRGAdapter(
-        LiveBackboneSettings(provider="vllm", model="qwen", base_url="http://localhost/v1", api_key="x"),
+        LiveBackboneSettings(provider="vllm", model="qwen", base_url="http://localhost/v1", api_key="x", revision=PINNED_QWEN_REVISION),
         transport=transport,
     )
 
@@ -118,7 +158,7 @@ def test_gasd_r_validates_exact_ontology_tags_and_converts_them_to_fixed_scores(
         [_response({"reason": "The tokens are a location.", "tags": ["I-LOC", "I-LOC"]})]
     )
     adapter = OpenAICompatibleLADRGAdapter(
-        LiveBackboneSettings(provider="vllm", model="qwen", base_url="http://localhost/v1", api_key="x"),
+        LiveBackboneSettings(provider="vllm", model="qwen", base_url="http://localhost/v1", api_key="x", revision=PINNED_QWEN_REVISION),
         transport=transport,
     )
 
@@ -153,7 +193,7 @@ def test_gasd_r_validates_exact_ontology_tags_and_converts_them_to_fixed_scores(
 def test_official_malformed_or_failed_responses_raise_live_backbone_error(response):
     transport = _RecordingTransport([response])
     adapter = OpenAICompatibleLADRGAdapter(
-        LiveBackboneSettings(provider="vllm", model="qwen", base_url="http://localhost/v1", api_key="x"),
+        LiveBackboneSettings(provider="vllm", model="qwen", base_url="http://localhost/v1", api_key="x", revision=PINNED_QWEN_REVISION),
         transport=transport,
     )
 
