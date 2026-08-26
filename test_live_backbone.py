@@ -41,7 +41,7 @@ def _payload(tokens=("Acme", "Labs")) -> dict:
     }
 
 
-def test_vllm_ror_requests_thinking_and_json_schema_then_returns_valid_spans():
+def test_vllm_ror_uses_configured_served_name_and_retains_pinned_evidence():
     transport = _RecordingTransport([_response({"spans": [{"start": 0, "end": 2}]})])
     adapter = OpenAICompatibleLADRGAdapter(
         LiveBackboneSettings(
@@ -59,7 +59,7 @@ def test_vllm_ror_requests_thinking_and_json_schema_then_returns_valid_spans():
     }
     request = transport.calls[0]
     assert request["timeout"] == 120.0
-    assert request["model"] == f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    assert request["model"] == "Qwen/Qwen3-32B-AWQ"
     assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
     assert request["response_format"]["type"] == "json_schema"
     assert request["response_format"]["json_schema"]["schema"] == {
@@ -81,6 +81,10 @@ def test_vllm_ror_requests_thinking_and_json_schema_then_returns_valid_spans():
             }
         },
     }
+    assert adapter.provider_metadata()["revision"] == PINNED_QWEN_REVISION
+    assert adapter.provider_metadata()["served_model"] == (
+        f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    )
 
 
 def test_deepseek_settings_reject_any_model_except_deepseek_v4_flash():

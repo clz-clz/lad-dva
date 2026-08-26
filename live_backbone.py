@@ -236,7 +236,7 @@ class OpenAICompatibleLADRGAdapter:
         enable_thinking: bool,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
-            "model": self.settings.served_model,
+            "model": self.settings.model,
             "messages": messages,
             "timeout": self.settings.timeout_seconds,
         }
