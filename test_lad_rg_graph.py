@@ -605,6 +605,147 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
     }
 
 
+def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monkeypatch):
+    class _Message:
+        content = '["O"]'
+        response_metadata = {}
+        usage_metadata = None
+
+    class _CoderLLM:
+        def invoke(self, prompt):
+            return _Message()
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
+    result = asyncio.run(
+        multi_agent_v2.coder_node(
+            _state(
+                official=True,
+                noise_type="OTHER",
+                tokens=["Alice"],
+                dirty_tags=["B-PER"],
+                candidate_paths=[],
+                provider_metadata={"coder": [], "reviewer": [], "ror": [], "gasd": []},
+            )
+        )
+    )
+
+    assert result["candidate_paths"] == [["O"], ["O"], ["O"]]
+    assert result["fallback_used"] is False
+
+
+def test_official_pipeline_rejects_any_reported_fallback(monkeypatch):
+    class _FallbackGraph:
+        async def ainvoke(self, state):
+            return {
+                "current_tags": ["O"],
+                "candidate_paths": [["O"]],
+                "rag_weights": [1.0],
+                "ror_reasoning": {"source": "not_triggered", "spans": []},
+                "gasd_variant_requested": "g",
+                "gasd_variant_used": "g",
+                "provider_metadata": {"coder": [], "reviewer": [], "ror": [], "gasd": []},
+                "fallback_used": True,
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _FallbackGraph())
+    with pytest.raises(RuntimeError, match="fallback"):
+        asyncio.run(
+            multi_agent_v2.run_agent_pipeline(
+                ["Alice"],
+                ["B-PER"],
+                {"terminal_graph": "lad-rg", "official": True},
+                dataset_name="conll2003",
+            )
+        )
+
+
+@pytest.mark.parametrize("variant", ["r", "both"])
+def test_official_disabled_gasd_reason_variant_still_requires_live_decoder(variant):
+    with pytest.raises(RuntimeError, match="live gasd_reason_decoder"):
+        multi_agent_v2.gasd_node(
+            _state(
+                official=True,
+                use_gasd=False,
+                gasd_variant=variant,
+                gasd_reason_decoder=None,
+            )
+        )
+
+
+def test_official_pipeline_requires_reason_variant_to_be_used(monkeypatch):
+    class _DisabledGraph:
+        async def ainvoke(self, state):
+            return {
+                "current_tags": ["O"],
+                "candidate_paths": [["O"]],
+                "rag_weights": [1.0],
+                "ror_reasoning": {"source": "not_triggered", "spans": []},
+                "gasd_variant_requested": "r",
+                "gasd_variant_used": "disabled",
+                "provider_metadata": {"coder": [], "reviewer": [], "ror": [], "gasd": []},
+                "fallback_used": False,
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _DisabledGraph())
+    with pytest.raises(RuntimeError, match="requested variant"):
+        asyncio.run(
+            multi_agent_v2.run_agent_pipeline(
+                ["Alice"],
+                ["O"],
+                {"terminal_graph": "lad-rg", "official": True, "gasd_variant": "r"},
+                dataset_name="conll2003",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "tag_scores",
+    [
+        [{"O": 2.0}],
+        [{"B-PER": 2.0, "O": 1.0}],
+        [{"B-PER": float("inf")}],
+        [{"B-PER": float("nan")}],
+    ],
+)
+def test_official_gasd_scores_must_match_declared_tag_exactly(tag_scores):
+    with pytest.raises(ValueError, match="declared tag"):
+        multi_agent_v2._official_reason_scores(
+            {"reason": "person", "tags": ["B-PER"], "tag_scores": tag_scores},
+            1,
+            {"O", "B-PER", "I-PER"},
+        )
+
+
+@pytest.mark.parametrize("terminal_graph", [None, "lad_rg", "typo"])
+def test_official_pipeline_requires_exact_lad_rg_graph(monkeypatch, terminal_graph):
+    class _OfflineGraph:
+        async def ainvoke(self, state):
+            return {
+                "current_tags": ["O"],
+                "candidate_paths": [["O"]],
+                "rag_weights": [1.0],
+                "ror_reasoning": {"source": "not_triggered", "spans": []},
+                "gasd_variant_requested": "g",
+                "gasd_variant_used": "g",
+                "provider_metadata": {"coder": [], "reviewer": [], "ror": [], "gasd": []},
+                "fallback_used": False,
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "multi_agent_graph", _OfflineGraph())
+    monkeypatch.setattr(multi_agent_v2, "lad_rg_graph", _OfflineGraph())
+    config = {"official": True}
+    if terminal_graph is not None:
+        config["terminal_graph"] = terminal_graph
+
+    with pytest.raises(ValueError, match="terminal_graph='lad-rg'"):
+        asyncio.run(
+            multi_agent_v2.run_agent_pipeline(
+                ["Alice"], ["O"], config, dataset_name="conll2003"
+            )
+        )
+
+
 def test_lad_rg_registers_gasd_g_r_and_both_variants():
     assert CONFIGURATIONS["lad_rg_full"]["gasd_variant"] == "g"
     assert CONFIGURATIONS["lad_rg_gasd_r"]["gasd_variant"] == "r"

@@ -4,6 +4,7 @@ import os
 import json
 import re
 import hashlib
+import math
 import threading
 from collections import Counter
 from pathlib import Path
@@ -559,7 +560,7 @@ Output ONLY the JSON list, no markdown, no explanation."""
         only_path = candidate_paths[0]
         all_o = all(t == "O" for t in only_path)
         has_entities_in_dirty = any(t != "O" for t in dirty_tags)
-        if all_o and has_entities_in_dirty:
+        if all_o and has_entities_in_dirty and not official:
             # LLM erased all entities — fallback to dirty (safer)
             print(f" [Coder] All paths identical (all O) with entities in dirty — "
                   f"overriding with dirty tags")
@@ -1395,13 +1396,14 @@ def _official_reason_scores(evidence: Any, token_count: int,
     if len(scores) != token_count:
         raise ValueError("official GASD-R response must score every token")
     normalized = []
-    for token_scores in scores:
-        if (not isinstance(token_scores, Mapping) or not token_scores
-                or any(tag not in valid_tags
-                       or type(score) not in (int, float)
-                       for tag, score in token_scores.items())):
-            raise ValueError("official GASD-R scores use an invalid ontology or schema")
-        normalized.append({tag: float(score) for tag, score in token_scores.items()})
+    for declared_tag, token_scores in zip(tags, scores):
+        if (not isinstance(token_scores, Mapping)
+                or set(token_scores) != {declared_tag}):
+            raise ValueError("official GASD-R score must match the declared tag exactly")
+        score = token_scores[declared_tag]
+        if type(score) not in (int, float) or not math.isfinite(float(score)):
+            raise ValueError("official GASD-R declared tag score must be finite")
+        normalized.append({declared_tag: float(score)})
     return normalized
 
 
@@ -1433,6 +1435,9 @@ def gasd_node(state: State):
     gasd_records = []
 
     try:
+        decoder = state.get("gasd_reason_decoder")
+        if official and variant in {"r", "both"} and not callable(decoder):
+            raise RuntimeError("official GASD-R requires a live gasd_reason_decoder callback")
         if not state.get("use_gasd", True):
             fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
             fallback = enforce_iob2_syntax(fallback, valid_set)
@@ -1465,9 +1470,6 @@ def gasd_node(state: State):
         reason_scores = None
         variant_used = "g"
         if variant in {"r", "both"}:
-            decoder = state.get("gasd_reason_decoder")
-            if official and not callable(decoder):
-                raise RuntimeError("official GASD-R requires a live gasd_reason_decoder callback")
             if callable(decoder):
                 try:
                     evidence = decoder({
@@ -1809,6 +1811,8 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
     if config is None:
         config = {"lambda_bias": 1.0, "use_dfa": True}
     official = bool(config.get("official", False))
+    if official and config.get("terminal_graph") != "lad-rg":
+        raise ValueError("official pipeline requires terminal_graph='lad-rg'")
 
     # Dataset name resolution: explicit arg → config["__dataset__"] → default
     if dataset_name is None:
@@ -1891,15 +1895,25 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
                     or not _is_legal_tag_sequence(predicted_tags)):
                 raise ValueError("official pipeline returned an illegal or out-of-ontology sequence")
             reasoning = final_state.get("ror_reasoning", {})
-            requested = str(final_state.get(
-                "gasd_variant_requested", config.get("gasd_variant", "g"))).lower()
+            reasoning_source = (
+                reasoning.get("source") if isinstance(reasoning, Mapping) else None
+            )
+            if reasoning_source not in {"not_triggered", "live", "disabled"}:
+                raise RuntimeError("official pipeline is missing valid RoR completion evidence")
+            requested_value = final_state.get("gasd_variant_requested")
             used = final_state.get("gasd_variant_used")
-            if requested in {"r", "both"} and used == "g_fallback":
-                raise RuntimeError("official GASD-R cannot use g_fallback")
+            if not isinstance(requested_value, str) or not isinstance(used, str):
+                raise RuntimeError("official pipeline is missing GASD completion evidence")
+            requested = requested_value.lower()
+            configured_variant = str(config.get("gasd_variant", "g")).lower()
+            if requested != configured_variant:
+                raise RuntimeError("official GASD requested variant does not match configuration")
+            if requested in {"r", "both"} and used != requested:
+                raise RuntimeError("official GASD-R did not use the requested variant")
+            if bool(final_state.get("fallback_used", False)):
+                raise RuntimeError("official pipeline cannot publish fallback evidence")
             official_metadata = {
-                "ror_reasoning_source": (
-                    reasoning.get("source") if isinstance(reasoning, Mapping) else None
-                ),
+                "ror_reasoning_source": reasoning_source,
                 "gasd_variant_requested": requested,
                 "gasd_variant_used": used,
                 "provider_metadata": _provider_evidence(
