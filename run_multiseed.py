@@ -24,14 +24,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import importlib.metadata
 import json
 import logging
 import os
+import platform
+import re
+import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
+from urllib.parse import urlsplit
 
 # Silence telemetry noise from chroma / langchain
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -52,6 +57,18 @@ SEEDS       = [13, 42, 2024]
 SAMPLE_SIZE = None  # None = full dataset
 MAX_CONCURRENCY = 200     # high throughput for LLM API calls
 PER_REQUEST_TIMEOUT = 180  # seconds per sentence; straggler → dirty fallback
+OFFICIAL_REQUEST_TIMEOUT = 600.0
+OFFICIAL_SAMPLE_SIZE = 200
+OFFICIAL_NOISE_RATIO = 0.15
+OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v1"
+OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
+DATASET_ENTITY_TYPES = {
+    "msra": ["PER", "LOC", "ORG"],
+    "conll2003": ["PER", "LOC", "ORG", "MISC"],
+    "wnut17": ["PER", "LOC", "ORG", "MISC"],
+    "fewnerd": ["PER", "LOC", "ORG", "MISC"],
+    "ontonotes5": ["PER", "LOC", "ORG", "MISC"],
+}
 
 # Configurations — each key maps to either a pipeline config or a standalone method.
 CONFIGURATIONS: Dict[str, dict] = {
@@ -154,7 +171,6 @@ CONFIGURATIONS: Dict[str, dict] = {
 
 NOISY_DIR = Path("results_multiseed")
 PRED_DIR  = Path("predictions_multiseed")
-PRED_DIR.mkdir(exist_ok=True)
 DEFAULT_CONFIGS = ["selectdenoise_contextual_lattice"]
 
 # Short tag namespacing prediction files per backbone, so a cross-backbone run
@@ -166,6 +182,173 @@ DEFAULT_CONFIGS = ["selectdenoise_contextual_lattice"]
 # Downstream scripts (aggregate_seeds, derive_ablations, sweep_results) import
 # _pred_path, so they follow the same namespace automatically.
 BACKBONE_TAG = os.environ.get("BACKBONE_TAG", "").strip()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _endpoint_origin(base_url: str) -> str:
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("BACKBONE_BASE_URL must be an absolute HTTP(S) URL")
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return f"{parsed.scheme}://{host}{port}"
+
+
+def _dependency_versions() -> dict[str, str]:
+    versions = {"python": platform.python_version()}
+    for package in ("openai", "langgraph", "langchain-openai", "datasets",
+                    "numpy", "seqeval"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = "missing"
+    return versions
+
+
+def _official_settings_from_env(config_names: list[str], environment: Mapping[str, str]):
+    """Validate explicit launch variables before constructing the live adapter."""
+    required = ["BACKBONE_PROVIDER", "BACKBONE_MODEL", "BACKBONE_BASE_URL", "BACKBONE_TAG"]
+    missing = [name for name in required if not str(environment.get(name, "")).strip()]
+    provider = str(environment.get("BACKBONE_PROVIDER", "")).strip().lower()
+    key = str(environment.get("BACKBONE_API_KEY", "")).strip()
+    if provider == "deepseek" and not key:
+        key = str(environment.get("DEEPSEEK_API_KEY", "")).strip()
+    if not key:
+        missing.append("BACKBONE_API_KEY (or provider-appropriate key)")
+    if missing:
+        raise ValueError("official mode requires explicit " + ", ".join(missing))
+    tag = str(environment["BACKBONE_TAG"]).strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+        raise ValueError("BACKBONE_TAG must contain only letters, numbers, dot, underscore, or hyphen")
+    for config_name in config_names:
+        config = CONFIGURATIONS.get(config_name)
+        if config is None or config.get("terminal_graph") != "lad-rg":
+            raise ValueError(f"official mode requires LAD-RG config, got {config_name!r}")
+    model = str(environment["BACKBONE_MODEL"]).strip()
+    revision = str(environment.get("BACKBONE_REVISION", "")).strip() or None
+    if provider == "deepseek":
+        if model != "deepseek-v4-flash":
+            raise ValueError("DeepSeek official runs require BACKBONE_MODEL=deepseek-v4-flash")
+        if any(str(CONFIGURATIONS[name].get("gasd_variant", "g")).lower() in {"r", "both"}
+               for name in config_names):
+            raise ValueError("DeepSeek official runs reject GASD-R/Both; use vllm/Qwen")
+    elif provider == "vllm":
+        if model != OFFICIAL_QWEN_MODEL:
+            raise ValueError(f"vLLM official runs require BACKBONE_MODEL={OFFICIAL_QWEN_MODEL}")
+        if not revision:
+            raise ValueError("Qwen official runs require immutable BACKBONE_REVISION")
+    from live_backbone import LiveBackboneSettings
+    settings = LiveBackboneSettings(
+        provider=provider,
+        model=model,
+        base_url=str(environment["BACKBONE_BASE_URL"]).strip(),
+        api_key=key,
+        revision=revision,
+    )
+    _endpoint_origin(settings.base_url)
+    return settings, tag
+
+
+def _build_official_manifest(settings, tag: str, git_sha: str,
+                             request_timeout: float) -> dict[str, Any]:
+    from live_backbone import OpenAICompatibleLADRGAdapter
+    return {
+        "schema_version": OFFICIAL_MANIFEST_SCHEMA,
+        "git_sha": git_sha,
+        "backbone": {
+            "provider": settings.provider,
+            "model": settings.model,
+            "revision": settings.revision,
+            "immutable_revision": settings.revision or settings.model,
+            "endpoint_origin": _endpoint_origin(settings.base_url),
+            "tag": tag,
+        },
+        "protocol": {
+            "sample_size": OFFICIAL_SAMPLE_SIZE,
+            "records_per_cell": OFFICIAL_SAMPLE_SIZE,
+            "noise_ratio": OFFICIAL_NOISE_RATIO,
+            "seeds": list(SEEDS),
+            "datasets": list(DATASETS),
+            "noise_types": list(NOISE_TYPES),
+        },
+        "dependencies": _dependency_versions(),
+        "decoder_constants": {
+            "provider_timeout_seconds": 120.0,
+            "sdk_max_retries": 2,
+            "gasd_reason_bonus": OpenAICompatibleLADRGAdapter.REASON_BONUS,
+            "runner_request_timeout_seconds": float(request_timeout),
+        },
+    }
+
+
+def _manifest_path(pred_dir: Path, tag: str) -> Path:
+    return pred_dir / f"run_manifest__{tag}.json"
+
+
+def _ensure_official_manifest(expected: Mapping[str, Any], pred_dir: Path,
+                              tag: str) -> Path:
+    manifest_path = _manifest_path(pred_dir, tag)
+    outputs = list(pred_dir.glob(f"pred_*__{tag}.jsonl")) if pred_dir.exists() else []
+    if not manifest_path.exists():
+        if outputs:
+            raise RuntimeError(f"official resume rejected: missing manifest {manifest_path.name}")
+        pred_dir.mkdir(parents=True, exist_ok=True)
+        tmp = manifest_path.with_suffix(".json.tmp")
+        tmp.write_text(_canonical_json(expected) + "\n", encoding="utf-8")
+        tmp.replace(manifest_path)
+        return manifest_path
+    try:
+        actual = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"official manifest is unreadable: {manifest_path}") from exc
+    if _canonical_json(actual) != _canonical_json(expected):
+        raise RuntimeError(f"official manifest is incompatible: {manifest_path.name}")
+    return manifest_path
+
+
+def _valid_tags(dataset: str) -> set[str]:
+    return {"O"} | {f"{prefix}-{kind}" for kind in DATASET_ENTITY_TYPES[dataset]
+                    for prefix in ("B", "I")}
+
+
+def _is_legal_iob2(tags: list[str]) -> bool:
+    previous = "O"
+    for tag in tags:
+        if tag.startswith("I-"):
+            kind = tag[2:]
+            if previous not in {f"B-{kind}", f"I-{kind}"}:
+                return False
+        previous = tag
+    return True
+
+
+def _validate_official_prediction(path: Path, dataset: str, config_name: str,
+                                  expected_count: int = OFFICIAL_SAMPLE_SIZE) -> None:
+    rows = _load_noisy(path)
+    if len(rows) != expected_count:
+        raise RuntimeError(f"official prediction has {len(rows)} records, expected {expected_count}: {path.name}")
+    config = CONFIGURATIONS[config_name]
+    expected_variant = str(config.get("gasd_variant", "g")).lower()
+    expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
+    valid = _valid_tags(dataset)
+    for index, row in enumerate(rows):
+        tokens, gold, pred = row.get("tokens"), row.get("gold_tags"), row.get("pred_tags")
+        if (not isinstance(tokens, list) or not isinstance(gold, list) or not isinstance(pred, list)
+                or not all(isinstance(item, str) for values in (tokens, gold, pred) for item in values)
+                or not len(tokens) == len(gold) == len(pred)
+                or any(tag not in valid for tag in gold + pred) or not _is_legal_iob2(pred)):
+            raise RuntimeError(f"official prediction row {index} is structurally incompatible: {path.name}")
+        if (row.get("ror_reasoning_source") not in {"not_triggered", "live", "disabled"}
+                or row.get("gasd_variant_requested") != expected_variant
+                or row.get("gasd_variant_used") != expected_used
+                or row.get("fallback_used") is not False
+                or not isinstance(row.get("provider_metadata"), dict)):
+            raise RuntimeError(f"official prediction row {index} lacks compatible launch evidence: {path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -360,22 +543,42 @@ async def _run_one_cell(config_name: str, config: dict,
                         dataset: str, noise: str, seed: int,
                         size: int, pipelines,
                         *, max_concurrency: int, dummy: bool,
-                        ratio: float = 0.15):
+                        ratio: float = 0.15, official: bool = False,
+                        failure_policy: str = "abort",
+                        request_timeout: float = PER_REQUEST_TIMEOUT,
+                        adapter_factory: Optional[Callable[[], Any]] = None):
     if config.get("offline_only"):
         raise RuntimeError(
             f"Config '{config_name}' is offline-only; derive it with "
             f"{config['offline_only']} from {config.get('source_method', 'existing prediction')} files."
         )
 
+    if failure_policy not in {"abort", "dirty"}:
+        raise ValueError("failure_policy must be 'abort' or 'dirty'")
+    if official:
+        if dummy:
+            raise ValueError("official mode cannot use --dummy")
+        if failure_policy != "abort":
+            raise ValueError("official mode requires failure_policy='abort'")
+        if config.get("terminal_graph") != "lad-rg":
+            raise ValueError("official mode requires a LAD-RG configuration")
+        if size != OFFICIAL_SAMPLE_SIZE or abs(ratio - OFFICIAL_NOISE_RATIO) >= 1e-12:
+            raise ValueError("official cells require size 200 and noise ratio 0.15")
+
     default_fn, baseline_fns = pipelines
     pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
+    tmp_p = pred_p.with_suffix(pred_p.suffix + ".tmp")
     pred_p.parent.mkdir(parents=True, exist_ok=True)
     if pred_p.exists() and pred_p.stat().st_size > 0:
+        if official:
+            _validate_official_prediction(pred_p, dataset, config_name)
         logging.info(f"[skip] {pred_p.name}")
         return
 
     noisy_p = _noisy_path(dataset, noise, seed, size, ratio)
     if not noisy_p.exists():
+        if official:
+            raise FileNotFoundError(f"official noisy file not found: {noisy_p}")
         logging.warning(f"[miss] noisy file not found: {noisy_p}; "
                         f"run gen_noisy.py first")
         return
@@ -387,6 +590,12 @@ async def _run_one_cell(config_name: str, config: dict,
     sem = asyncio.Semaphore(max_concurrency)
     # Buffer results IN INPUT ORDER so prediction files line up across methods.
     buffer: List[Optional[dict]] = [None] * len(rows)
+    adapter = None
+    if official:
+        if adapter_factory is None:
+            from live_backbone import OpenAICompatibleLADRGAdapter
+            adapter_factory = OpenAICompatibleLADRGAdapter
+        adapter = adapter_factory()
 
     async def _process(i, row):
         async with sem:
@@ -399,6 +608,13 @@ async def _run_one_cell(config_name: str, config: dict,
             if dummy:
                 cfg["__gold__"] = gold
                 cfg["__seed__"] = seed
+            if official:
+                cfg.update({
+                    "official": True,
+                    "ror_reasoner": adapter.ror_reasoner,
+                    "gasd_reason_decoder": adapter.gasd_reason_decoder,
+                    "provider_metadata": adapter.provider_metadata(),
+                })
             # Log the Coder candidate pool for the main methods only (oracle /
             # selection analysis); keeps ablation prediction files lean.
             if _supports_candidate_evidence(config_name, config):
@@ -413,6 +629,8 @@ async def _run_one_cell(config_name: str, config: dict,
                         return await fn(tokens, dirty, cfg, dataset_name=dataset)
                     except TypeError:
                         return await fn(tokens, dirty, cfg)
+                if official:
+                    return await default_fn(tokens, dirty, cfg, dataset_name=dataset)
                 try:
                     return await default_fn(tokens, dirty, cfg, dataset_name=dataset)
                 except TypeError:
@@ -421,15 +639,17 @@ async def _run_one_cell(config_name: str, config: dict,
             try:
                 # Per-request timeout: a single straggler sentence (e.g. very long
                 # MSRA input) must not stall the whole cell's async gather.
-                pred = await asyncio.wait_for(_call(), timeout=PER_REQUEST_TIMEOUT)
+                pred = await asyncio.wait_for(_call(), timeout=request_timeout)
             except asyncio.TimeoutError:
-                if config.get("terminal_decoder") == "contextual-lattice-v1":
-                    raise RuntimeError("Contextual lattice sentence timed out; refusing dirty substitution")
+                if failure_policy == "abort" or config.get("terminal_decoder") == "contextual-lattice-v1":
+                    raise RuntimeError(
+                        f"sentence {i} exceeded the {request_timeout:g}-second request timeout"
+                    )
                 logging.warning(f"[timeout] sentence {i} exceeded "
-                                f"{PER_REQUEST_TIMEOUT}s; using dirty as fallback")
+                                f"{request_timeout}s; using dirty as fallback")
                 pred = list(dirty)
             except Exception as e:                       # noqa: BLE001
-                if config.get("terminal_decoder") == "contextual-lattice-v1":
+                if failure_policy == "abort" or config.get("terminal_decoder") == "contextual-lattice-v1":
                     raise
                 logging.error(f"[!] sentence {i} failed ({e!r}); using dirty as fallback")
                 pred = list(dirty)
@@ -438,9 +658,26 @@ async def _run_one_cell(config_name: str, config: dict,
                 extra = {k: pred[k] for k in
                          ("candidate_paths", "rag_weights", "confidence",
                           "terminal_model_hash", "terminal_used_anchor",
-                          "terminal_predicted_gain", "terminal_fallback_count")
+                          "terminal_predicted_gain", "terminal_fallback_count",
+                          "ror_reasoning_source", "gasd_variant_requested",
+                          "gasd_variant_used", "provider_metadata", "fallback_used")
                          if k in pred}
                 pred = pred.get("pred_tags", list(dirty))
+            if official:
+                expected_variant = str(config.get("gasd_variant", "g")).lower()
+                expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
+                if (
+                    not isinstance(pred, list)
+                    or len(pred) != len(gold)
+                    or any(tag not in _valid_tags(dataset) for tag in pred)
+                    or not _is_legal_iob2(pred)
+                    or extra.get("ror_reasoning_source") not in {"not_triggered", "live", "disabled"}
+                    or extra.get("gasd_variant_requested") != expected_variant
+                    or extra.get("gasd_variant_used") != expected_used
+                    or extra.get("fallback_used") is not False
+                    or not isinstance(extra.get("provider_metadata"), dict)
+                ):
+                    raise RuntimeError(f"official sentence {i} lacks valid launch evidence")
             # Length alignment (defensive)
             if not isinstance(pred, list):
                 pred = ["O"] * len(gold)
@@ -455,23 +692,31 @@ async def _run_one_cell(config_name: str, config: dict,
 
     rate_tag = f"r{int(round(ratio*100))}"
     try:
-        from tqdm.asyncio import tqdm as async_tqdm
-        await async_tqdm.gather(
-            *(_process(i, r) for i, r in enumerate(rows)),
-            desc=f"{dataset}/{noise}/seed{seed}/{config_name}/{rate_tag}",
-            leave=False,
-        )
-    except ImportError:
-        await asyncio.gather(*(_process(i, r) for i, r in enumerate(rows)))
+        try:
+            from tqdm.asyncio import tqdm as async_tqdm
+            await async_tqdm.gather(
+                *(_process(i, r) for i, r in enumerate(rows)),
+                desc=f"{dataset}/{noise}/seed{seed}/{config_name}/{rate_tag}",
+                leave=False,
+            )
+        except ImportError:
+            await asyncio.gather(*(_process(i, r) for i, r in enumerate(rows)))
 
-    # Write to disk in input order, atomically (via temp file + rename)
-    tmp_p = pred_p.with_suffix(pred_p.suffix + ".tmp")
-    with tmp_p.open("w", encoding="utf-8") as f_out:
-        for rec in buffer:
-            if rec is None:
-                continue
-            f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    tmp_p.replace(pred_p)
+        # Write to disk in input order, atomically (via temp file + rename)
+        with tmp_p.open("w", encoding="utf-8") as f_out:
+            for rec in buffer:
+                if rec is None:
+                    if official:
+                        raise RuntimeError("official cell produced an incomplete result buffer")
+                    continue
+                f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        if official:
+            _validate_official_prediction(tmp_p, dataset, config_name, expected_count=len(rows))
+        tmp_p.replace(pred_p)
+    except Exception:
+        if failure_policy == "abort":
+            tmp_p.unlink(missing_ok=True)
+        raise
 
     logging.info(f"[done] {pred_p.name} in {time.time() - t0:.1f}s")
 
@@ -480,7 +725,7 @@ async def _run_one_cell(config_name: str, config: dict,
 # Driver
 # ---------------------------------------------------------------------------
 
-def main(argv=None):
+def _parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs",  nargs="+", default=DEFAULT_CONFIGS)
     ap.add_argument("--datasets", nargs="+", default=DATASETS)
@@ -493,7 +738,46 @@ def main(argv=None):
     ap.add_argument("--max-concurrency", type=int, default=MAX_CONCURRENCY)
     ap.add_argument("--dummy",    action="store_true",
                     help="Use a mock pipeline; no API calls.")
+    ap.add_argument("--official", action="store_true",
+                    help="Enable fail-closed official LAD-RG launch semantics.")
+    ap.add_argument("--failure-policy", choices=("abort", "dirty"), default=None,
+                    help="Sentence failure behavior; dirty is legacy opt-in only.")
+    ap.add_argument("--request-timeout", type=float, default=None,
+                    help="Outer per-sentence timeout in seconds.")
     args = ap.parse_args(argv)
+    args.failure_policy = args.failure_policy or "abort"
+    args.request_timeout = (
+        args.request_timeout if args.request_timeout is not None
+        else (OFFICIAL_REQUEST_TIMEOUT if args.official else float(PER_REQUEST_TIMEOUT))
+    )
+    if args.request_timeout <= 0:
+        ap.error("--request-timeout must be positive")
+    return args
+
+
+def main(argv=None):
+    global BACKBONE_TAG
+    args = _parse_args(argv)
+
+    official_settings = None
+    if args.official:
+        if args.dummy:
+            raise ValueError("--official cannot be combined with --dummy")
+        if args.failure_policy != "abort":
+            raise ValueError("official mode does not permit dirty fallback")
+        if args.size != OFFICIAL_SAMPLE_SIZE:
+            raise ValueError("official mode requires --size 200")
+        if len(args.ratios) != 1 or abs(args.ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
+            raise ValueError("official mode requires exactly --ratios 0.15")
+        official_settings, BACKBONE_TAG = _official_settings_from_env(args.configs, os.environ)
+        git_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ).stdout.strip()
+        manifest = _build_official_manifest(
+            official_settings, BACKBONE_TAG, git_sha, args.request_timeout,
+        )
+        _ensure_official_manifest(manifest, PRED_DIR, BACKBONE_TAG)
 
     # Expand default thread pool so MAX_CONCURRENCY LLM calls fit.
     loop = asyncio.new_event_loop()
@@ -526,12 +810,23 @@ def main(argv=None):
                                 max_concurrency=args.max_concurrency,
                                 dummy=args.dummy,
                                 ratio=r,
+                                official=args.official,
+                                failure_policy=args.failure_policy,
+                                request_timeout=args.request_timeout,
+                                adapter_factory=(
+                                    (lambda settings=official_settings: __import__(
+                                        "live_backbone", fromlist=["OpenAICompatibleLADRGAdapter"]
+                                    ).OpenAICompatibleLADRGAdapter(settings))
+                                    if args.official else None
+                                ),
                             ))
                             n_done += 1
                         except Exception:                    # noqa: BLE001
                             logging.error("[!] cell raised")
                             traceback.print_exc(file=sys.stderr)
                             n_err += 1
+                            if args.official:
+                                raise
 
     logging.info(f"summary: {n_done} ok, {n_err} failed")
 
