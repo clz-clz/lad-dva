@@ -1093,7 +1093,7 @@ def main(
             control_seed=args.control_seed,
             model_loader=model_loader,
         )
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (ImportError, MemoryError, OSError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, sort_keys=True))
     return 0

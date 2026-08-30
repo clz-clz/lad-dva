@@ -766,3 +766,69 @@ def test_cli_expected_errors_are_argparse_diagnostics_without_loading_or_traceba
     assert len(captured.err) < 2_000
     assert captured.out == ""
     assert loader_calls == []
+
+
+@pytest.mark.parametrize(
+    "error_type, message",
+    [
+        (ImportError, "transformers dependency unavailable"),
+        (MemoryError, "insufficient memory for model"),
+    ],
+)
+def test_cli_model_operational_failures_are_concise_argparse_diagnostics(
+    tmp_path, capsys, error_type, message
+):
+    input_root = _write_canonical_matrix(tmp_path / "inputs")
+
+    def failing_loader(model_id, revision):
+        raise error_type(message)
+
+    with pytest.raises(SystemExit) as caught:
+        probe.main(
+            [
+                "--revision",
+                "a" * 40,
+                "--backbone-tag",
+                "qwen",
+                "--confirm-vllm-stopped",
+                "--input-root",
+                str(input_root),
+                "--output-root",
+                str(tmp_path / "outputs"),
+            ],
+            model_loader=failing_loader,
+        )
+
+    captured = capsys.readouterr()
+    assert caught.value.code == 2
+    assert "error:" in captured.err
+    assert message in captured.err
+    assert "Traceback" not in captured.err
+    assert captured.out == ""
+
+
+def test_cli_does_not_hide_model_loader_assertion_errors(tmp_path, capsys):
+    input_root = _write_canonical_matrix(tmp_path / "inputs")
+
+    def failing_loader(model_id, revision):
+        raise AssertionError("loader contract bug")
+
+    with pytest.raises(AssertionError, match="loader contract bug"):
+        probe.main(
+            [
+                "--revision",
+                "a" * 40,
+                "--backbone-tag",
+                "qwen",
+                "--confirm-vllm-stopped",
+                "--input-root",
+                str(input_root),
+                "--output-root",
+                str(tmp_path / "outputs"),
+            ],
+            model_loader=failing_loader,
+        )
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""

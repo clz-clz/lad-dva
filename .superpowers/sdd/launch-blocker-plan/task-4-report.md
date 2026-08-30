@@ -163,3 +163,40 @@ recoverable backups/stages are retained, and `OutputTransactionError` reports
 both the primary and rollback failures. Cleanup after a validated commit is
 best effort, so a cleanup error cannot turn a valid pair into a reported
 failure. Fault-injection coverage also verifies unrelated files are untouched.
+
+## Review fix round 2
+
+### RED evidence
+
+With valid canonical inputs and GPU confirmation, injected loader failures
+reproduced the uncovered CLI boundary (exit 1):
+
+```text
+FF.                                                                      [100%]
+2 failed, 1 passed, 35 deselected in 4.00s
+```
+
+`ImportError` and `MemoryError` escaped through `main()` rather than producing
+argparse diagnostics. The passing case proved that an injected
+`AssertionError` already remained visible as a programming error.
+
+### GREEN evidence
+
+After extending only the expected CLI exception tuple, the targeted cases
+passed (exit 0):
+
+```text
+...                                                                      [100%]
+3 passed, 35 deselected in 3.86s
+```
+
+The full focused suite then passed (exit 0):
+
+```text
+......................................                                   [100%]
+38 passed in 5.20s
+```
+
+`main()` now converts explicit `ImportError`/`ModuleNotFoundError` and
+`MemoryError` model/dependency failures to concise nonzero argparse-style
+diagnostics without catching `BaseException` or hiding `AssertionError`.
