@@ -492,9 +492,9 @@ Output ONLY the JSON list, no markdown, no explanation."""
 
     coder_records = [
         _response_stage_record(
-            response, f"coder_path_{index}", state.get("provider_settings")
+            response, f"coder_path_{strategy_key}", state.get("provider_settings")
         )
-        for index, response in enumerate(responses, start=1)
+        for strategy_key, response in zip(path_strategies, responses)
     ]
 
     # Length normalization

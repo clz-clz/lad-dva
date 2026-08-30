@@ -154,14 +154,19 @@ def _check_tagged_artifacts(
         for noise in NOISE_TYPES for seed in SEEDS
     }
     canonical_temps = {name + ".tmp" for name in canonical_outputs}
-    selected_tag_suffix = f"__{tag}.jsonl"
-    selected_tag_extra_component = f"__{tag}__"
+
+    def has_selected_tag(path: Path) -> bool:
+        parts = path.name.split("__")
+        if len(parts) < 5:
+            return False
+        return any(
+            component == tag or component.startswith(f"{tag}.")
+            for component in parts[4:]
+        )
+
     tagged_artifacts = sorted(
         path for path in pred_dir.glob("pred_*")
-        if pred_dir.is_dir() and (
-            selected_tag_suffix in path.name
-            or selected_tag_extra_component in path.name
-        )
+        if pred_dir.is_dir() and has_selected_tag(path)
     ) if pred_dir.is_dir() else []
     noncanonical = [
         path for path in tagged_artifacts
@@ -198,10 +203,10 @@ def _check_tagged_artifacts(
             if len(parts) < 5:
                 _block(blockers, "incompatible_prediction", f"unrecognized tagged output {path.name}")
                 continue
-            config_name, dataset = parts[1], parts[2]
+            config_name, dataset, noise_type = parts[1], parts[2], parts[3]
             try:
                 _validate_official_prediction(
-                    path, dataset, config_name,
+                    path, dataset, config_name, noise_type,
                     provider_identity={
                         "provider": settings.provider,
                         "model": settings.model,

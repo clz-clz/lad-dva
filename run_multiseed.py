@@ -339,7 +339,7 @@ def _is_legal_iob2(tags: list[str]) -> bool:
 
 
 def _validate_official_prediction(
-    path: Path, dataset: str, config_name: str,
+    path: Path, dataset: str, config_name: str, noise_type: str,
     expected_count: int = OFFICIAL_SAMPLE_SIZE,
     provider_identity: Optional[Mapping[str, Any]] = None,
 ) -> None:
@@ -366,13 +366,13 @@ def _validate_official_prediction(
         if provider_identity is not None:
             _validate_official_provider_evidence(
                 config, row["provider_metadata"], provider_identity,
-                row["ror_reasoning_source"],
+                row["ror_reasoning_source"], noise_type=noise_type,
             )
 
 
 def _validate_official_provider_evidence(
     config: Mapping[str, Any], evidence: Any, identity: Mapping[str, Any],
-    ror_source: str,
+    ror_source: str, *, noise_type: str,
 ) -> None:
     """Require justified stage statuses and immutable provider identity."""
     if not isinstance(evidence, Mapping):
@@ -419,7 +419,14 @@ def _validate_official_provider_evidence(
                 raise RuntimeError(f"non-live official evidence cannot claim a response for {stage}")
         return value
 
-    coder_stages = {f"coder_path_{index}" for index in range(1, 6)}
+    coder_path_indexes = {
+        "BT": (1, 2, 5),
+        "IF": (1, 2, 5),
+        "ATF": (1, 2, 3, 4, 5),
+    }.get(noise_type)
+    if coder_path_indexes is None:
+        raise RuntimeError(f"unsupported official noise type: {noise_type!r}")
+    coder_stages = {f"coder_path_{index}" for index in coder_path_indexes}
     coder = records("coder", coder_stages)
     if ({record.get("stage") for record in coder} != coder_stages
             or len(coder) != len(coder_stages)
@@ -739,7 +746,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
         provider_identity = adapter.provider_metadata()
         if pred_p.exists() and pred_p.stat().st_size > 0:
             _validate_official_prediction(
-                pred_p, dataset, config_name,
+                pred_p, dataset, config_name, noise,
                 expected_count=OFFICIAL_SAMPLE_SIZE,
                 provider_identity=provider_identity,
             )
@@ -817,7 +824,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
                 expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
                 _validate_official_provider_evidence(
                     config, extra.get("provider_metadata"), provider_identity,
-                    str(extra.get("ror_reasoning_source")),
+                    str(extra.get("ror_reasoning_source")), noise_type=noise,
                 )
                 if (
                     not isinstance(pred, list)
@@ -876,7 +883,8 @@ async def _run_one_cell_impl(config_name: str, config: dict,
                 f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
         if official:
             _validate_official_prediction(
-                tmp_p, dataset, config_name, expected_count=OFFICIAL_SAMPLE_SIZE,
+                tmp_p, dataset, config_name, noise,
+                expected_count=OFFICIAL_SAMPLE_SIZE,
                 provider_identity=provider_identity,
             )
         tmp_p.replace(pred_p)

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+import multi_agent_v2
 import run_multiseed
 from live_backbone import LiveBackboneSettings
 
@@ -57,9 +58,10 @@ def _status_record(stage, status):
     }
 
 
-def _full_evidence(*, ror_status="not_triggered", gasd_status="live"):
+def _full_evidence(*, ror_status="not_triggered", gasd_status="live",
+                   coder_stages=(1, 2, 5)):
     return {
-        "coder": [_live_record(f"coder_path_{index}") for index in range(1, 6)],
+        "coder": [_live_record(f"coder_path_{index}") for index in coder_stages],
         "reviewer": [_live_record("reviewer")],
         "ror": [_status_record("ror", ror_status)],
         "gasd": ([_live_record("gasd_r")] if gasd_status == "live"
@@ -92,6 +94,102 @@ def _write_official_prediction(path: Path, *, evidence=None, count=200):
     path.write_text(
         "".join(json.dumps(row) + "\n" for _ in range(count)), encoding="utf-8"
     )
+
+
+@pytest.mark.parametrize(
+    ("noise_type", "expected_stages"),
+    [
+        ("BT", ["coder_path_1", "coder_path_2", "coder_path_5"]),
+        ("IF", ["coder_path_1", "coder_path_2", "coder_path_5"]),
+        ("ATF", [f"coder_path_{index}" for index in range(1, 6)]),
+    ],
+)
+def test_real_coder_evidence_validates_exact_noise_stage_set(
+    monkeypatch, noise_type, expected_stages
+):
+    identity = _identity()
+
+    class Response:
+        content = '["B-PER", "O"]'
+        response_metadata = {
+            "model_name": identity["served_model"],
+            "system_fingerprint": "fp-test",
+            "token_usage": {},
+        }
+        usage_metadata = None
+
+    class CoderLLM:
+        @staticmethod
+        def invoke(_prompt):
+            return Response()
+
+    monkeypatch.setattr(multi_agent_v2, "coder_llm", CoderLLM())
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+    result = asyncio.run(multi_agent_v2.coder_node({
+        "tokens": ["Alice", "works"],
+        "dirty_tags": ["B-PER", "O"],
+        "dataset_name": "msra",
+        "noise_type": noise_type,
+        "official": True,
+        "provider_settings": identity,
+        "provider_metadata": {},
+    }))
+    evidence = _full_evidence()
+    evidence["coder"] = result["provider_metadata"]["coder"]
+
+    run_multiseed._validate_official_provider_evidence(
+        run_multiseed.CONFIGURATIONS["lad_rg_gasd_r"],
+        evidence,
+        identity,
+        "not_triggered",
+        noise_type=noise_type,
+    )
+
+    assert [record["stage"] for record in evidence["coder"]] == expected_stages
+
+
+@pytest.mark.parametrize(
+    "coder_records",
+    [
+        [_live_record("coder_path_1"), _live_record("coder_path_2")],
+        [
+            _live_record("coder_path_1"), _live_record("coder_path_2"),
+            _live_record("coder_path_5"), _live_record("coder_path_5"),
+        ],
+        [
+            _live_record("coder_path_1"), _live_record("coder_path_2"),
+            _live_record("coder_path_3"), _live_record("coder_path_5"),
+        ],
+        [
+            _live_record("coder_path_1"), _live_record("coder_path_2"),
+            _status_record("coder_path_5", "skipped"),
+        ],
+    ],
+    ids=("missing", "duplicate", "extra", "non-live"),
+)
+def test_official_coder_evidence_rejects_invalid_bt_stage_sets(coder_records):
+    evidence = _full_evidence()
+    evidence["coder"] = coder_records
+
+    with pytest.raises(RuntimeError, match="[Cc]oder"):
+        run_multiseed._validate_official_provider_evidence(
+            run_multiseed.CONFIGURATIONS["lad_rg_gasd_r"],
+            evidence,
+            _identity(),
+            "not_triggered",
+            noise_type="BT",
+        )
+
+
+def test_official_coder_evidence_rejects_unsupported_noise_type():
+    with pytest.raises(RuntimeError, match="unsupported official noise type"):
+        run_multiseed._validate_official_provider_evidence(
+            run_multiseed.CONFIGURATIONS["lad_rg_gasd_r"],
+            _full_evidence(),
+            _identity(),
+            "not_triggered",
+            noise_type="OTHER",
+        )
 
 
 @pytest.mark.parametrize("record_count", [199, 201])

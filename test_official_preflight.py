@@ -135,6 +135,9 @@ def test_static_preflight_rejects_off_protocol_tagged_artifacts(tmp_path):
         pred / "pred_seed13__lad_rg_full__msra__XX__qwen32b-r1.jsonl",
         pred / "pred_seed13__lad_rg_gasd_r__msra__BT__qwen32b-r1.jsonl",
         pred / "pred_seed13__lad_rg_full__msra__BT__extra__qwen32b-r1.jsonl",
+        pred / "pred_seed99__lad_rg_full__msra__BT__qwen32b-r1.tmp",
+        pred / "pred_seed13__lad_rg_full__msra__BT__extra__qwen32b-r1.backup",
+        pred / "pred_seed13__lad_rg_full__msra__BT__qwen32b-r1__extra.bin",
     ]
     for artifact in artifacts:
         artifact.write_text("{}\n", encoding="utf-8")
@@ -154,6 +157,33 @@ def test_static_preflight_rejects_off_protocol_tagged_artifacts(tmp_path):
     )
     assert set(rejected["files"]) == {artifact.name for artifact in artifacts}
     assert unrelated_tag.name not in rejected["files"]
+
+
+def test_tagged_artifact_scan_keeps_dotted_tag_exact_and_ignores_longer_tag(tmp_path):
+    pred = tmp_path / "pred"
+    pred.mkdir()
+    tag = "qwen.32b-r1"
+    exact_tag = pred / f"pred_seed99__lad_rg_full__msra__BT__{tag}.tmp"
+    exact_tag.write_text("{}\n", encoding="utf-8")
+    longer_tag = pred / f"pred_seed99__lad_rg_full__msra__BT__{tag}-other.tmp"
+    longer_tag.write_text("{}\n", encoding="utf-8")
+    blockers = []
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision=QWEN_REVISION,
+    )
+
+    official_preflight._check_tagged_artifacts(
+        pred, settings, tag, "1" * 40, 600.0, blockers, ["lad_rg_full"]
+    )
+
+    rejected = next(
+        item for item in blockers
+        if item["code"] == "noncanonical_prediction_artifact"
+    )
+    assert rejected["files"] == [exact_tag.name]
+    assert longer_tag.name not in rejected["files"]
 
 
 def _response(payload, fingerprint="fp-test"):

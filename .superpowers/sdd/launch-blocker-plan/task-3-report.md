@@ -134,3 +134,38 @@ Required commit subject: `feat: add official LAD-RG launch preflight`.
 - `official_preflight.py`: selected-config live validation, exact `/v1/models` and adapter/response evidence checks, and canonical selected-tag artifact coordinates without colliding with unrelated tags.
 - `test_backbone_evidence.py`, `test_lad_rg_graph.py`, `test_live_backbone.py`, `test_official_preflight.py`, `test_run_multiseed_official.py`: offline regressions for all eight findings.
 - `.superpowers/sdd/launch-blocker-plan/task-3-report.md`: this review-fix evidence.
+
+## Review fix round 2
+
+### Rationale
+
+- The approved Coder policy is unchanged: BT and IF intentionally execute strategy paths 1, 2, and 5, while ATF executes paths 1 through 5. No path 3/4 prompts were added to BT/IF and no Coder prompt or repair behavior was altered.
+- Coder evidence now uses the actual `path_strategies` keys, so BT/IF records are exactly `coder_path_1`, `coder_path_2`, and `coder_path_5`; ATF records remain `coder_path_1` through `coder_path_5`.
+- Official validation now receives the cell noise type and requires the exact corresponding live stage set, rejecting duplicates, missing/extra paths, non-live paths, and unsupported noise types.
+- Selected-tag artifact discovery now examines the structural tag/tail components of every `pred_*` name and recognizes the exact tag with any extension or extra component. Dotted tags remain valid, while longer hyphenated tags remain outside the selected namespace.
+
+### RED evidence
+
+- Coder producer/validator regressions: `8 failed, 14 deselected in 8.92s`. The old validator did not accept a cell noise type and the real BT/IF producer still mislabeled strategy 5 as `coder_path_3`.
+- Selected-tag artifact regressions: `2 failed, 12 deselected in 1.61s`. Exact-tag `.tmp`/arbitrary-extension artifacts were omitted, including for a dotted tag.
+
+### GREEN evidence
+
+- Coder producer/validator regressions: `8 passed, 14 deselected in 8.72s`.
+- Selected-tag artifact regressions: `2 passed, 12 deselected in 1.21s`.
+- Final required focused suite: `108 passed in 14.12s`.
+- Required `py_compile`: exit 0, no output.
+- `git diff --check`: exit 0; only Git's existing LF-to-CRLF warnings were emitted.
+
+### Files changed
+
+- `multi_agent_v2.py`: names Coder evidence from actual path-strategy keys without changing BT/IF's intentional three-path algorithm.
+- `run_multiseed.py`: threads cell noise through resume, per-sentence, and completed-output validation and enforces exact noise-specific Coder evidence.
+- `official_preflight.py`: structurally recognizes exact selected-tag artifacts across arbitrary extensions/extra tail components and passes artifact noise into output validation.
+- `test_run_multiseed_official.py`: mocked real-Coder-to-validator coverage for BT, IF, and ATF plus strict invalid-stage/noise regressions.
+- `test_official_preflight.py`: arbitrary-extension, extra-component, dotted-tag, and longer-unrelated-tag regressions.
+- `.superpowers/sdd/launch-blocker-plan/task-3-report.md`: this round-2 evidence and rationale.
+
+### Concerns
+
+- No new implementation concern was found in the scoped diff. Live providers, Hugging Face, GPU execution, and prediction generation remained intentionally unexercised per the task constraints.
