@@ -31,6 +31,8 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_BOOTSTRAP_ITERATIONS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 20250317
 DEFAULT_CONTROL_SEED = "lad-rg-logit-gap-controls-v1"
+TRANSACTION_PROTOCOL = "aggregate-installed-last"
+TRANSACTION_VERSION = 1
 
 # Audited copy of multi_agent_v2.DATASET_ENTITY_TYPES.  Importing that module
 # would construct OpenAI-compatible clients, which violates this probe's safe
@@ -45,6 +47,29 @@ DATASET_ENTITY_TYPES = {
 
 _REVISION_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
 _SAFE_TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+
+class OutputTransactionError(RuntimeError):
+    """A commit failed and at least one rollback/cleanup action also failed."""
+
+    def __init__(
+        self,
+        primary_error: BaseException,
+        rollback_errors: Sequence[BaseException],
+        recovery_paths: Sequence[Path],
+    ) -> None:
+        self.primary_error = primary_error
+        self.rollback_errors = tuple(rollback_errors)
+        self.recovery_paths = tuple(recovery_paths)
+        failures = "; ".join(
+            f"{type(error).__name__}: {error}" for error in self.rollback_errors
+        )
+        recoverable = ", ".join(str(path) for path in self.recovery_paths) or "none"
+        super().__init__(
+            f"output transaction failed with {type(primary_error).__name__}: "
+            f"{primary_error}; rollback failed: {failures}; "
+            f"recoverable files preserved: {recoverable}"
+        )
 
 
 @dataclass(frozen=True)
@@ -246,6 +271,12 @@ def _stable_control_sample(
     return sorted(selected, key=lambda item: (item.sentence_index, item.token_index))
 
 
+def _summarize_filenames(names: Sequence[str]) -> str:
+    preview = ", ".join(names[:3])
+    remaining = len(names) - 3
+    return preview if remaining <= 0 else f"{preview}, ... (+{remaining} more)"
+
+
 def load_probe_items(
     input_root: Path,
     *,
@@ -275,9 +306,15 @@ def load_probe_items(
     missing = sorted(path.name for path in expected - actual)
     extra = sorted(path.name for path in actual - expected)
     if missing:
-        raise ValueError(f"missing canonical noisy-data files: {missing}")
+        raise ValueError(
+            f"missing canonical noisy-data files ({len(missing)}): "
+            f"{_summarize_filenames(missing)}"
+        )
     if extra:
-        raise ValueError(f"unexpected noisy-data files: {extra}")
+        raise ValueError(
+            f"unexpected noisy-data files ({len(extra)}): "
+            f"{_summarize_filenames(extra)}"
+        )
 
     items: list[ProbeItem] = []
     ordered_paths = [
@@ -422,26 +459,46 @@ def _derived_bootstrap_seed(seed: int, key: tuple[str, str, str]) -> int:
     return int.from_bytes(digest[:16], "big")
 
 
-def _bootstrap_mean_ci(
-    values: Sequence[float], *, iterations: int, seed: int
-) -> dict[str, float]:
+def _bootstrap_mean_cis(
+    metric_values: Mapping[str, Sequence[float]], *, iterations: int, seed: int
+) -> dict[str, dict[str, float]]:
     import numpy as np
 
-    array = np.asarray(values, dtype=np.float64)
-    if array.size == 0:
+    arrays = {
+        name: np.asarray(values, dtype=np.float64)
+        for name, values in metric_values.items()
+    }
+    sizes = {array.size for array in arrays.values()}
+    if not arrays or sizes == {0}:
         raise ValueError("cannot bootstrap an empty group")
-    if array.size == 1:
-        value = float(array[0])
-        return {"low": value, "high": value}
+    if len(sizes) != 1:
+        raise ValueError("bootstrap metrics must have equal lengths")
+    sample_size = next(iter(sizes))
+    if sample_size == 1:
+        return {
+            name: {"low": float(array[0]), "high": float(array[0])}
+            for name, array in arrays.items()
+        }
     rng = np.random.Generator(np.random.PCG64(seed))
-    means = np.empty(iterations, dtype=np.float64)
-    chunk_size = min(512, iterations)
+    means = {
+        name: np.empty(iterations, dtype=np.float64) for name in arrays
+    }
+    # Cap the temporary index matrix at roughly one million int64 entries.
+    chunk_size = min(512, iterations, max(1, 1_000_000 // sample_size))
     for start in range(0, iterations, chunk_size):
         stop = min(start + chunk_size, iterations)
-        indices = rng.integers(0, array.size, size=(stop - start, array.size))
-        means[start:stop] = array[indices].mean(axis=1)
-    low, high = np.percentile(means, [2.5, 97.5])
-    return {"low": float(low), "high": float(high)}
+        indices = rng.integers(
+            0, sample_size, size=(stop - start, sample_size)
+        )
+        for name, array in arrays.items():
+            means[name][start:stop] = array[indices].mean(axis=1)
+    return {
+        name: {
+            "low": float(np.percentile(metric_means, 2.5)),
+            "high": float(np.percentile(metric_means, 97.5)),
+        }
+        for name, metric_means in means.items()
+    }
 
 
 def aggregate_records(
@@ -470,28 +527,34 @@ def aggregate_records(
         ):
             raise ValueError(f"non-finite logit in aggregate group {key}")
         count = len(rows)
-        groups.append(
-            {
-                "dataset": key[0],
-                "noise": key[1],
-                "group": key[2],
-                "count": count,
-                "mean_delta_z": math.fsum(delta_values) / count,
-                "mean_o_logit": math.fsum(o_values) / count,
-                "mean_strongest_entity_logit": math.fsum(entity_values) / count,
-                "mean_delta_z_ci95": _bootstrap_mean_ci(
-                    delta_values,
-                    iterations=bootstrap_iterations,
-                    seed=_derived_bootstrap_seed(bootstrap_seed, key),
-                ),
-            }
+        group = {
+            "dataset": key[0],
+            "noise": key[1],
+            "group": key[2],
+            "count": count,
+            "mean_delta_z": math.fsum(delta_values) / count,
+            "mean_o_logit": math.fsum(o_values) / count,
+            "mean_strongest_entity_logit": math.fsum(entity_values) / count,
+        }
+        group.update(
+            _bootstrap_mean_cis(
+                {
+                    "mean_delta_z_ci95": delta_values,
+                    "mean_o_logit_ci95": o_values,
+                    "mean_strongest_entity_logit_ci95": entity_values,
+                },
+                iterations=bootstrap_iterations,
+                seed=_derived_bootstrap_seed(bootstrap_seed, key),
+            )
         )
+        groups.append(group)
     return {
         "bootstrap": {
             "method": "fixed-seed percentile bootstrap of the mean",
             "iterations": bootstrap_iterations,
             "seed": bootstrap_seed,
             "confidence": 0.95,
+            "shared_resample_indices": True,
         },
         "groups": groups,
     }
@@ -521,10 +584,163 @@ def _write_staged(path: Path, content: str) -> Path:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-    except Exception:
-        staged.unlink(missing_ok=True)
+    except BaseException as primary_error:
+        try:
+            staged.unlink(missing_ok=True)
+        except BaseException as cleanup_error:
+            raise OutputTransactionError(
+                primary_error, [cleanup_error], [staged] if staged.exists() else []
+            ) from primary_error
         raise
     return staged
+
+
+def _transaction_marker(
+    jsonl_path: Path, jsonl_bytes: bytes, record_count: int, transaction_id: str
+) -> dict[str, Any]:
+    return {
+        "protocol": TRANSACTION_PROTOCOL,
+        "version": TRANSACTION_VERSION,
+        "transaction_id": transaction_id,
+        "jsonl_name": jsonl_path.name,
+        "jsonl_sha256": hashlib.sha256(jsonl_bytes).hexdigest(),
+        "jsonl_bytes": len(jsonl_bytes),
+        "jsonl_line_count": jsonl_bytes.count(b"\n"),
+        "jsonl_record_count": record_count,
+    }
+
+
+def validate_output_pair(jsonl_path: Path, aggregate_path: Path) -> dict[str, Any]:
+    """Validate that the aggregate marker commits the exact canonical JSONL."""
+    jsonl_path = Path(jsonl_path)
+    aggregate_path = Path(aggregate_path)
+    try:
+        jsonl_bytes = jsonl_path.read_bytes()
+        aggregate_value = json.loads(aggregate_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("output pair is missing or unreadable") from exc
+    if not isinstance(aggregate_value, dict):
+        raise ValueError("aggregate output must be a JSON object")
+    marker = aggregate_value.get("artifact_transaction")
+    if not isinstance(marker, dict):
+        raise ValueError("aggregate output has no artifact transaction marker")
+
+    lines = jsonl_bytes.splitlines()
+    try:
+        for line in lines:
+            if not line:
+                raise ValueError("blank JSONL record")
+            json.loads(line)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("canonical JSONL contains an invalid record") from exc
+    expected = {
+        "protocol": TRANSACTION_PROTOCOL,
+        "version": TRANSACTION_VERSION,
+        "transaction_id": marker.get("transaction_id"),
+        "jsonl_name": jsonl_path.name,
+        "jsonl_sha256": hashlib.sha256(jsonl_bytes).hexdigest(),
+        "jsonl_bytes": len(jsonl_bytes),
+        "jsonl_line_count": jsonl_bytes.count(b"\n"),
+        "jsonl_record_count": len(lines),
+    }
+    transaction_id = marker.get("transaction_id")
+    if not isinstance(transaction_id, str) or not re.fullmatch(r"[0-9a-f]{32}", transaction_id):
+        raise ValueError("aggregate transaction id is invalid")
+    if marker != expected:
+        raise ValueError("canonical JSONL does not match its aggregate commit marker")
+    return dict(marker)
+
+
+def _path_matches(path: Path, expected: bytes | None) -> bool:
+    try:
+        if expected is None:
+            return not path.exists()
+        return path.is_file() and path.read_bytes() == expected
+    except OSError:
+        return False
+
+
+def _cleanup_paths(paths: Sequence[Path]) -> list[BaseException]:
+    errors: list[BaseException] = []
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
+
+
+def _restore_old_pair(
+    *,
+    jsonl_path: Path,
+    aggregate_path: Path,
+    old_jsonl: bytes | None,
+    old_aggregate: bytes | None,
+    jsonl_backup: Path,
+    aggregate_backup: Path,
+) -> list[BaseException]:
+    """Restore the pre-transaction bytes, restoring the aggregate marker last."""
+    errors: list[BaseException] = []
+    if _path_matches(jsonl_path, old_jsonl) and _path_matches(
+        aggregate_path, old_aggregate
+    ):
+        return errors
+
+    # No aggregate marker may remain canonical while the JSONL is being restored.
+    if aggregate_path.exists() and not _path_matches(aggregate_path, old_aggregate):
+        try:
+            aggregate_path.unlink()
+        except BaseException as exc:
+            errors.append(exc)
+
+    if old_jsonl is None:
+        if jsonl_path.exists():
+            try:
+                jsonl_path.unlink()
+            except BaseException as exc:
+                errors.append(exc)
+    elif not _path_matches(jsonl_path, old_jsonl):
+        if _path_matches(jsonl_backup, old_jsonl):
+            try:
+                os.replace(jsonl_backup, jsonl_path)
+            except BaseException as exc:
+                errors.append(exc)
+        else:
+            errors.append(RuntimeError("old JSONL backup is unavailable"))
+
+    jsonl_restored = _path_matches(jsonl_path, old_jsonl)
+    if not jsonl_restored:
+        errors.append(RuntimeError("canonical JSONL was not restored exactly"))
+        if aggregate_path.exists():
+            try:
+                if old_aggregate is not None and _path_matches(
+                    aggregate_path, old_aggregate
+                ) and not aggregate_backup.exists():
+                    os.replace(aggregate_path, aggregate_backup)
+                else:
+                    aggregate_path.unlink()
+            except BaseException as exc:
+                errors.append(exc)
+        return errors
+
+    if old_aggregate is None:
+        if aggregate_path.exists():
+            try:
+                aggregate_path.unlink()
+            except BaseException as exc:
+                errors.append(exc)
+    elif not _path_matches(aggregate_path, old_aggregate):
+        if _path_matches(aggregate_backup, old_aggregate):
+            try:
+                os.replace(aggregate_backup, aggregate_path)
+            except BaseException as exc:
+                errors.append(exc)
+        else:
+            errors.append(RuntimeError("old aggregate backup is unavailable"))
+
+    if not _path_matches(aggregate_path, old_aggregate):
+        errors.append(RuntimeError("canonical aggregate was not restored exactly"))
+    return errors
 
 
 def write_outputs_atomic(
@@ -533,47 +749,87 @@ def write_outputs_atomic(
     records: Sequence[Mapping[str, Any]],
     aggregate: Mapping[str, Any],
 ) -> tuple[Path, Path]:
-    """Stage both artifacts completely, then install them with rollback."""
+    """Commit JSONL plus aggregate, using the aggregate as the last-installed marker."""
     jsonl_path, aggregate_path = output_paths(output_root, backbone_tag)
     jsonl_text = "".join(
         json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records
     )
-    aggregate_text = json.dumps(
-        aggregate, ensure_ascii=False, sort_keys=True, indent=2
-    ) + "\n"
+    jsonl_bytes = jsonl_text.encode("utf-8")
+    transaction_id = uuid.uuid4().hex
+    aggregate_value = dict(aggregate)
+    aggregate_value["artifact_transaction"] = _transaction_marker(
+        jsonl_path, jsonl_bytes, len(records), transaction_id
+    )
+    aggregate_text = (
+        json.dumps(aggregate_value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    )
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
     final_paths = (jsonl_path, aggregate_path)
     staged_paths: list[Path] = []
-    backups: dict[Path, Path] = {}
-    installed: list[Path] = []
     try:
-        staged_paths = [
-            _write_staged(jsonl_path, jsonl_text),
-            _write_staged(aggregate_path, aggregate_text),
-        ]
-        for final_path in final_paths:
-            if final_path.exists():
-                backup = final_path.with_name(
-                    f".{final_path.name}.{uuid.uuid4().hex}.bak"
-                )
-                os.replace(final_path, backup)
-                backups[final_path] = backup
-        for staged, final_path in zip(staged_paths, final_paths):
-            os.replace(staged, final_path)
-            installed.append(final_path)
-    except Exception:
-        for final_path in installed:
-            final_path.unlink(missing_ok=True)
-        for final_path, backup in backups.items():
-            if backup.exists():
-                os.replace(backup, final_path)
+        staged_paths.append(_write_staged(jsonl_path, jsonl_text))
+        staged_paths.append(_write_staged(aggregate_path, aggregate_text))
+    except BaseException as primary_error:
+        cleanup_errors = _cleanup_paths(staged_paths)
+        if cleanup_errors:
+            recovery_paths = [path for path in staged_paths if path.exists()]
+            raise OutputTransactionError(
+                primary_error, cleanup_errors, recovery_paths
+            ) from primary_error
         raise
-    finally:
-        for staged in staged_paths:
-            staged.unlink(missing_ok=True)
-        for backup in backups.values():
-            backup.unlink(missing_ok=True)
+
+    jsonl_staged, aggregate_staged = staged_paths
+    jsonl_backup = jsonl_path.with_name(f".{jsonl_path.name}.{transaction_id}.bak")
+    aggregate_backup = aggregate_path.with_name(
+        f".{aggregate_path.name}.{transaction_id}.bak"
+    )
+    try:
+        old_jsonl = jsonl_path.read_bytes() if jsonl_path.exists() else None
+        old_aggregate = aggregate_path.read_bytes() if aggregate_path.exists() else None
+    except BaseException as primary_error:
+        cleanup_errors = _cleanup_paths(staged_paths)
+        if cleanup_errors:
+            recovery_paths = [path for path in staged_paths if path.exists()]
+            raise OutputTransactionError(
+                primary_error, cleanup_errors, recovery_paths
+            ) from primary_error
+        raise
+    try:
+        # Remove the old commit marker before any canonical JSONL transition.
+        if old_aggregate is not None:
+            os.replace(aggregate_path, aggregate_backup)
+        if old_jsonl is not None:
+            os.replace(jsonl_path, jsonl_backup)
+        os.replace(jsonl_staged, jsonl_path)
+        # Installing the aggregate is the atomic commit point and must be last.
+        os.replace(aggregate_staged, aggregate_path)
+        validate_output_pair(jsonl_path, aggregate_path)
+    except BaseException as primary_error:
+        rollback_errors = _restore_old_pair(
+            jsonl_path=jsonl_path,
+            aggregate_path=aggregate_path,
+            old_jsonl=old_jsonl,
+            old_aggregate=old_aggregate,
+            jsonl_backup=jsonl_backup,
+            aggregate_backup=aggregate_backup,
+        )
+        recovery_candidates = [
+            jsonl_staged,
+            aggregate_staged,
+            jsonl_backup,
+            aggregate_backup,
+        ]
+        if rollback_errors:
+            recovery_paths = [path for path in recovery_candidates if path.exists()]
+            raise OutputTransactionError(
+                primary_error, rollback_errors, recovery_paths
+            ) from primary_error
+        _cleanup_paths(recovery_candidates)
+        raise
+
+    # Once the marker validates, cleanup is best effort and cannot revoke the commit.
+    _cleanup_paths([jsonl_staged, aggregate_staged, jsonl_backup, aggregate_backup])
     return final_paths
 
 
@@ -678,6 +934,21 @@ def _record_from_item(
     return record
 
 
+def _ontology_batches(
+    items: Sequence[ProbeItem], batch_size: int
+) -> list[list[tuple[int, ProbeItem]]]:
+    """Group deterministic item positions by dataset and exact codebook shape."""
+    buckets: dict[tuple[str, tuple[tuple[str, str], ...]], list[tuple[int, ProbeItem]]] = {}
+    for index, item in enumerate(items):
+        key = (item.dataset, tuple(build_codebook(item.dataset).items()))
+        buckets.setdefault(key, []).append((index, item))
+    return [
+        bucket[start : start + batch_size]
+        for bucket in buckets.values()
+        for start in range(0, len(bucket), batch_size)
+    ]
+
+
 def run_probe(
     *,
     revision: str,
@@ -702,9 +973,9 @@ def run_probe(
     model_hash = model_fingerprint(model, revision)
     tokenizer_hash = tokenizer_fingerprint(tokenizer, revision)
 
-    records: list[dict[str, Any]] = []
-    for start in range(0, len(items), batch_size):
-        batch = items[start : start + batch_size]
+    ordered_records: list[dict[str, Any] | None] = [None] * len(items)
+    for indexed_batch in _ontology_batches(items, batch_size):
+        batch = [item for _, item in indexed_batch]
         prompts: list[str] = []
         codebooks: list[dict[str, str]] = []
         token_id_maps: list[dict[str, int]] = []
@@ -723,21 +994,23 @@ def run_probe(
             codebooks.append(codebook)
             token_id_maps.append(token_ids)
         batch_logits = gather_code_logits(model, tokenizer, prompts, token_id_maps)
-        for item, codebook, token_ids, logits in zip(
-            batch, codebooks, token_id_maps, batch_logits
+        for (item_index, item), codebook, token_ids, logits in zip(
+            indexed_batch, codebooks, token_id_maps, batch_logits
         ):
-            records.append(
-                _record_from_item(
-                    item,
-                    codebook=codebook,
-                    code_token_ids=token_ids,
-                    logits=logits,
-                    revision=revision,
-                    backbone_tag=backbone_tag,
-                    model_hash=model_hash,
-                    tokenizer_hash=tokenizer_hash,
-                )
+            ordered_records[item_index] = _record_from_item(
+                item,
+                codebook=codebook,
+                code_token_ids=token_ids,
+                logits=logits,
+                revision=revision,
+                backbone_tag=backbone_tag,
+                model_hash=model_hash,
+                tokenizer_hash=tokenizer_hash,
             )
+
+    if any(record is None for record in ordered_records):
+        raise RuntimeError("internal error: a probe item was not scored")
+    records = [record for record in ordered_records if record is not None]
 
     aggregate = aggregate_records(
         records,
@@ -799,21 +1072,29 @@ def main(
     *,
     model_loader: Callable[[str, str], tuple[Any, Any]] = load_model_and_tokenizer,
 ) -> int:
-    args = _parser().parse_args(argv)
-    revision, backbone_tag = validate_runtime_identity(args.revision, args.backbone_tag)
-    if not args.confirm_vllm_stopped:
-        raise ValueError("--confirm-vllm-stopped is required before GPU model loading")
-    result = run_probe(
-        revision=revision,
-        backbone_tag=backbone_tag,
-        input_root=args.input_root,
-        output_root=args.output_root,
-        batch_size=args.batch_size,
-        bootstrap_iterations=args.bootstrap_iterations,
-        bootstrap_seed=args.bootstrap_seed,
-        control_seed=args.control_seed,
-        model_loader=model_loader,
-    )
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        revision, backbone_tag = validate_runtime_identity(
+            args.revision, args.backbone_tag
+        )
+        if not args.confirm_vllm_stopped:
+            raise ValueError(
+                "--confirm-vllm-stopped is required before GPU model loading"
+            )
+        result = run_probe(
+            revision=revision,
+            backbone_tag=backbone_tag,
+            input_root=args.input_root,
+            output_root=args.output_root,
+            batch_size=args.batch_size,
+            bootstrap_iterations=args.bootstrap_iterations,
+            bootstrap_seed=args.bootstrap_seed,
+            control_seed=args.control_seed,
+            model_loader=model_loader,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
     print(json.dumps(result, sort_keys=True))
     return 0
 

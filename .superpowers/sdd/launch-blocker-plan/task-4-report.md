@@ -94,3 +94,72 @@ The pre-change related baseline was also clean: 36 tests passed in 16.02s.
   intentionally fail-closed runtime checks for the rented GPU.
 - Direct CLI execution additionally requires `--confirm-vllm-stopped`; this is
   a safety acknowledgement and does not attempt to inspect or stop vLLM.
+
+## Review fix round 1
+
+### RED evidence
+
+The inherited partial test edit was preserved and audited. Its first run was
+not sufficient product RED evidence because it stopped in the test harness:
+
+```text
+........F........                                                        [100%]
+1 failed, 16 passed in 4.00s
+```
+
+`PaddingTokenizer` had been changed to require `padding_side`, but its existing
+call site had not been updated. After correcting that fixture and completing
+the behavior-level tests, the unchanged production code failed in the intended
+places (exit 1):
+
+```text
+............F..FFF.FFFFF....FFFF                                         [100%]
+13 failed, 19 passed in 4.02s
+```
+
+Those failures reproduced mixed 7/9-code batching at the MSRA boundary,
+missing CIs for two logit metrics, absent aggregate commit metadata, staging
+leaks, incomplete `BaseException` rollback, cleanup failures escaping after a
+valid install, and raw CLI validation exceptions. A later transaction-audit
+test separately proved that a pre-commit snapshot failure leaked both staged
+files before its fix (exit 1: `1 failed, 32 deselected in 2.45s`).
+
+### GREEN evidence
+
+The completed focused suite now passes (exit 0):
+
+```text
+...................................                                      [100%]
+35 passed in 3.72s
+```
+
+The full synthetic run uses the canonical 45-file by 200-row matrix and the
+old batch size of eight that crosses from MSRA into CONLL-2003. It proves that
+inference batches stay within one dataset/exact codebook, while the 90 output
+records retain canonical dataset/file/group order. Separate left- and
+right-padding cases use different contextual token-ID maps per row and assert
+the exact gathered logits.
+
+The 10,000-iteration bootstrap test compares all three CIs against a direct
+NumPy reference. One derived PCG64 stream supplies each group's resample index
+matrix, and each chunk reuses those indices for delta-z, O-logit, and strongest
+entity-logit means.
+
+### Transaction rationale
+
+The aggregate JSON is now the commit marker for the exact canonical JSONL. It
+records protocol/version, a transaction ID, canonical JSONL name, SHA-256,
+byte count, line count, and record count; `validate_output_pair()` verifies the
+marker and parses every JSONL record.
+
+Both artifacts are staged in the destination directory before canonical paths
+change. The old aggregate marker is moved aside first, followed by the old
+JSONL; the new JSONL is installed next and the new aggregate marker last. Thus
+a process crash after the old marker is removed but before the new marker is
+installed cannot present an uncommitted JSONL as a committed pair. Handled
+`BaseException` paths restore the exact prior JSONL and restore its aggregate
+marker last. If rollback itself fails, the canonical aggregate remains absent,
+recoverable backups/stages are retained, and `OutputTransactionError` reports
+both the primary and rollback failures. Cleanup after a validated commit is
+best effort, so a cleanup error cannot turn a valid pair into a reported
+failure. Fault-injection coverage also verifies unrelated files are untouched.
