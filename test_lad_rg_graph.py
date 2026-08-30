@@ -9,6 +9,17 @@ from metrics import compute_ser
 from run_multiseed import CONFIGURATIONS
 
 
+REVISION = "a" * 40
+SERVED_MODEL = f"Qwen/Qwen3-32B-AWQ@{REVISION}"
+
+
+def _provider_settings():
+    return {
+        "provider": "vllm", "model": "Qwen/Qwen3-32B-AWQ",
+        "served_model": SERVED_MODEL, "revision": REVISION,
+    }
+
+
 def _state(**overrides):
     state = {
         "tokens": ["Alice", "Berlin"],
@@ -22,6 +33,8 @@ def _state(**overrides):
         "ror_ungated": False,
         "gasd_potentials": True,
         "ror_proposals": {},
+        "provider_settings": _provider_settings(),
+        "provider_metadata": {stage: [] for stage in ("coder", "reviewer", "ror", "gasd")},
     }
     state.update(overrides)
     return state
@@ -145,6 +158,7 @@ def test_reviewer_disables_lads_weighting_without_calling_llm(monkeypatch):
 
     assert called["n"] == 0
     assert result["rag_weights"] == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+    assert result["provider_metadata"]["reviewer"][0]["status"] == "disabled"
 
 
 def test_gasd_can_be_disabled_without_running_decoder(monkeypatch):
@@ -161,6 +175,7 @@ def test_gasd_can_be_disabled_without_running_decoder(monkeypatch):
     )
 
     assert result["current_tags"] == ["B-PER", "O"]
+    assert result["provider_metadata"]["gasd"][0]["status"] == "disabled"
 
 
 def test_ror_gate_uses_omega_and_ungated_diagnostic(monkeypatch):
@@ -251,6 +266,7 @@ def test_ror_reports_not_triggered_without_calling_provider(monkeypatch):
 
     assert result["ror_proposals"] == {}
     assert result["ror_reasoning"]["source"] == "not_triggered"
+    assert result["provider_metadata"]["ror"][0]["status"] == "not_triggered"
 
 
 def test_ror_live_empty_span_response_rejects_all_deterministic_proposals(monkeypatch):
@@ -275,6 +291,7 @@ def test_ror_live_empty_span_response_rejects_all_deterministic_proposals(monkey
     assert calls == ["span_detection"]
     assert result["ror_proposals"] == {}
     assert result["ror_reasoning"] == {"source": "live", "spans": []}
+    assert result["provider_metadata"]["ror"][0]["status"] == "live"
 
 
 @pytest.mark.parametrize(

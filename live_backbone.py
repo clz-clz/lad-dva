@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from official_contract import OFFICIAL_DECODER_CONSTANTS
+
 
 class LiveBackboneError(RuntimeError):
     """A provider, response-schema, or live-backbone validation failure."""
@@ -146,7 +148,7 @@ class OpenAICompatibleLADRGAdapter:
     offline; otherwise the official OpenAI SDK client is constructed lazily.
     """
 
-    REASON_BONUS = 2.0
+    REASON_BONUS = OFFICIAL_DECODER_CONSTANTS["gasd_reason_bonus"]
 
     def __init__(
         self,
@@ -247,10 +249,12 @@ class OpenAICompatibleLADRGAdapter:
     ) -> dict[str, Any]:
         return {
             "stage": stage,
+            "status": "live",
             "provider": self.settings.provider,
-            "model": response_metadata.get("model") or self.settings.model,
+            "model": self.settings.model,
             "served_model": self.settings.served_model,
             "revision": self.settings.revision,
+            "response_model": response_metadata.get("model"),
             "system_fingerprint": response_metadata.get("system_fingerprint"),
             "usage": dict(response_metadata.get("usage") or {}),
         }
@@ -264,7 +268,7 @@ class OpenAICompatibleLADRGAdapter:
         enable_thinking: bool,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         request: dict[str, Any] = {
-            "model": self.settings.model,
+            "model": self.settings.served_model,
             "messages": messages,
             "timeout": self.settings.timeout_seconds,
         }
@@ -281,8 +285,14 @@ class OpenAICompatibleLADRGAdapter:
                 request["extra_body"] = {"thinking": {"type": "enabled"}}
         try:
             raw = self._transport(**request)
+            response_model = _get(raw, "model")
+            if (self.settings.provider == "vllm"
+                    and response_model != self.settings.served_model):
+                raise LiveBackboneError(
+                    "vLLM response served model identity does not match the immutable request"
+                )
             return _json_response(raw), {
-                "model": _get(raw, "model"),
+                "model": response_model,
                 "system_fingerprint": _get(raw, "system_fingerprint"),
                 "usage": _mapping_value(_get(raw, "usage")),
             }
@@ -404,7 +414,10 @@ def _validate_gasd(response: Mapping[str, Any], token_count: int, valid_tags: se
     if not isinstance(reason, str) or not isinstance(tags, list):
         raise LiveBackboneError("official GASD-R response has invalid field types")
     if len(tags) != token_count:
-        raise LiveBackboneError("official GASD-R response must contain exactly one tag per token")
+        raise LiveBackboneError(
+            f"official GASD-R response must contain exactly {token_count} tags; "
+            f"received {len(tags)}"
+        )
     if not all(isinstance(tag, str) and tag in valid_tags for tag in tags):
         raise LiveBackboneError("official GASD-R response uses a tag outside the dataset ontology")
     return reason, list(tags)

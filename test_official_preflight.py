@@ -9,6 +9,8 @@ from live_backbone import LiveBackboneSettings, OpenAICompatibleLADRGAdapter
 DATASETS = ["msra", "conll2003", "wnut17", "fewnerd", "ontonotes5"]
 NOISE = ["BT", "IF", "ATF"]
 SEEDS = [13, 42, 2024]
+QWEN_REVISION = "a" * 40
+QWEN_SERVED_MODEL = f"Qwen/Qwen3-32B-AWQ@{QWEN_REVISION}"
 
 
 def _env():
@@ -18,7 +20,7 @@ def _env():
         "BACKBONE_BASE_URL": "http://127.0.0.1:8000/v1",
         "BACKBONE_API_KEY": "test-key",
         "BACKBONE_TAG": "qwen32b-r1",
-        "BACKBONE_REVISION": "a" * 40,
+        "BACKBONE_REVISION": QWEN_REVISION,
     }
 
 
@@ -122,9 +124,41 @@ def test_static_preflight_validates_the_intended_official_configs(tmp_path):
     assert any(item["code"] == "invalid_configuration" for item in report["blockers"])
 
 
+def test_static_preflight_rejects_off_protocol_tagged_artifacts(tmp_path):
+    repo, sha = _repo(tmp_path)
+    noisy = tmp_path / "noisy"
+    pred = tmp_path / "pred"
+    pred.mkdir()
+    _noisy_fixture(noisy)
+    artifacts = [
+        pred / "pred_seed99__lad_rg_full__msra__BT__qwen32b-r1.jsonl",
+        pred / "pred_seed13__lad_rg_full__msra__XX__qwen32b-r1.jsonl",
+        pred / "pred_seed13__lad_rg_gasd_r__msra__BT__qwen32b-r1.jsonl",
+        pred / "pred_seed13__lad_rg_full__msra__BT__extra__qwen32b-r1.jsonl",
+    ]
+    for artifact in artifacts:
+        artifact.write_text("{}\n", encoding="utf-8")
+    unrelated_tag = pred / "pred_seed13__lad_rg_full__msra__BT__qwen32b-r1-other.jsonl"
+    unrelated_tag.write_text("{}\n", encoding="utf-8")
+
+    report = official_preflight.run_static_preflight(
+        repo_root=repo, expected_sha=sha, noisy_dir=noisy, pred_dir=pred,
+        environment=_env(), config_names=["lad_rg_full"], deer_timeout=3.0,
+        deer_checker=lambda datasets, timeout: {name: {"ok": True} for name in datasets},
+    )
+
+    assert report["ok"] is False
+    rejected = next(
+        item for item in report["blockers"]
+        if item["code"] == "noncanonical_prediction_artifact"
+    )
+    assert set(rejected["files"]) == {artifact.name for artifact in artifacts}
+    assert unrelated_tag.name not in rejected["files"]
+
+
 def _response(payload, fingerprint="fp-test"):
     return {
-        "model": "Qwen/Qwen3-32B-AWQ",
+        "model": QWEN_SERVED_MODEL,
         "system_fingerprint": fingerprint,
         "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         "choices": [{"message": {"content": json.dumps(payload)}}],
@@ -135,7 +169,7 @@ def test_live_preflight_uses_real_adapter_validation_with_mocked_transport():
     settings = LiveBackboneSettings(
         provider="vllm", model="Qwen/Qwen3-32B-AWQ",
         base_url="http://127.0.0.1:8000/v1", api_key="test",
-        revision="a" * 40,
+        revision=QWEN_REVISION,
     )
 
     def transport(**request):
@@ -148,7 +182,7 @@ def test_live_preflight_uses_real_adapter_validation_with_mocked_transport():
 
     report = official_preflight.run_live_preflight(
         settings=settings,
-        models_fetcher=lambda _: [{"id": "Qwen/Qwen3-32B-AWQ"}],
+        models_fetcher=lambda _: [{"id": QWEN_SERVED_MODEL}],
         adapter_factory=lambda configured: OpenAICompatibleLADRGAdapter(
             configured, transport=transport
         ),
@@ -163,7 +197,7 @@ def test_live_preflight_blocks_qwen_gasd_length_error():
     settings = LiveBackboneSettings(
         provider="vllm", model="Qwen/Qwen3-32B-AWQ",
         base_url="http://127.0.0.1:8000/v1", api_key="test",
-        revision="a" * 40,
+        revision=QWEN_REVISION,
     )
 
     def transport(**request):
@@ -176,14 +210,18 @@ def test_live_preflight_blocks_qwen_gasd_length_error():
 
     report = official_preflight.run_live_preflight(
         settings=settings,
-        models_fetcher=lambda _: [{"id": settings.model}],
+        models_fetcher=lambda _: [{"id": settings.served_model}],
         adapter_factory=lambda configured: OpenAICompatibleLADRGAdapter(
             configured, transport=transport
         ),
     )
 
     assert report["ok"] is False
-    assert any(item["code"] == "live_validation_failed" for item in report["blockers"])
+    assert any(
+        item["code"] == "live_validation_failed"
+        and "exactly 3 tags" in item["message"]
+        for item in report["blockers"]
+    )
 
 
 def test_models_url_always_targets_openai_v1_models_endpoint():
@@ -199,7 +237,7 @@ def test_live_preflight_records_unsupported_fingerprint_without_blocking():
     settings = LiveBackboneSettings(
         provider="vllm", model="Qwen/Qwen3-32B-AWQ",
         base_url="http://127.0.0.1:8000/v1", api_key="test",
-        revision="a" * 40,
+        revision=QWEN_REVISION,
     )
 
     def transport(**request):
@@ -212,7 +250,7 @@ def test_live_preflight_records_unsupported_fingerprint_without_blocking():
 
     report = official_preflight.run_live_preflight(
         settings=settings,
-        models_fetcher=lambda _: [{"id": settings.model}],
+        models_fetcher=lambda _: [{"id": settings.served_model}],
         adapter_factory=lambda configured: OpenAICompatibleLADRGAdapter(
             configured, transport=transport
         ),
@@ -220,6 +258,95 @@ def test_live_preflight_records_unsupported_fingerprint_without_blocking():
 
     assert report["ok"] is True
     assert report["checks"]["provider_metadata"]["fingerprint_supported"] is False
+
+
+def test_live_preflight_rejects_bare_vllm_model_advertisement():
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision=QWEN_REVISION,
+    )
+
+    report = official_preflight.run_live_preflight(
+        settings=settings,
+        models_fetcher=lambda _: [{"id": settings.model}],
+        adapter_factory=lambda configured: (_ for _ in ()).throw(
+            AssertionError("adapter must not be created for a bare model listing")
+        ),
+    )
+
+    assert report["ok"] is False
+    assert any(
+        item["code"] == "live_validation_failed"
+        and "absent from /v1/models" in item["message"]
+        for item in report["blockers"]
+    )
+
+
+def test_live_preflight_rejects_non_official_vllm_model_before_network():
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Other-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision=QWEN_REVISION,
+    )
+
+    report = official_preflight.run_live_preflight(
+        settings=settings,
+        models_fetcher=lambda _: (_ for _ in ()).throw(
+            AssertionError("network check must not run for a non-official model")
+        ),
+    )
+
+    assert report["ok"] is False
+    assert any("Qwen/Qwen3-32B-AWQ" in item["message"] for item in report["blockers"])
+
+
+def test_live_preflight_rejects_adapter_identity_before_schema_calls():
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision=QWEN_REVISION,
+    )
+
+    class WrongIdentityAdapter:
+        def __init__(self, configured):
+            self.configured = configured
+
+        def provider_metadata(self):
+            return {
+                "provider": "vllm", "model": self.configured.model,
+                "served_model": self.configured.model,
+                "revision": self.configured.revision,
+            }
+
+        def ror_reasoner(self, *args):
+            raise AssertionError("schema calls must not run")
+
+    report = official_preflight.run_live_preflight(
+        settings=settings,
+        models_fetcher=lambda _: [{"id": settings.served_model}],
+        adapter_factory=WrongIdentityAdapter,
+    )
+
+    assert report["ok"] is False
+    assert any("adapter identity" in item["message"] for item in report["blockers"])
+
+
+def test_live_preflight_rejects_deepseek_reason_configs_before_network():
+    settings = LiveBackboneSettings(
+        provider="deepseek", model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1", api_key="test",
+    )
+
+    report = official_preflight.run_live_preflight(
+        settings=settings, config_names=["lad_rg_gasd_both"],
+        models_fetcher=lambda _: (_ for _ in ()).throw(
+            AssertionError("network check must not run for an invalid config/provider pair")
+        ),
+    )
+
+    assert report["ok"] is False
+    assert any("GASD-R/Both" in item["message"] for item in report["blockers"])
 
 
 def test_static_cli_converts_internal_failure_to_json_only(capsys, monkeypatch, tmp_path):

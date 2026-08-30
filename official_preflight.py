@@ -31,6 +31,7 @@ from run_multiseed import (
     _is_legal_iob2,
     _manifest_path,
     _official_settings_from_env,
+    _validate_official_settings_for_configs,
     _validate_official_prediction,
     _valid_tags,
 )
@@ -144,10 +145,36 @@ def _default_deer_checker(
 def _check_tagged_artifacts(
     pred_dir: Path, settings: LiveBackboneSettings, tag: str, expected_sha: str,
     request_timeout: float, blockers: list[dict[str, Any]],
+    config_names: Sequence[str],
 ) -> dict[str, Any]:
     manifest_path = _manifest_path(pred_dir, tag)
-    outputs = sorted(pred_dir.glob(f"pred_*__{tag}.jsonl")) if pred_dir.is_dir() else []
-    temp_outputs = sorted(pred_dir.glob(f"pred_*__{tag}.jsonl.tmp")) if pred_dir.is_dir() else []
+    canonical_outputs = {
+        f"pred_seed{seed}__{config_name}__{dataset}__{noise}__{tag}.jsonl"
+        for config_name in config_names for dataset in DATASETS
+        for noise in NOISE_TYPES for seed in SEEDS
+    }
+    canonical_temps = {name + ".tmp" for name in canonical_outputs}
+    selected_tag_suffix = f"__{tag}.jsonl"
+    selected_tag_extra_component = f"__{tag}__"
+    tagged_artifacts = sorted(
+        path for path in pred_dir.glob("pred_*")
+        if pred_dir.is_dir() and (
+            selected_tag_suffix in path.name
+            or selected_tag_extra_component in path.name
+        )
+    ) if pred_dir.is_dir() else []
+    noncanonical = [
+        path for path in tagged_artifacts
+        if path.name not in canonical_outputs and path.name not in canonical_temps
+    ]
+    if noncanonical:
+        _block(
+            blockers, "noncanonical_prediction_artifact",
+            "tagged prediction artifacts fall outside the selected official namespace",
+            files=[path.name for path in noncanonical],
+        )
+    outputs = [path for path in tagged_artifacts if path.name in canonical_outputs]
+    temp_outputs = [path for path in tagged_artifacts if path.name in canonical_temps]
     expected_manifest = _build_official_manifest(settings, tag, expected_sha, request_timeout)
     compatible_manifest = False
     if manifest_path.exists():
@@ -173,7 +200,15 @@ def _check_tagged_artifacts(
                 continue
             config_name, dataset = parts[1], parts[2]
             try:
-                _validate_official_prediction(path, dataset, config_name)
+                _validate_official_prediction(
+                    path, dataset, config_name,
+                    provider_identity={
+                        "provider": settings.provider,
+                        "model": settings.model,
+                        "served_model": settings.served_model,
+                        "revision": settings.revision,
+                    },
+                )
             except Exception as exc:  # noqa: BLE001 - report all blockers as JSON
                 _block(blockers, "incompatible_prediction", str(exc), file=path.name)
     return {
@@ -238,6 +273,7 @@ def run_static_preflight(
     if settings is not None:
         checks["tagged_artifacts"] = _check_tagged_artifacts(
             pred_dir, settings, tag, expected_sha, request_timeout, blockers,
+            config_names,
         )
     else:
         checks["tagged_artifacts"] = {"skipped": True}
@@ -271,6 +307,7 @@ def _default_models_fetcher(settings: LiveBackboneSettings) -> list[dict[str, An
 
 def run_live_preflight(
     *, settings: LiveBackboneSettings,
+    config_names: Sequence[str] = ("lad_rg_full",),
     models_fetcher: Callable[[LiveBackboneSettings], Sequence[Mapping[str, Any]]] = _default_models_fetcher,
     adapter_factory: Callable[[LiveBackboneSettings], OpenAICompatibleLADRGAdapter] = OpenAICompatibleLADRGAdapter,
 ) -> dict[str, Any]:
@@ -279,13 +316,30 @@ def run_live_preflight(
     checks: dict[str, Any] = {}
     fingerprints: set[str] = set()
     try:
+        _validate_official_settings_for_configs(settings, config_names)
         models = list(models_fetcher(settings))
         model_ids = [item.get("id") for item in models if isinstance(item, Mapping)]
-        if settings.model not in model_ids and settings.served_model not in model_ids:
-            raise ValueError(f"configured model is absent from /v1/models: {settings.model}")
+        expected_model_id = (
+            settings.served_model if settings.provider == "vllm" else settings.model
+        )
+        if expected_model_id not in model_ids:
+            raise ValueError(
+                f"configured immutable identity is absent from /v1/models: {expected_model_id}"
+            )
         checks["models"] = {"ids": model_ids, "configured_model_present": True}
 
         adapter = adapter_factory(settings)
+        expected_identity = {
+            "provider": settings.provider,
+            "model": settings.model,
+            "served_model": settings.served_model,
+            "revision": settings.revision,
+        }
+        adapter_identity = adapter.provider_metadata()
+        if (not isinstance(adapter_identity, Mapping)
+                or any(adapter_identity.get(key) != value
+                       for key, value in expected_identity.items())):
+            raise ValueError("live adapter identity does not match official settings")
         tokens = ["Alice", "met", "Paris"]
         valid_types = ["PER", "LOC", "ORG", "MISC"]
         spans = adapter.ror_reasoner(
@@ -296,7 +350,7 @@ def run_live_preflight(
                                 "dirty_tags": ["O"] * 3, "spans": spans["spans"]},
         )
         checks["ror"] = {"spans": spans["spans"], "types": typed["types"]}
-        evidence = [spans, typed]
+        evidence = [(spans, "ror_span_detection"), (typed, "ror_type_assignment")]
         if settings.provider == "vllm":
             valid_tags = ["O"] + [
                 f"{prefix}-{entity_type}" for entity_type in valid_types for prefix in ("B", "I")
@@ -307,14 +361,23 @@ def run_live_preflight(
                 "ror_proposals": {}, "constraint": "hard_iob2",
             })
             checks["gasd_r"] = {"tag_count": len(gasd["tags"]), "tags": gasd["tags"]}
-            evidence.append(gasd)
-        for result in evidence:
+            evidence.append((gasd, "gasd_r"))
+        for result, expected_stage in evidence:
             metadata = getattr(result, "provider_metadata", {})
+            if (not isinstance(metadata, Mapping)
+                    or metadata.get("stage") != expected_stage
+                    or metadata.get("status") != "live"
+                    or metadata.get("response_model") != settings.served_model
+                    or any(metadata.get(key) != value
+                           for key, value in expected_identity.items())):
+                raise ValueError(
+                    f"live provider evidence does not match official identity for {expected_stage}"
+                )
             fingerprint = metadata.get("system_fingerprint")
             if fingerprint:
                 fingerprints.add(str(fingerprint))
         checks["provider_metadata"] = {
-            "settings": adapter.provider_metadata(),
+            "settings": dict(adapter_identity),
             "system_fingerprints": sorted(fingerprints),
             "fingerprint_supported": bool(fingerprints),
         }
@@ -359,8 +422,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }]}
     else:
         try:
-            settings, _ = _official_settings_from_env(["lad_rg_full"], os.environ)
-            report = run_live_preflight(settings=settings)
+            settings, _ = _official_settings_from_env(list(args.configs), os.environ)
+            report = run_live_preflight(settings=settings, config_names=args.configs)
         except Exception as exc:  # noqa: BLE001
             report = {"mode": "live", "ok": False, "checks": {}, "blockers": [{
                 "code": "invalid_configuration", "message": str(exc),

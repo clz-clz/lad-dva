@@ -15,6 +15,7 @@ PINNED_QWEN_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def _response(payload: dict, **metadata) -> dict:
+    metadata.setdefault("model", f"qwen@{PINNED_QWEN_REVISION}")
     return {"choices": [{"message": {"content": json.dumps(payload)}}], **metadata}
 
 
@@ -42,7 +43,10 @@ def _payload(tokens=("Acme", "Labs")) -> dict:
 
 
 def test_vllm_ror_uses_configured_served_name_and_retains_pinned_evidence():
-    transport = _RecordingTransport([_response({"spans": [{"start": 0, "end": 2}]})])
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    transport = _RecordingTransport([
+        _response({"spans": [{"start": 0, "end": 2}]}, model=served_model)
+    ])
     adapter = OpenAICompatibleLADRGAdapter(
         LiveBackboneSettings(
             provider="vllm",
@@ -59,7 +63,7 @@ def test_vllm_ror_uses_configured_served_name_and_retains_pinned_evidence():
     }
     request = transport.calls[0]
     assert request["timeout"] == 120.0
-    assert request["model"] == "Qwen/Qwen3-32B-AWQ"
+    assert request["model"] == served_model
     assert request["extra_body"] == {"chat_template_kwargs": {"enable_thinking": True}}
     assert request["response_format"]["type"] == "json_schema"
     assert request["response_format"]["json_schema"]["schema"] == {
@@ -85,6 +89,23 @@ def test_vllm_ror_uses_configured_served_name_and_retains_pinned_evidence():
     assert adapter.provider_metadata()["served_model"] == (
         f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
     )
+
+
+def test_vllm_rejects_response_from_bare_or_different_served_identity():
+    transport = _RecordingTransport([
+        _response({"spans": []}, model="Qwen/Qwen3-32B-AWQ")
+    ])
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=transport,
+    )
+
+    with pytest.raises(LiveBackboneError, match="served model identity"):
+        adapter.ror_reasoner("span_detection", _payload())
 
 
 def test_deepseek_settings_reject_any_model_except_deepseek_v4_flash():
@@ -146,13 +167,13 @@ def test_callback_result_retains_independent_response_metadata_without_changing_
         [
             _response(
                 {"spans": [{"start": 0, "end": 2}]},
-                model="qwen-served",
+                model=f"qwen@{PINNED_QWEN_REVISION}",
                 system_fingerprint="fp-span",
                 usage={"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
             ),
             _response(
                 {"types": [{"start": 0, "end": 2, "type": "ORG"}]},
-                model="qwen-served",
+                model=f"qwen@{PINNED_QWEN_REVISION}",
                 system_fingerprint="fp-type",
                 usage={"prompt_tokens": 13, "completion_tokens": 4, "total_tokens": 17},
             ),
@@ -178,10 +199,12 @@ def test_callback_result_retains_independent_response_metadata_without_changing_
     assert type_result == {"types": [{"start": 0, "end": 2, "type": "ORG"}]}
     assert span_result.provider_metadata == {
         "stage": "ror_span_detection",
+        "status": "live",
         "provider": "vllm",
-        "model": "qwen-served",
+        "model": "qwen",
         "served_model": f"qwen@{PINNED_QWEN_REVISION}",
         "revision": PINNED_QWEN_REVISION,
+        "response_model": f"qwen@{PINNED_QWEN_REVISION}",
         "system_fingerprint": "fp-span",
         "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
     }

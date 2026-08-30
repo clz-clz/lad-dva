@@ -18,6 +18,7 @@ from langchain_openai import ChatOpenAI
 
 from utils import enforce_iob2_syntax, legalize_noise_aware, extract_json_list
 from metrics import _is_valid_transition
+from official_contract import OFFICIAL_DECODER_CONSTANTS
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ load_dotenv()
 # backbone-agnostic; only these two client constructors bind the backbone.
 # ---------------------------------------------------------------------------
 BACKBONE_MODEL    = os.environ.get("BACKBONE_MODEL", "deepseek-chat")
+BACKBONE_REQUEST_MODEL = os.environ.get("BACKBONE_SERVED_MODEL", BACKBONE_MODEL)
 BACKBONE_BASE_URL = os.environ.get("BACKBONE_BASE_URL", "https://api.deepseek.com")
 BACKBONE_API_KEY  = (os.environ.get("BACKBONE_API_KEY")
                      or os.environ.get("DEEPSEEK_API_KEY"))
@@ -36,7 +38,7 @@ BACKBONE_API_KEY  = (os.environ.get("BACKBONE_API_KEY")
 # run_multiseed.py, which builds those paths (see _pred_path there).
 
 llm = ChatOpenAI(
-    model=BACKBONE_MODEL,
+    model=BACKBONE_REQUEST_MODEL,
     temperature=0.7,
     base_url=BACKBONE_BASE_URL,
     api_key=BACKBONE_API_KEY,
@@ -44,7 +46,7 @@ llm = ChatOpenAI(
 
 # Dedicated higher-temperature LLM for Coder to encourage diverse paths
 coder_llm = ChatOpenAI(
-    model=BACKBONE_MODEL,
+    model=BACKBONE_REQUEST_MODEL,
     temperature=1.0,
     base_url=BACKBONE_BASE_URL,
     api_key=BACKBONE_API_KEY,
@@ -158,14 +160,16 @@ def _response_stage_record(response: Any, stage: str,
     usage = _plain_mapping(getattr(response, "usage_metadata", None))
     if not usage:
         usage = _plain_mapping(response_metadata.get("token_usage"))
+    response_model = (response_metadata.get("model_name")
+                      or response_metadata.get("model"))
     return {
         "stage": stage,
+        "status": "live",
         "provider": settings.get("provider"),
-        "model": (response_metadata.get("model_name")
-                  or response_metadata.get("model")
-                  or settings.get("model")),
+        "model": settings.get("model") or response_model,
         "served_model": settings.get("served_model"),
         "revision": settings.get("revision"),
+        "response_model": response_model,
         "system_fingerprint": response_metadata.get("system_fingerprint"),
         "usage": usage,
     }
@@ -177,14 +181,32 @@ def _callback_stage_record(result: Any, stage: str,
     if isinstance(callback_metadata, Mapping):
         record = dict(callback_metadata)
         record.setdefault("stage", stage)
+        record.setdefault("status", "live")
         record.setdefault("provider", None)
         record.setdefault("model", None)
         record.setdefault("served_model", None)
         record.setdefault("revision", None)
+        record.setdefault("response_model", None)
         record.setdefault("system_fingerprint", None)
         record["usage"] = _plain_mapping(record.get("usage"))
         return record
     return _response_stage_record(None, stage, provider_settings)
+
+
+def _stage_status_record(stage: str, status: str,
+                         provider_settings: Any = None) -> dict[str, Any]:
+    settings = _plain_mapping(provider_settings)
+    return {
+        "stage": stage,
+        "status": status,
+        "provider": settings.get("provider"),
+        "model": settings.get("model"),
+        "served_model": settings.get("served_model"),
+        "revision": settings.get("revision"),
+        "response_model": None,
+        "system_fingerprint": None,
+        "usage": {},
+    }
 
 
 def _with_stage_records(state: Mapping[str, Any], stage: str,
@@ -866,12 +888,26 @@ async def reviewer_node(state: State):
     if not candidate_paths:
         return {"rag_weights": []}
     if not use_lads:
-        return {"rag_weights": [1.0 / len(candidate_paths)] * len(candidate_paths)}
+        return {
+            "rag_weights": [1.0 / len(candidate_paths)] * len(candidate_paths),
+            "provider_metadata": _with_stage_records(state, "reviewer", [
+                _stage_status_record(
+                    "reviewer", "disabled", state.get("provider_settings")
+                )
+            ]),
+        }
 
     # Skip Reviewer when all Coder paths are identical (no diversity to judge)
     if _all_paths_identical(candidate_paths):
         print(f" [Reviewer] SKIPPED — all {len(candidate_paths)} paths identical")
-        return {"rag_weights": [1.0 / len(candidate_paths)] * len(candidate_paths)}
+        return {
+            "rag_weights": [1.0 / len(candidate_paths)] * len(candidate_paths),
+            "provider_metadata": _with_stage_records(state, "reviewer", [
+                _stage_status_record(
+                    "reviewer", "skipped_identical", state.get("provider_settings")
+                )
+            ]),
+        }
 
     # DEER retrieval: use label statistics to find similar training sentences
     deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=ds_name)
@@ -945,9 +981,9 @@ async def reviewer_node(state: State):
 
 def _weighted_majority_voting(candidate_paths: List[List[str]],
                               weights: List[float],
-                              entity_boost: float = 1.0,
+                              entity_boost: float = OFFICIAL_DECODER_CONSTANTS["voting_entity_boost"],
                               dirty_tags: List[str] = None,
-                              consensus_ratio: float = 0.6) -> List[str]:
+                              consensus_ratio: float = OFFICIAL_DECODER_CONSTANTS["voting_consensus_ratio"]) -> List[str]:
     """Weighted majority voting with entity boost and consensus threshold.
 
     If the winning tag has less than consensus_ratio of total weighted votes
@@ -1010,9 +1046,9 @@ def voting_node(state: State):
     raw_voted_tags = _weighted_majority_voting(
         candidate_paths,
         rag_weights,
-        entity_boost=lam,
+        entity_boost=(lam * OFFICIAL_DECODER_CONSTANTS["voting_entity_boost"]),
         dirty_tags=dirty_tags,
-        consensus_ratio=0.6,
+        consensus_ratio=OFFICIAL_DECODER_CONSTANTS["voting_consensus_ratio"],
     )
 
     return {"current_tags": raw_voted_tags}
@@ -1079,8 +1115,8 @@ def physical_wash_node(state: State):
 def _ror_recover(tokens: List[str], base: List[str],
                  candidate_paths: List[List[str]], weights: List[float],
                  omega: List[float], *, ungated: bool = False,
-                 omega_quantile: float = 0.6,
-                 conf_thresh: float = 0.6) -> dict:
+                 omega_quantile: float = OFFICIAL_DECODER_CONSTANTS["ror_omega_quantile"],
+                 conf_thresh: float = OFFICIAL_DECODER_CONSTANTS["ror_confidence_threshold"]) -> dict:
     """RoR recall gate: at O-positions that are statistically entity-bearing
     (high ω) yet low-confidence, propose the entity *type* most supported by
     the candidate pool. Proposals are handed to GASD (never applied raw), which
@@ -1214,12 +1250,17 @@ def ror_node(state: State):
             raise ValueError("official RoR candidate path has invalid length or ontology")
 
     base = _weighted_majority_voting(
-        candidate_paths, rag_weights, entity_boost=1.0,
-        dirty_tags=dirty_tags, consensus_ratio=0.6)
+        candidate_paths, rag_weights,
+        entity_boost=OFFICIAL_DECODER_CONSTANTS["voting_entity_boost"],
+        dirty_tags=dirty_tags,
+        consensus_ratio=OFFICIAL_DECODER_CONSTANTS["voting_consensus_ratio"])
 
     if not state.get("use_ror", True):
         return {"current_tags": base, "ror_proposals": {},
                 "ror_reasoning": {"source": "disabled", "spans": []},
+                "provider_metadata": _with_stage_records(state, "ror", [
+                    _stage_status_record("ror", "disabled", state.get("provider_settings"))
+                ]),
                 "fallback_used": fallback_used}
 
     use_lads = state.get("use_lads", True)
@@ -1231,6 +1272,11 @@ def ror_node(state: State):
             "current_tags": base,
             "ror_proposals": {},
             "ror_reasoning": {"source": "not_triggered", "spans": []},
+            "provider_metadata": _with_stage_records(state, "ror", [
+                _stage_status_record(
+                    "ror", "not_triggered", state.get("provider_settings")
+                )
+            ]),
             "fallback_used": fallback_used,
         }
 
@@ -1312,7 +1358,7 @@ def _gasd_viterbi_decode(candidate_paths: List[List[str]], weights: List[float],
                          proposals: dict, valid_types: List[str], *,
                          use_potentials: bool = True,
                          beta_omega: float = 0.5,
-                         gamma_prop: float = 1.0,
+                         gamma_prop: float = OFFICIAL_DECODER_CONSTANTS["gasd_gamma_proposal"],
                          reason_tag_scores: Optional[List[dict]] = None,
                          candidate_scale: float = 1.0) -> List[str]:
     """GASD-G: global IOB2-constrained inference (Viterbi) over the candidate
@@ -1445,6 +1491,11 @@ def gasd_node(state: State):
             return {"current_tags": fallback,
                     "gasd_variant_requested": variant,
                     "gasd_variant_used": "disabled",
+                    "provider_metadata": _with_stage_records(state, "gasd", [
+                        _stage_status_record(
+                            "gasd", "disabled", state.get("provider_settings")
+                        )
+                    ]),
                     "fallback_used": fallback_used}
         if len(weights) != len(candidate_paths):
             if official:
@@ -1504,7 +1555,11 @@ def gasd_node(state: State):
             use_potentials=(state.get("gasd_potentials", True) and use_lads),
             beta_omega=GASD_BETA_OMEGA,
             reason_tag_scores=reason_scores,
-            candidate_scale=0.0 if variant == "r" and reason_scores is not None else 1.0)
+            candidate_scale=(
+                OFFICIAL_DECODER_CONSTANTS["gasd_candidate_scale_r"]
+                if variant == "r" and reason_scores is not None
+                else OFFICIAL_DECODER_CONSTANTS["gasd_candidate_scale_g"]
+            ))
         if len(decoded) != len(tokens):
             if official:
                 raise ValueError("official GASD decoder returned the wrong sequence length")
@@ -1516,6 +1571,10 @@ def gasd_node(state: State):
         if official and (any(tag not in valid_tags for tag in decoded)
                          or not _is_legal_tag_sequence(decoded)):
             raise ValueError("official GASD decoder violated hard IOB2 legality")
+        if not gasd_records and variant == "g":
+            gasd_records.append(_stage_status_record(
+                "gasd", "local", state.get("provider_settings")
+            ))
         return {"current_tags": decoded,
                 "gasd_variant_requested": variant,
                 "gasd_variant_used": variant_used,
@@ -1593,7 +1652,7 @@ def _spans_str(tokens: List[str], tags: List[str]) -> str:
 # (~0.001-0.03), so β scales it against candidate fidelity (which lives in
 # [0,1]). F1 sits on a flat plateau for β in [1,3] and collapses by β=10; the
 # value was selected on seed 13 alone and validated on the held-out seeds.
-GASD_BETA_OMEGA = 2.0
+GASD_BETA_OMEGA = OFFICIAL_DECODER_CONSTANTS["gasd_beta_omega"]
 
 
 def _base_decode(candidate_paths: List[List[str]], weights: List[float],

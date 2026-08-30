@@ -35,8 +35,10 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
+
+from official_contract import official_manifest_decoder_constants
 
 # Silence telemetry noise from chroma / langchain
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -56,7 +58,7 @@ NOISE_TYPES = ["BT", "IF", "ATF"]
 SEEDS       = [13, 42, 2024]
 SAMPLE_SIZE = None  # None = full dataset
 MAX_CONCURRENCY = 200     # high throughput for LLM API calls
-PER_REQUEST_TIMEOUT = 180  # seconds per sentence; straggler → dirty fallback
+PER_REQUEST_TIMEOUT = 180  # legacy outer deadline; failure policy controls the outcome
 OFFICIAL_REQUEST_TIMEOUT = 600.0
 OFFICIAL_SAMPLE_SIZE = 200
 OFFICIAL_NOISE_RATIO = 0.15
@@ -225,18 +227,11 @@ def _official_settings_from_env(config_names: list[str], environment: Mapping[st
     tag = str(environment["BACKBONE_TAG"]).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
         raise ValueError("BACKBONE_TAG must contain only letters, numbers, dot, underscore, or hyphen")
-    for config_name in config_names:
-        config = CONFIGURATIONS.get(config_name)
-        if config is None or config.get("terminal_graph") != "lad-rg":
-            raise ValueError(f"official mode requires LAD-RG config, got {config_name!r}")
     model = str(environment["BACKBONE_MODEL"]).strip()
     revision = str(environment.get("BACKBONE_REVISION", "")).strip() or None
     if provider == "deepseek":
         if model != "deepseek-v4-flash":
             raise ValueError("DeepSeek official runs require BACKBONE_MODEL=deepseek-v4-flash")
-        if any(str(CONFIGURATIONS[name].get("gasd_variant", "g")).lower() in {"r", "both"}
-               for name in config_names):
-            raise ValueError("DeepSeek official runs reject GASD-R/Both; use vllm/Qwen")
     elif provider == "vllm":
         if model != OFFICIAL_QWEN_MODEL:
             raise ValueError(f"vLLM official runs require BACKBONE_MODEL={OFFICIAL_QWEN_MODEL}")
@@ -251,18 +246,39 @@ def _official_settings_from_env(config_names: list[str], environment: Mapping[st
         revision=revision,
     )
     _endpoint_origin(settings.base_url)
+    _validate_official_settings_for_configs(settings, config_names)
     return settings, tag
+
+
+def _validate_official_settings_for_configs(settings, config_names: Sequence[str]) -> None:
+    for config_name in config_names:
+        config = CONFIGURATIONS.get(config_name)
+        if config is None or config.get("terminal_graph") != "lad-rg":
+            raise ValueError(f"official mode requires LAD-RG config, got {config_name!r}")
+    if settings.provider == "vllm" and settings.model != OFFICIAL_QWEN_MODEL:
+        raise ValueError(f"vLLM official runs require BACKBONE_MODEL={OFFICIAL_QWEN_MODEL}")
+    if settings.provider == "deepseek" and any(
+        str(CONFIGURATIONS[name].get("gasd_variant", "g")).lower() in {"r", "both"}
+        for name in config_names
+    ):
+        raise ValueError("DeepSeek official runs reject GASD-R/Both; use vllm/Qwen")
+
+
+def _configure_official_request_model(settings) -> str:
+    """Bind Coder/Reviewer imports to the same immutable served identity."""
+    os.environ["BACKBONE_SERVED_MODEL"] = settings.served_model
+    return settings.served_model
 
 
 def _build_official_manifest(settings, tag: str, git_sha: str,
                              request_timeout: float) -> dict[str, Any]:
-    from live_backbone import OpenAICompatibleLADRGAdapter
     return {
         "schema_version": OFFICIAL_MANIFEST_SCHEMA,
         "git_sha": git_sha,
         "backbone": {
             "provider": settings.provider,
             "model": settings.model,
+            "served_model": settings.served_model,
             "revision": settings.revision,
             "immutable_revision": settings.revision or settings.model,
             "endpoint_origin": _endpoint_origin(settings.base_url),
@@ -277,12 +293,7 @@ def _build_official_manifest(settings, tag: str, git_sha: str,
             "noise_types": list(NOISE_TYPES),
         },
         "dependencies": _dependency_versions(),
-        "decoder_constants": {
-            "provider_timeout_seconds": 120.0,
-            "sdk_max_retries": 2,
-            "gasd_reason_bonus": OpenAICompatibleLADRGAdapter.REASON_BONUS,
-            "runner_request_timeout_seconds": float(request_timeout),
-        },
+        "decoder_constants": official_manifest_decoder_constants(request_timeout),
     }
 
 
@@ -327,8 +338,11 @@ def _is_legal_iob2(tags: list[str]) -> bool:
     return True
 
 
-def _validate_official_prediction(path: Path, dataset: str, config_name: str,
-                                  expected_count: int = OFFICIAL_SAMPLE_SIZE) -> None:
+def _validate_official_prediction(
+    path: Path, dataset: str, config_name: str,
+    expected_count: int = OFFICIAL_SAMPLE_SIZE,
+    provider_identity: Optional[Mapping[str, Any]] = None,
+) -> None:
     rows = _load_noisy(path)
     if len(rows) != expected_count:
         raise RuntimeError(f"official prediction has {len(rows)} records, expected {expected_count}: {path.name}")
@@ -349,6 +363,104 @@ def _validate_official_prediction(path: Path, dataset: str, config_name: str,
                 or row.get("fallback_used") is not False
                 or not isinstance(row.get("provider_metadata"), dict)):
             raise RuntimeError(f"official prediction row {index} lacks compatible launch evidence: {path.name}")
+        if provider_identity is not None:
+            _validate_official_provider_evidence(
+                config, row["provider_metadata"], provider_identity,
+                row["ror_reasoning_source"],
+            )
+
+
+def _validate_official_provider_evidence(
+    config: Mapping[str, Any], evidence: Any, identity: Mapping[str, Any],
+    ror_source: str,
+) -> None:
+    """Require justified stage statuses and immutable provider identity."""
+    if not isinstance(evidence, Mapping):
+        raise RuntimeError("official provider evidence must be stage-separated")
+    if set(evidence) != {"coder", "reviewer", "ror", "gasd"}:
+        raise RuntimeError("official provider evidence must contain exactly four stages")
+    expected_identity = {
+        key: identity.get(key) for key in ("provider", "model", "served_model", "revision")
+    }
+
+    provider = expected_identity["provider"]
+    model = expected_identity["model"]
+    served_model = expected_identity["served_model"]
+    revision = expected_identity["revision"]
+    if provider == "vllm":
+        if (model != OFFICIAL_QWEN_MODEL
+                or not isinstance(revision, str)
+                or not re.fullmatch(r"[0-9a-fA-F]{40}", revision)
+                or served_model != f"{model}@{revision}"):
+            raise RuntimeError("official provider identity is not immutable vLLM/Qwen")
+    elif provider == "deepseek":
+        if model != "deepseek-v4-flash" or served_model != model:
+            raise RuntimeError("official provider identity is not exact DeepSeek")
+    else:
+        raise RuntimeError("official provider identity has an invalid provider")
+
+    def records(stage: str, allowed_stages: set[str]) -> list[Mapping[str, Any]]:
+        value = evidence.get(stage)
+        if (not isinstance(value, list) or not value
+                or not all(isinstance(record, Mapping) for record in value)):
+            raise RuntimeError(f"official provider evidence is missing stage {stage}")
+        for record in value:
+            if record.get("stage") not in allowed_stages:
+                raise RuntimeError(f"official provider evidence has an invalid stage for {stage}")
+            if any(record.get(key) != expected for key, expected in expected_identity.items()):
+                raise RuntimeError(f"official provider evidence identity mismatch for {stage}")
+            status = record.get("status")
+            if status == "live":
+                if record.get("response_model") != expected_identity["served_model"]:
+                    raise RuntimeError(
+                        f"official provider response identity mismatch for {stage}"
+                    )
+            elif record.get("response_model") is not None:
+                raise RuntimeError(f"non-live official evidence cannot claim a response for {stage}")
+        return value
+
+    coder_stages = {f"coder_path_{index}" for index in range(1, 6)}
+    coder = records("coder", coder_stages)
+    if ({record.get("stage") for record in coder} != coder_stages
+            or len(coder) != len(coder_stages)
+            or any(record.get("status") != "live" for record in coder)):
+        raise RuntimeError("official Coder provider evidence must be live")
+
+    reviewer = records("reviewer", {"reviewer"})
+    reviewer_allowed = {"live", "skipped_identical"}
+    if not config.get("use_lads", True):
+        reviewer_allowed.add("disabled")
+    if (len(reviewer) != 1
+            or any(record.get("status") not in reviewer_allowed for record in reviewer)):
+        raise RuntimeError("official Reviewer provider evidence status is unjustified")
+
+    ror = records("ror", {"ror", "ror_span_detection", "ror_type_assignment"})
+    expected_ror_status = (
+        "disabled" if not config.get("use_ror", True) else ror_source
+    )
+    if expected_ror_status == "live":
+        ror_stages = [record.get("stage") for record in ror]
+        if (any(record.get("status") != "live" for record in ror)
+                or ror_stages not in (["ror_span_detection"],
+                                      ["ror_span_detection", "ror_type_assignment"])):
+            raise RuntimeError("official RoR live claim lacks matching provider evidence")
+    elif (len(ror) != 1 or ror[0].get("stage") != "ror"
+          or ror[0].get("status") != expected_ror_status):
+        raise RuntimeError("official RoR skipped status is inconsistent with configuration")
+
+    gasd = records("gasd", {"gasd", "gasd_r"})
+    variant = str(config.get("gasd_variant", "g")).lower()
+    expected_gasd_status = (
+        "disabled" if not config.get("use_gasd", True)
+        else ("live" if variant in {"r", "both"} else "local")
+    )
+    if expected_gasd_status == "live":
+        if (len(gasd) != 1 or gasd[0].get("status") != "live"
+                or gasd[0].get("stage") != "gasd_r"):
+            raise RuntimeError("official GASD-R live claim lacks matching provider evidence")
+    elif (len(gasd) != 1 or gasd[0].get("stage") != "gasd"
+          or gasd[0].get("status") != expected_gasd_status):
+        raise RuntimeError("official GASD status is inconsistent with configuration")
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +659,30 @@ async def _run_one_cell(config_name: str, config: dict,
                         failure_policy: str = "abort",
                         request_timeout: float = PER_REQUEST_TIMEOUT,
                         adapter_factory: Optional[Callable[[], Any]] = None):
+    """Run one cell and clean only its exact temporary output on abort."""
+    pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
+    tmp_p = pred_p.with_suffix(pred_p.suffix + ".tmp")
+    try:
+        return await _run_one_cell_impl(
+            config_name, config, dataset, noise, seed, size, pipelines,
+            max_concurrency=max_concurrency, dummy=dummy, ratio=ratio,
+            official=official, failure_policy=failure_policy,
+            request_timeout=request_timeout, adapter_factory=adapter_factory,
+        )
+    except Exception:
+        if failure_policy == "abort":
+            tmp_p.unlink(missing_ok=True)
+        raise
+
+
+async def _run_one_cell_impl(config_name: str, config: dict,
+                             dataset: str, noise: str, seed: int,
+                             size: int, pipelines,
+                             *, max_concurrency: int, dummy: bool,
+                             ratio: float = 0.15, official: bool = False,
+                             failure_policy: str = "abort",
+                             request_timeout: float = PER_REQUEST_TIMEOUT,
+                             adapter_factory: Optional[Callable[[], Any]] = None):
     if config.get("offline_only"):
         raise RuntimeError(
             f"Config '{config_name}' is offline-only; derive it with "
@@ -569,9 +705,7 @@ async def _run_one_cell(config_name: str, config: dict,
     pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
     tmp_p = pred_p.with_suffix(pred_p.suffix + ".tmp")
     pred_p.parent.mkdir(parents=True, exist_ok=True)
-    if pred_p.exists() and pred_p.stat().st_size > 0:
-        if official:
-            _validate_official_prediction(pred_p, dataset, config_name)
+    if not official and pred_p.exists() and pred_p.stat().st_size > 0:
         logging.info(f"[skip] {pred_p.name}")
         return
 
@@ -584,6 +718,11 @@ async def _run_one_cell(config_name: str, config: dict,
         return
 
     rows = _load_noisy(noisy_p)
+    if official and len(rows) != OFFICIAL_SAMPLE_SIZE:
+        raise RuntimeError(
+            f"official noisy cell must contain exactly {OFFICIAL_SAMPLE_SIZE} records; "
+            f"found {len(rows)} in {noisy_p.name}"
+        )
     logging.info(f"[run]  {pred_p.name}  ({len(rows)} sentences)")
     t0 = time.time()
 
@@ -591,11 +730,21 @@ async def _run_one_cell(config_name: str, config: dict,
     # Buffer results IN INPUT ORDER so prediction files line up across methods.
     buffer: List[Optional[dict]] = [None] * len(rows)
     adapter = None
+    provider_identity: Mapping[str, Any] = {}
     if official:
         if adapter_factory is None:
             from live_backbone import OpenAICompatibleLADRGAdapter
             adapter_factory = OpenAICompatibleLADRGAdapter
         adapter = adapter_factory()
+        provider_identity = adapter.provider_metadata()
+        if pred_p.exists() and pred_p.stat().st_size > 0:
+            _validate_official_prediction(
+                pred_p, dataset, config_name,
+                expected_count=OFFICIAL_SAMPLE_SIZE,
+                provider_identity=provider_identity,
+            )
+            logging.info(f"[skip] {pred_p.name}")
+            return
 
     async def _process(i, row):
         async with sem:
@@ -613,7 +762,7 @@ async def _run_one_cell(config_name: str, config: dict,
                     "official": True,
                     "ror_reasoner": adapter.ror_reasoner,
                     "gasd_reason_decoder": adapter.gasd_reason_decoder,
-                    "provider_metadata": adapter.provider_metadata(),
+                    "provider_metadata": dict(provider_identity),
                 })
             # Log the Coder candidate pool for the main methods only (oracle /
             # selection analysis); keeps ablation prediction files lean.
@@ -666,6 +815,10 @@ async def _run_one_cell(config_name: str, config: dict,
             if official:
                 expected_variant = str(config.get("gasd_variant", "g")).lower()
                 expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
+                _validate_official_provider_evidence(
+                    config, extra.get("provider_metadata"), provider_identity,
+                    str(extra.get("ror_reasoning_source")),
+                )
                 if (
                     not isinstance(pred, list)
                     or len(pred) != len(gold)
@@ -692,15 +845,26 @@ async def _run_one_cell(config_name: str, config: dict,
 
     rate_tag = f"r{int(round(ratio*100))}"
     try:
-        try:
-            from tqdm.asyncio import tqdm as async_tqdm
-            await async_tqdm.gather(
-                *(_process(i, r) for i, r in enumerate(rows)),
-                desc=f"{dataset}/{noise}/seed{seed}/{config_name}/{rate_tag}",
-                leave=False,
+        if official:
+            outcomes = await asyncio.gather(
+                *(_process(i, row) for i, row in enumerate(rows)),
+                return_exceptions=True,
             )
-        except ImportError:
-            await asyncio.gather(*(_process(i, r) for i, r in enumerate(rows)))
+            first_error = next(
+                (outcome for outcome in outcomes if isinstance(outcome, BaseException)), None
+            )
+            if first_error is not None:
+                raise first_error
+        else:
+            try:
+                from tqdm.asyncio import tqdm as async_tqdm
+                await async_tqdm.gather(
+                    *(_process(i, r) for i, r in enumerate(rows)),
+                    desc=f"{dataset}/{noise}/seed{seed}/{config_name}/{rate_tag}",
+                    leave=False,
+                )
+            except ImportError:
+                await asyncio.gather(*(_process(i, r) for i, r in enumerate(rows)))
 
         # Write to disk in input order, atomically (via temp file + rename)
         with tmp_p.open("w", encoding="utf-8") as f_out:
@@ -711,7 +875,10 @@ async def _run_one_cell(config_name: str, config: dict,
                     continue
                 f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
         if official:
-            _validate_official_prediction(tmp_p, dataset, config_name, expected_count=len(rows))
+            _validate_official_prediction(
+                tmp_p, dataset, config_name, expected_count=OFFICIAL_SAMPLE_SIZE,
+                provider_identity=provider_identity,
+            )
         tmp_p.replace(pred_p)
     except Exception:
         if failure_policy == "abort":
@@ -770,6 +937,7 @@ def main(argv=None):
         if len(args.ratios) != 1 or abs(args.ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
             raise ValueError("official mode requires exactly --ratios 0.15")
         official_settings, BACKBONE_TAG = _official_settings_from_env(args.configs, os.environ)
+        _configure_official_request_model(official_settings)
         git_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"], check=True, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,

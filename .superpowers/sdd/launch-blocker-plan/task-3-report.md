@@ -106,3 +106,31 @@ Required commit subject: `feat: add official LAD-RG launch preflight`.
 - Multi-agent reviewer tools were unavailable in this session, so the requesting-code-review skill could not dispatch an independent reviewer; a manual requirement/diff audit was performed instead.
 - Real DEER/Hugging Face initialization, provider credentials, `/v1/models`, GPU, and predictions were intentionally not exercised. Those checks remain launch-time responsibilities of static/live preflight.
 - The full repository pytest suite was not run because the user requested focused mocked/no-network verification; 84 related offline tests were run.
+
+## Review fix round 1
+
+### RED evidence
+
+- Required focused suite: `1 failed, 93 passed in 14.99s`; the Qwen live-preflight length blocker reported only a generic one-tag-per-token error instead of the exact expected count.
+- Added contract regressions: `4 failed, 1 passed in 0.47s`, exposing resume input-count bypass, shallow persisted-stage validation, missing served-model manifest identity, and direct live-preflight acceptance of a non-official vLLM model.
+- Selected-tag namespace regression: `1 failed in 1.56s`, proving a longer unrelated backbone tag was incorrectly treated as the selected launch tag.
+
+### GREEN evidence
+
+- Exact Qwen GASD-R length diagnostic: `1 passed in 0.02s`.
+- New resume/evidence/identity/artifact regressions: `7 passed in 1.31s`.
+- Noisy-load lifecycle cleanup: `1 passed in 0.04s`.
+- Final required focused suite: `99 passed in 13.95s`.
+- Required `py_compile`: exit 0, no output.
+- `git diff --check`: exit 0; only existing LF-to-CRLF warnings.
+- Repository-wide diagnostic with `-x`: `1 failed, 43 passed, 4 warnings in 13.72s`; the sole failure is the intentionally untouched frozen contextual-lattice source-hash inventory in `test_contextual_lattice_runtime.py` after `multi_agent_v2.py` changed. Frozen hash updates remain out of Task 3 scope.
+
+### Files changed
+
+- `official_contract.py`: centralized serialized output-affecting LAD-RG decoder constants and contract/hard-constraint versions.
+- `live_backbone.py`: immutable served-model requests/responses, exact evidence fields, centralized reason bonus, and exact GASD-R length diagnostics.
+- `multi_agent_v2.py`: immutable Coder/Reviewer request identity, explicit stage status records, and centralized voting/RoR/GASD constants.
+- `run_multiseed.py`: exact-200 resume/input/output gates, full-lifecycle exact-temp cleanup, strict stage/identity evidence validation, served identity in manifests, selected-config validation, and corrected failure-policy semantics.
+- `official_preflight.py`: selected-config live validation, exact `/v1/models` and adapter/response evidence checks, and canonical selected-tag artifact coordinates without colliding with unrelated tags.
+- `test_backbone_evidence.py`, `test_lad_rg_graph.py`, `test_live_backbone.py`, `test_official_preflight.py`, `test_run_multiseed_official.py`: offline regressions for all eight findings.
+- `.superpowers/sdd/launch-blocker-plan/task-3-report.md`: this review-fix evidence.

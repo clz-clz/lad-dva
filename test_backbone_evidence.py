@@ -19,7 +19,7 @@ def test_backbone_env_configures_both_clients():
     real_chat_openai = langchain_openai.ChatOpenAI
     saved_env = {
         key: os.environ.get(key)
-        for key in ("BACKBONE_MODEL", "BACKBONE_BASE_URL", "BACKBONE_API_KEY")
+        for key in ("BACKBONE_MODEL", "BACKBONE_SERVED_MODEL", "BACKBONE_BASE_URL", "BACKBONE_API_KEY")
     }
     init_calls: list[dict] = []
 
@@ -29,6 +29,7 @@ def test_backbone_env_configures_both_clients():
 
     try:
         os.environ["BACKBONE_MODEL"] = "meta-llama/test"
+        os.environ["BACKBONE_SERVED_MODEL"] = "meta-llama/test@immutable"
         os.environ["BACKBONE_BASE_URL"] = "http://localhost:8000/v1"
         os.environ["BACKBONE_API_KEY"] = "offline-key"
         langchain_openai.ChatOpenAI = FakeChatOpenAI
@@ -44,13 +45,13 @@ def test_backbone_env_configures_both_clients():
 
     assert init_calls == [
         {
-            "model": "meta-llama/test",
+            "model": "meta-llama/test@immutable",
             "temperature": 0.7,
             "base_url": "http://localhost:8000/v1",
             "api_key": "offline-key",
         },
         {
-            "model": "meta-llama/test",
+            "model": "meta-llama/test@immutable",
             "temperature": 1.0,
             "base_url": "http://localhost:8000/v1",
             "api_key": "offline-key",
