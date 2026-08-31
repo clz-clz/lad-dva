@@ -25,6 +25,12 @@ D:/py/Anaconda3/python.exe -m py_compile run_multiseed.py multi_agent_v2.py live
 Normal pytest is offline. The one live integration test is skipped unless
 `RUN_LAD_RG_LIVE_TESTS=1` is explicitly set.
 
+Static preflight launches DEER checks in Hugging Face cache-only mode with hub,
+datasets, and Transformers networking disabled and provider credentials
+removed. A missing cache is a blocker; materialize and approve all five dataset
+caches before the launch-gate sequence rather than allowing preflight to
+download them.
+
 ## 2. DeepSeek-V4-Flash gate
 
 Set every identity value explicitly. Use a fresh `BACKBONE_TAG` for a new
@@ -141,6 +147,9 @@ Official output is resumable only when
 current Git SHA, provider identity, endpoint origin, dependencies, N=200
 protocol, and decoder constants. A mismatch is a hard stop, not a reason to
 edit the manifest or reuse stale predictions.
+Official Coder, Reviewer, RoR, and GASD-R provider clients are all pinned to
+the manifest's 120-second provider timeout and at most two SDK retries; the
+runner's outer per-sentence deadline remains 600 seconds.
 
 ## 4. B4 raw-logit probe
 

@@ -26,6 +26,8 @@ def test_launch_guide_covers_every_authorized_gate_and_command():
     ):
         assert command in guide
     assert "DeepSeek" in guide and "GASD-R/Both" in guide and "Qwen-only" in guide
+    assert "cache-only" in guide
+    assert "missing cache" in guide.lower()
     assert not re.search(r"--official[^\n]*--size\s+20\b", guide)
 
 

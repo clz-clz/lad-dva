@@ -18,7 +18,11 @@ from langchain_openai import ChatOpenAI
 
 from utils import enforce_iob2_syntax, legalize_noise_aware, extract_json_list
 from metrics import _is_valid_transition
-from official_contract import OFFICIAL_DECODER_CONSTANTS
+from official_contract import (
+    OFFICIAL_DECODER_CONSTANTS,
+    OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
+    OFFICIAL_SDK_MAX_RETRIES,
+)
 
 load_dotenv()
 
@@ -37,11 +41,26 @@ BACKBONE_API_KEY  = (os.environ.get("BACKBONE_API_KEY")
 # $BACKBONE_TAG namespaces prediction filenames per backbone; it is owned by
 # run_multiseed.py, which builds those paths (see _pred_path there).
 
+def _provider_client_options(environment: Optional[Mapping[str, str]] = None) -> dict:
+    """Pin SDK controls only for the official runner's pre-import handshake."""
+    source = os.environ if environment is None else environment
+    if str(source.get("LAD_RG_OFFICIAL_REQUESTS", "")).strip() != "1":
+        return {}
+    return {
+        "timeout": OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
+        "max_retries": OFFICIAL_SDK_MAX_RETRIES,
+    }
+
+
+_PROVIDER_CLIENT_OPTIONS = _provider_client_options()
+
+
 llm = ChatOpenAI(
     model=BACKBONE_REQUEST_MODEL,
     temperature=0.7,
     base_url=BACKBONE_BASE_URL,
     api_key=BACKBONE_API_KEY,
+    **_PROVIDER_CLIENT_OPTIONS,
 )
 
 # Dedicated higher-temperature LLM for Coder to encourage diverse paths
@@ -50,6 +69,7 @@ coder_llm = ChatOpenAI(
     temperature=1.0,
     base_url=BACKBONE_BASE_URL,
     api_key=BACKBONE_API_KEY,
+    **_PROVIDER_CLIENT_OPTIONS,
 )
 
 DEEPSEEK_NER_TOKEN_IDS = {

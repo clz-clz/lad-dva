@@ -1,6 +1,9 @@
 import asyncio
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -354,6 +357,48 @@ def test_official_request_model_configuration_uses_immutable_served_name(monkeyp
 
     assert run_multiseed._configure_official_request_model(settings) == settings.served_model
     assert run_multiseed.os.environ["BACKBONE_SERVED_MODEL"] == settings.served_model
+    assert run_multiseed.os.environ["LAD_RG_OFFICIAL_REQUESTS"] == "1"
+
+
+def test_official_coder_and_reviewer_clients_use_manifest_sdk_controls():
+    environment = dict(os.environ)
+    environment.update({
+        "LAD_RG_OFFICIAL_REQUESTS": "1",
+        "BACKBONE_MODEL": "deepseek-v4-flash",
+        "BACKBONE_SERVED_MODEL": "deepseek-v4-flash",
+        "BACKBONE_BASE_URL": "http://127.0.0.1:9/v1",
+        "BACKBONE_API_KEY": "offline-key",
+    })
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, multi_agent_v2 as m; "
+                "print(json.dumps({"
+                "'reviewer_timeout': m.llm.request_timeout, "
+                "'reviewer_retries': m.llm.max_retries, "
+                "'coder_timeout': m.coder_llm.request_timeout, "
+                "'coder_retries': m.coder_llm.max_retries}))"
+            ),
+        ],
+        cwd=Path(__file__).parent,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30.0,
+        check=True,
+    )
+    controls = json.loads(completed.stdout.strip())
+
+    assert controls == {
+        "reviewer_timeout": 120.0,
+        "reviewer_retries": 2,
+        "coder_timeout": 120.0,
+        "coder_retries": 2,
+    }
+    assert multi_agent_v2._provider_client_options({}) == {}
 
 
 def test_official_environment_is_explicit_and_rejects_deepseek_gasd_r():

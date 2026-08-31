@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 
+OFFICIAL_PROVIDER_TIMEOUT_SECONDS = 120.0
+OFFICIAL_SDK_MAX_RETRIES = 2
+
+
 OFFICIAL_DECODER_CONSTANTS: dict[str, Any] = {
     "contract_version": "lad-rg-official-decoder-v1",
     "hard_constraint": "strict-iob2-v1",
@@ -24,8 +28,8 @@ def official_manifest_decoder_constants(request_timeout: float) -> dict[str, Any
     return {
         "contract_version": OFFICIAL_DECODER_CONSTANTS["contract_version"],
         "hard_constraint": OFFICIAL_DECODER_CONSTANTS["hard_constraint"],
-        "provider_timeout_seconds": 120.0,
-        "sdk_max_retries": 2,
+        "provider_timeout_seconds": OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
+        "sdk_max_retries": OFFICIAL_SDK_MAX_RETRIES,
         "runner_request_timeout_seconds": float(request_timeout),
         **{
             key: value for key, value in OFFICIAL_DECODER_CONSTANTS.items()

@@ -13,7 +13,11 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
-from official_contract import OFFICIAL_DECODER_CONSTANTS
+from official_contract import (
+    OFFICIAL_DECODER_CONSTANTS,
+    OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
+    OFFICIAL_SDK_MAX_RETRIES,
+)
 
 
 class LiveBackboneError(RuntimeError):
@@ -37,8 +41,8 @@ class LiveBackboneSettings:
     base_url: str
     api_key: Optional[str]
     revision: Optional[str] = None
-    timeout_seconds: float = 120.0
-    max_retries: int = 2
+    timeout_seconds: float = OFFICIAL_PROVIDER_TIMEOUT_SECONDS
+    max_retries: int = OFFICIAL_SDK_MAX_RETRIES
 
     def __post_init__(self) -> None:
         provider = self.provider.lower()
@@ -55,9 +59,9 @@ class LiveBackboneSettings:
             or not re.fullmatch(r"[0-9a-fA-F]{40}", self.revision)
         ):
             raise ValueError("vLLM/Qwen requires an immutable 40-hex BACKBONE_REVISION")
-        if self.timeout_seconds != 120.0:
+        if self.timeout_seconds != OFFICIAL_PROVIDER_TIMEOUT_SECONDS:
             raise ValueError("live LAD-RG provider timeout must be 120 seconds")
-        if not 0 <= self.max_retries <= 2:
+        if not 0 <= self.max_retries <= OFFICIAL_SDK_MAX_RETRIES:
             raise ValueError("live LAD-RG SDK retries must be between 0 and 2")
         object.__setattr__(self, "provider", provider)
 

@@ -54,6 +54,60 @@ def _noisy_fixture(root: Path):
                 path.write_text("".join(json.dumps(row) + "\n" for _ in range(200)), encoding="utf-8")
 
 
+def test_deer_check_is_cache_only_and_has_no_provider_credentials(
+    tmp_path, monkeypatch
+):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        return subprocess.CompletedProcess(command, 0, stdout='{"ok": true}\n', stderr="")
+
+    monkeypatch.setenv("BACKBONE_API_KEY", "must-not-reach-child")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "must-not-reach-child")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-child")
+    monkeypatch.setattr(official_preflight.subprocess, "run", fake_run)
+
+    result = official_preflight._one_deer_check(tmp_path, "msra", 3.0)
+
+    assert result == {"ok": True}
+    child_env = captured["environment"]
+    assert child_env["HF_DATASETS_OFFLINE"] == "1"
+    assert child_env["HF_HUB_OFFLINE"] == "1"
+    assert child_env["TRANSFORMERS_OFFLINE"] == "1"
+    assert child_env["HF_HUB_DISABLE_TELEMETRY"] == "1"
+    assert child_env["BACKBONE_API_KEY"] == "offline-deer-preflight"
+    assert child_env["BACKBONE_MODEL"] == "offline-deer-preflight"
+    assert child_env["BACKBONE_BASE_URL"] == "http://127.0.0.1:9/v1"
+    for secret_name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        assert secret_name not in child_env
+
+
+def test_deer_check_fails_closed_on_timeout(tmp_path, monkeypatch):
+    def time_out(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(official_preflight.subprocess, "run", time_out)
+
+    assert official_preflight._one_deer_check(tmp_path, "fewnerd", 2.5) == {
+        "ok": False, "error": "timed out after 2.5 seconds",
+    }
+
+
+def test_deer_check_fails_closed_when_offline_cache_is_missing(tmp_path, monkeypatch):
+    def cache_miss(command, **kwargs):
+        return subprocess.CompletedProcess(
+            command, 1, stdout="", stderr="offline cache entry not found"
+        )
+
+    monkeypatch.setattr(official_preflight.subprocess, "run", cache_miss)
+
+    assert official_preflight._one_deer_check(tmp_path, "wnut17", 3.0) == {
+        "ok": False, "error": "offline cache entry not found",
+    }
+
+
 def test_static_preflight_accepts_complete_fixture_and_writes_no_predictions(tmp_path):
     repo, sha = _repo(tmp_path)
     noisy = tmp_path / "noisy"

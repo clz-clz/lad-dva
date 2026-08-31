@@ -118,11 +118,33 @@ def _one_deer_check(repo_root: Path, dataset: str, timeout: float) -> dict[str, 
         f"assert {dataset!r} in m._deer_stats and {dataset!r} in m._deer_retriever; "
         "print(json.dumps({'ok': True}))"
     )
+    child_environment = dict(os.environ)
+    for secret_name in (
+        "BACKBONE_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        child_environment.pop(secret_name, None)
+    child_environment.pop("LAD_RG_OFFICIAL_REQUESTS", None)
+    child_environment.pop("BACKBONE_SERVED_MODEL", None)
+    child_environment.update({
+        # multi_agent_v2 constructs LangChain clients at import time. Give
+        # those inert clients a non-secret loopback identity so import can
+        # succeed without exposing credentials or a reachable provider.
+        "BACKBONE_API_KEY": "offline-deer-preflight",
+        "BACKBONE_MODEL": "offline-deer-preflight",
+        "BACKBONE_BASE_URL": "http://127.0.0.1:9/v1",
+        "HF_DATASETS_OFFLINE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "HF_DATASETS_DISABLE_PROGRESS_BARS": "1",
+        "PYTHON_DOTENV_DISABLED": "1",
+    })
     try:
         completed = subprocess.run(
             [sys.executable, "-c", code], cwd=repo_root, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
-            env={**os.environ, "HF_HUB_DISABLE_TELEMETRY": "1"},
+            env=child_environment,
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": f"timed out after {timeout:g} seconds"}
@@ -231,7 +253,7 @@ def run_static_preflight(
     deer_checker: Callable[[Sequence[str], float], Mapping[str, Mapping[str, Any]]] | None = None,
     request_timeout: float = 600.0, config_names: Sequence[str] = ("lad_rg_full",),
 ) -> dict[str, Any]:
-    """Run all read-only static checks and return a JSON-serializable report."""
+    """Run cache-only static checks without creating prediction artifacts."""
     repo_root, noisy_dir, pred_dir = map(Path, (repo_root, noisy_dir, pred_dir))
     blockers: list[dict[str, Any]] = []
     checks: dict[str, Any] = {}

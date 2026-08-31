@@ -266,8 +266,9 @@ def _validate_official_settings_for_configs(settings, config_names: Sequence[str
 
 
 def _configure_official_request_model(settings) -> str:
-    """Bind Coder/Reviewer imports to the same immutable served identity."""
+    """Bind Coder/Reviewer imports to the official identity and SDK controls."""
     os.environ["BACKBONE_SERVED_MODEL"] = settings.served_model
+    os.environ["LAD_RG_OFFICIAL_REQUESTS"] = "1"
     return settings.served_model
 
 
