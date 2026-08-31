@@ -1,5 +1,8 @@
 """Offline unit tests for SelectDenoise Levers 1 & 2 (mock LLMs, no API)."""
-import asyncio, types
+import asyncio
+
+import pytest
+
 import multi_agent_v2 as M
 
 
@@ -18,6 +21,48 @@ def _patch_llm(obj_name, fn):
     setattr(M, obj_name, _MockLLM(fn))
 
 
+class _OfflineDEERStats:
+    """Small deterministic substitute for corpus-derived DEER statistics."""
+
+    _WEIGHTS = {
+        "beijing": 0.8,
+        "arsenal": 0.7,
+        "california": 0.6,
+        "peter": 0.5,
+        "smith": 0.5,
+    }
+
+    def token_weight(self, token):
+        return self._WEIGHTS.get(token.lower(), 0.1)
+
+
+class _OfflineDEERRetriever:
+    """Return one stable in-memory example without touching Hugging Face."""
+
+    _EXAMPLE = (0, 0.5, ["Alice", "works"], ["B-PER", "O"])
+
+    def retrieve(self, query_tokens, top_k=8):
+        del query_tokens
+        return [self._EXAMPLE] if top_k else []
+
+
+@pytest.fixture(autouse=True)
+def _offline_deer_fixture(monkeypatch):
+    """Preload the only dataset used here and forbid live DEER initialization."""
+    stats = _OfflineDEERStats()
+    retriever = _OfflineDEERRetriever()
+    monkeypatch.setitem(M._deer_stats, "conll2003", stats)
+    monkeypatch.setitem(M._deer_retriever, "conll2003", retriever)
+
+    def already_loaded(dataset_name="conll2003"):
+        if dataset_name != "conll2003":
+            raise AssertionError(f"unexpected offline DEER dataset: {dataset_name}")
+        assert M._deer_stats[dataset_name] is stats
+        assert M._deer_retriever[dataset_name] is retriever
+
+    monkeypatch.setattr(M, "_init_deer", already_loaded)
+
+
 def test_deanchor_boundaries_and_types():
     """Lever 1: de-anchored ATF must keep dirty boundaries, adopt model types,
     and the type-masked prompt must NOT leak the dirty type."""
@@ -30,7 +75,6 @@ def test_deanchor_boundaries_and_types():
         # model correctly re-derives: Beijing=LOC, Arsenal=ORG
         return '["B-LOC","O","B-ORG"]'
     _patch_llm("coder_llm", coder_fn)
-    M._init_deer("conll2003")
 
     state = {"tokens": tokens, "dirty_tags": dirty, "dataset_name": "conll2003",
              "noise_type": "ATF", "deanchor_atf": True}
@@ -56,7 +100,6 @@ def test_verifier_selects_and_falls_back():
     base_state = {"tokens": tokens, "dirty_tags": dirty, "candidate_paths": cands,
                   "rag_weights": weights, "dataset_name": "conll2003",
                   "use_verifier": True, "verify_all": False, "verifier_topk": 4}
-    M._init_deer("conll2003")
 
     # verifier picks the correct minority path B-LOC
     _patch_llm("llm", lambda p: '["B-LOC"]')
@@ -78,7 +121,6 @@ def test_verifier_trigger_gating():
         called["n"] += 1
         return '["O"]'
     _patch_llm("llm", spy)
-    M._init_deer("conll2003")
     state = {"tokens": ["hello"], "dirty_tags": ["O"],
              "candidate_paths": [["O"], ["O"], ["O"]], "rag_weights": [1, 1, 1],
              "dataset_name": "conll2003", "use_verifier": True,
@@ -114,7 +156,6 @@ def test_noise_aware_legalization():
     # leaves a dangling I- for the policy to fix.)
     _patch_llm("llm", lambda p: (_ for _ in ()).throw(
         AssertionError("verifier must not call LLM here")))
-    M._init_deer("conll2003")
     fallback = dict(tokens=["a", "b"], dirty_tags=["O", "I-PER"],
                     candidate_paths=[], rag_weights=[],
                     dataset_name="conll2003", use_verifier=True,

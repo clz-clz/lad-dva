@@ -455,6 +455,97 @@ def test_official_cell_reuses_one_adapter_and_persists_launch_evidence(tmp_path,
     assert rows[0]["fallback_used"] is False
 
 
+def test_paid_smoke_uses_first_20_canonical_rows_with_strict_evidence(
+    tmp_path, monkeypatch
+):
+    noisy_dir = tmp_path / "noisy"
+    pred_dir = tmp_path / "pred"
+    smoke_output = pred_dir / "smoke" / "deepseek.jsonl"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
+    monkeypatch.setattr(run_multiseed, "BACKBONE_TAG", "deepseek-smoke")
+    _write_noisy(noisy_dir / "noisy_seed13__BT__msra__N200.jsonl", count=200)
+
+    identity = {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "served_model": "deepseek-v4-flash",
+        "revision": None,
+    }
+    calls = []
+
+    class Adapter:
+        ror_reasoner = staticmethod(lambda *_: {})
+        gasd_reason_decoder = staticmethod(lambda *_: {})
+        provider_metadata = staticmethod(lambda: dict(identity))
+
+    def record(stage, status, response_model=None):
+        return {
+            "stage": stage,
+            "status": status,
+            **identity,
+            "response_model": response_model,
+            "system_fingerprint": "fp-smoke" if response_model else None,
+            "usage": {},
+        }
+
+    async def pipeline(tokens, dirty, config, dataset_name=None):
+        calls.append((list(tokens), dataset_name))
+        assert config["official"] is True
+        return {
+            "pred_tags": list(dirty),
+            "candidate_paths": [list(dirty)],
+            "rag_weights": [1.0],
+            "confidence": [1.0] * len(dirty),
+            "ror_reasoning_source": "not_triggered",
+            "gasd_variant_requested": "g",
+            "gasd_variant_used": "g",
+            "provider_metadata": {
+                "coder": [
+                    record("coder_path_1", "live", identity["served_model"]),
+                    record("coder_path_2", "live", identity["served_model"]),
+                    record("coder_path_5", "live", identity["served_model"]),
+                ],
+                "reviewer": [record("reviewer", "live", identity["served_model"])],
+                "ror": [record("ror", "not_triggered")],
+                "gasd": [record("gasd", "local")],
+            },
+            "fallback_used": False,
+        }
+
+    asyncio.run(run_multiseed._run_one_cell(
+        "lad_rg_full", run_multiseed.CONFIGURATIONS["lad_rg_full"],
+        "msra", "BT", 13, 200, (pipeline, {}), max_concurrency=2,
+        dummy=False, ratio=0.15, official=False, paid_smoke_size=20,
+        prediction_path=smoke_output, failure_policy="abort",
+        request_timeout=10.0, adapter_factory=Adapter,
+    ))
+
+    rows = run_multiseed._load_noisy(smoke_output)
+    assert len(calls) == len(rows) == 20
+    assert all(row["fallback_used"] is False for row in rows)
+    assert not (pred_dir / "run_manifest__deepseek-smoke.json").exists()
+
+
+def test_paid_smoke_rejects_noncanonical_source_size_before_adapter(
+    tmp_path, monkeypatch
+):
+    noisy_dir = tmp_path / "noisy"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    _write_noisy(noisy_dir / "noisy_seed13__BT__msra__N20.jsonl", count=20)
+
+    with pytest.raises(ValueError, match="canonical size 200"):
+        asyncio.run(run_multiseed._run_one_cell(
+            "lad_rg_full", run_multiseed.CONFIGURATIONS["lad_rg_full"],
+            "msra", "BT", 13, 20, (lambda *args: None, {}),
+            max_concurrency=1, dummy=False, official=False, paid_smoke_size=20,
+            prediction_path=tmp_path / "smoke.jsonl", failure_policy="abort",
+            adapter_factory=lambda: (_ for _ in ()).throw(
+                AssertionError("adapter must not be constructed")
+            ),
+        ))
+
+
 def test_official_failure_removes_only_exact_cell_temp(tmp_path, monkeypatch):
     noisy_dir = tmp_path / "noisy"
     pred_dir = tmp_path / "pred"

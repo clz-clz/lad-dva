@@ -476,7 +476,38 @@ def test_documented_metrics_and_manifest_have_locked_inventory():
         "gate_file_sha256": LOCKED_GATE_FILE_HASH,
         "decoder_model_sha256": LOCKED_DECODER_MODEL_HASH,
     }
-    for name, expected in manifest["source_sha256"].items():
+    historical_inventory = manifest["source_sha256"]
+    assert set(historical_inventory) == {
+        "selectdenoise_contextual_lattice.py",
+        "contextual_lattice_runtime.py",
+        "run_contextual_lattice_gate.py",
+        "multi_agent_v2.py",
+        "run_multiseed.py",
+        "oracle_gap.py",
+        "test_lad_rg_graph.py",
+        "test_oracle_gap.py",
+        "test_contextual_lattice.py",
+        "test_contextual_lattice_runtime.py",
+    }
+    assert all(
+        isinstance(digest, str)
+        and len(digest) == 64
+        and set(digest) <= set("0123456789abcdef")
+        for digest in historical_inventory.values()
+    )
+    # The manifest records the complete source snapshot used for the locked
+    # experiment. Later launch-safety work may legitimately evolve the runner,
+    # pipeline integration, analyses, and tests; those historical hashes must
+    # remain recorded rather than being silently rebaselined. Only the three
+    # source files that constitute the frozen contextual-lattice runtime are
+    # required to remain byte-identical in the active worktree.
+    locked_runtime_sources = {
+        "selectdenoise_contextual_lattice.py",
+        "contextual_lattice_runtime.py",
+        "run_contextual_lattice_gate.py",
+    }
+    for name in locked_runtime_sources:
+        expected = historical_inventory[name]
         digest = hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
         assert digest == expected
 

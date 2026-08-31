@@ -1,5 +1,10 @@
 # Multi-seed runner for SelectDenoise and LAD-RG
 
+The fail-closed N=200 launch procedure, provider setup, paid-smoke gate, and
+Qwen logit probe are documented in
+[`docs/LAD_RG_LAUNCH_GATE.md`](docs/LAD_RG_LAUNCH_GATE.md). Passing offline
+tests is implementation readiness only; it does not create B3/B4 evidence.
+
 Drop these five files alongside your existing `multi_agent_v2.py`,
 `rag_voting_engine.py`, `utils.py`, and `chroma_db/`. Then:
 

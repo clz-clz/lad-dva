@@ -61,6 +61,7 @@ MAX_CONCURRENCY = 200     # high throughput for LLM API calls
 PER_REQUEST_TIMEOUT = 180  # legacy outer deadline; failure policy controls the outcome
 OFFICIAL_REQUEST_TIMEOUT = 600.0
 OFFICIAL_SAMPLE_SIZE = 200
+PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
 OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v1"
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
@@ -665,9 +666,12 @@ async def _run_one_cell(config_name: str, config: dict,
                         ratio: float = 0.15, official: bool = False,
                         failure_policy: str = "abort",
                         request_timeout: float = PER_REQUEST_TIMEOUT,
-                        adapter_factory: Optional[Callable[[], Any]] = None):
+                        adapter_factory: Optional[Callable[[], Any]] = None,
+                        paid_smoke_size: Optional[int] = None,
+                        prediction_path: Optional[Path] = None):
     """Run one cell and clean only its exact temporary output on abort."""
-    pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
+    pred_p = (Path(prediction_path) if prediction_path is not None
+              else _pred_path(config_name, dataset, noise, seed, ratio))
     tmp_p = pred_p.with_suffix(pred_p.suffix + ".tmp")
     try:
         return await _run_one_cell_impl(
@@ -675,6 +679,7 @@ async def _run_one_cell(config_name: str, config: dict,
             max_concurrency=max_concurrency, dummy=dummy, ratio=ratio,
             official=official, failure_policy=failure_policy,
             request_timeout=request_timeout, adapter_factory=adapter_factory,
+            paid_smoke_size=paid_smoke_size, prediction_path=prediction_path,
         )
     except Exception:
         if failure_policy == "abort":
@@ -689,7 +694,9 @@ async def _run_one_cell_impl(config_name: str, config: dict,
                              ratio: float = 0.15, official: bool = False,
                              failure_policy: str = "abort",
                              request_timeout: float = PER_REQUEST_TIMEOUT,
-                             adapter_factory: Optional[Callable[[], Any]] = None):
+                             adapter_factory: Optional[Callable[[], Any]] = None,
+                             paid_smoke_size: Optional[int] = None,
+                             prediction_path: Optional[Path] = None):
     if config.get("offline_only"):
         raise RuntimeError(
             f"Config '{config_name}' is offline-only; derive it with "
@@ -698,6 +705,27 @@ async def _run_one_cell_impl(config_name: str, config: dict,
 
     if failure_policy not in {"abort", "dirty"}:
         raise ValueError("failure_policy must be 'abort' or 'dirty'")
+    is_paid_smoke = paid_smoke_size is not None
+    launch_strict = official or is_paid_smoke
+    if official and is_paid_smoke:
+        raise ValueError("official publication and paid smoke modes are mutually exclusive")
+    if official and prediction_path is not None:
+        raise ValueError("official predictions must use the canonical tagged namespace")
+    if is_paid_smoke:
+        if paid_smoke_size != PAID_SMOKE_SIZE:
+            raise ValueError(f"paid smoke requires exactly {PAID_SMOKE_SIZE} records")
+        if prediction_path is None:
+            raise ValueError("paid smoke requires a dedicated prediction_path")
+        if dummy:
+            raise ValueError("paid smoke cannot use --dummy")
+        if failure_policy != "abort":
+            raise ValueError("paid smoke requires failure_policy='abort'")
+        if config.get("terminal_graph") != "lad-rg":
+            raise ValueError("paid smoke requires a LAD-RG configuration")
+        if size != OFFICIAL_SAMPLE_SIZE:
+            raise ValueError("paid smoke must read the canonical size 200 noisy cell")
+        if abs(ratio - OFFICIAL_NOISE_RATIO) >= 1e-12:
+            raise ValueError("paid smoke requires noise ratio 0.15")
     if official:
         if dummy:
             raise ValueError("official mode cannot use --dummy")
@@ -709,27 +737,32 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             raise ValueError("official cells require size 200 and noise ratio 0.15")
 
     default_fn, baseline_fns = pipelines
-    pred_p = _pred_path(config_name, dataset, noise, seed, ratio)
+    pred_p = (Path(prediction_path) if prediction_path is not None
+              else _pred_path(config_name, dataset, noise, seed, ratio))
     tmp_p = pred_p.with_suffix(pred_p.suffix + ".tmp")
     pred_p.parent.mkdir(parents=True, exist_ok=True)
-    if not official and pred_p.exists() and pred_p.stat().st_size > 0:
+    if is_paid_smoke and pred_p.exists():
+        raise FileExistsError(f"paid smoke output already exists: {pred_p}")
+    if not launch_strict and pred_p.exists() and pred_p.stat().st_size > 0:
         logging.info(f"[skip] {pred_p.name}")
         return
 
     noisy_p = _noisy_path(dataset, noise, seed, size, ratio)
     if not noisy_p.exists():
-        if official:
+        if launch_strict:
             raise FileNotFoundError(f"official noisy file not found: {noisy_p}")
         logging.warning(f"[miss] noisy file not found: {noisy_p}; "
                         f"run gen_noisy.py first")
         return
 
     rows = _load_noisy(noisy_p)
-    if official and len(rows) != OFFICIAL_SAMPLE_SIZE:
+    if launch_strict and len(rows) != OFFICIAL_SAMPLE_SIZE:
         raise RuntimeError(
             f"official noisy cell must contain exactly {OFFICIAL_SAMPLE_SIZE} records; "
             f"found {len(rows)} in {noisy_p.name}"
         )
+    if is_paid_smoke:
+        rows = rows[:paid_smoke_size]
     logging.info(f"[run]  {pred_p.name}  ({len(rows)} sentences)")
     t0 = time.time()
 
@@ -738,13 +771,13 @@ async def _run_one_cell_impl(config_name: str, config: dict,
     buffer: List[Optional[dict]] = [None] * len(rows)
     adapter = None
     provider_identity: Mapping[str, Any] = {}
-    if official:
+    if launch_strict:
         if adapter_factory is None:
             from live_backbone import OpenAICompatibleLADRGAdapter
             adapter_factory = OpenAICompatibleLADRGAdapter
         adapter = adapter_factory()
         provider_identity = adapter.provider_metadata()
-        if pred_p.exists() and pred_p.stat().st_size > 0:
+        if official and pred_p.exists() and pred_p.stat().st_size > 0:
             _validate_official_prediction(
                 pred_p, dataset, config_name, noise,
                 expected_count=OFFICIAL_SAMPLE_SIZE,
@@ -764,7 +797,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             if dummy:
                 cfg["__gold__"] = gold
                 cfg["__seed__"] = seed
-            if official:
+            if launch_strict:
                 cfg.update({
                     "official": True,
                     "ror_reasoner": adapter.ror_reasoner,
@@ -785,7 +818,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
                         return await fn(tokens, dirty, cfg, dataset_name=dataset)
                     except TypeError:
                         return await fn(tokens, dirty, cfg)
-                if official:
+                if launch_strict:
                     return await default_fn(tokens, dirty, cfg, dataset_name=dataset)
                 try:
                     return await default_fn(tokens, dirty, cfg, dataset_name=dataset)
@@ -819,7 +852,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
                           "gasd_variant_used", "provider_metadata", "fallback_used")
                          if k in pred}
                 pred = pred.get("pred_tags", list(dirty))
-            if official:
+            if launch_strict:
                 expected_variant = str(config.get("gasd_variant", "g")).lower()
                 expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
                 _validate_official_provider_evidence(
@@ -852,7 +885,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
 
     rate_tag = f"r{int(round(ratio*100))}"
     try:
-        if official:
+        if launch_strict:
             outcomes = await asyncio.gather(
                 *(_process(i, row) for i, row in enumerate(rows)),
                 return_exceptions=True,
@@ -877,14 +910,15 @@ async def _run_one_cell_impl(config_name: str, config: dict,
         with tmp_p.open("w", encoding="utf-8") as f_out:
             for rec in buffer:
                 if rec is None:
-                    if official:
+                    if launch_strict:
                         raise RuntimeError("official cell produced an incomplete result buffer")
                     continue
                 f_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        if official:
+        if launch_strict:
             _validate_official_prediction(
                 tmp_p, dataset, config_name, noise,
-                expected_count=OFFICIAL_SAMPLE_SIZE,
+                expected_count=(paid_smoke_size if is_paid_smoke
+                                else OFFICIAL_SAMPLE_SIZE),
                 provider_identity=provider_identity,
             )
         tmp_p.replace(pred_p)
