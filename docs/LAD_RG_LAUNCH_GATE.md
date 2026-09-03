@@ -150,6 +150,9 @@ edit the manifest or reuse stale predictions.
 Official Coder, Reviewer, RoR, and GASD-R provider clients are all pinned to
 the manifest's 120-second provider timeout and at most two SDK retries; the
 runner's outer per-sentence deadline remains 600 seconds.
+Official Coder and Reviewer responses are structured as single-key JSON
+objects. DeepSeek uses `json_object` plus an explicit fixed-slot template;
+vLLM/Qwen uses strict JSON Schema with exact array lengths and ontology enums.
 
 ## 4. B4 raw-logit probe
 

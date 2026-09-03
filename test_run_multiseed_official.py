@@ -113,7 +113,7 @@ def test_real_coder_evidence_validates_exact_noise_stage_set(
     identity = _identity()
 
     class Response:
-        content = '["B-PER", "O"]'
+        content = '{"tags":["B-PER","O"]}'
         response_metadata = {
             "model_name": identity["served_model"],
             "system_fingerprint": "fp-test",
@@ -123,7 +123,7 @@ def test_real_coder_evidence_validates_exact_noise_stage_set(
 
     class CoderLLM:
         @staticmethod
-        def invoke(_prompt):
+        def invoke(_prompt, **kwargs):
             return Response()
 
     monkeypatch.setattr(multi_agent_v2, "coder_llm", CoderLLM())

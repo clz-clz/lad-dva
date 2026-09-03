@@ -600,12 +600,12 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
             self.usage_metadata = None
 
     class _CoderLLM:
-        def invoke(self, prompt):
-            return _Message('["O", "O"]', "coder")
+        def invoke(self, prompt, **kwargs):
+            return _Message('{"tags":["O","O"]}', "coder")
 
     class _ReviewerLLM:
-        def invoke(self, prompt):
-            return _Message("[0.75, 0.25]", "reviewer")
+        def invoke(self, prompt, **kwargs):
+            return _Message('{"weights":[0.75,0.25]}', "reviewer")
 
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
     monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
@@ -646,12 +646,12 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
 
 def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monkeypatch):
     class _Message:
-        content = '["O"]'
+        content = '{"tags":["O"]}'
         response_metadata = {}
         usage_metadata = None
 
     class _CoderLLM:
-        def invoke(self, prompt):
+        def invoke(self, prompt, **kwargs):
             return _Message()
 
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
@@ -671,6 +671,141 @@ def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monke
 
     assert result["candidate_paths"] == [["O"], ["O"], ["O"]]
     assert result["fallback_used"] is False
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "vllm"])
+def test_official_coder_uses_provider_structured_output_with_exact_tag_count(
+    monkeypatch, provider
+):
+    calls = []
+
+    class _Message:
+        content = '{"tags":["O","O"]}'
+        response_metadata = {}
+        usage_metadata = None
+
+    class _CoderLLM:
+        def invoke(self, prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return _Message()
+
+    settings = {
+        "provider": provider,
+        "model": "deepseek-v4-flash" if provider == "deepseek" else "qwen",
+        "served_model": "deepseek-v4-flash" if provider == "deepseek" else SERVED_MODEL,
+        "revision": None if provider == "deepseek" else REVISION,
+    }
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
+
+    result = asyncio.run(
+        multi_agent_v2.coder_node(
+            _state(
+                official=True,
+                noise_type="OTHER",
+                tokens=["Alice", "works"],
+                dirty_tags=["O", "O"],
+                candidate_paths=[],
+                provider_settings=settings,
+            )
+        )
+    )
+
+    assert result["candidate_paths"] == [["O", "O"]] * 3
+    assert len(calls) == 3
+    for prompt, kwargs in calls:
+        assert '"tags"' in prompt
+        assert "[null, null]" in prompt
+        response_format = kwargs["response_format"]
+        if provider == "deepseek":
+            assert response_format == {"type": "json_object"}
+        else:
+            tag_schema = response_format["json_schema"]["schema"]["properties"]["tags"]
+            assert response_format["type"] == "json_schema"
+            assert tag_schema["minItems"] == tag_schema["maxItems"] == 2
+            assert set(tag_schema["items"]["enum"]) == {
+                "O", "B-PER", "I-PER", "B-LOC", "I-LOC",
+                "B-ORG", "I-ORG", "B-MISC", "I-MISC",
+            }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        '["O"]',
+        '{"tags":["O"],"extra":true}',
+        '{"tags":[]}',
+        '{"tags":["B-UNKNOWN"]}',
+    ],
+)
+def test_official_coder_rejects_nonexact_structured_response(content):
+    with pytest.raises(ValueError):
+        multi_agent_v2._official_tag_path(content, 1, {"O", "B-PER", "I-PER"})
+
+
+@pytest.mark.parametrize("provider", ["deepseek", "vllm"])
+def test_official_reviewer_uses_provider_structured_output_with_exact_weight_count(
+    monkeypatch, provider
+):
+    calls = []
+
+    class _Message:
+        content = '{"weights":[0.8,0.2]}'
+        response_metadata = {}
+        usage_metadata = None
+
+    class _ReviewerLLM:
+        def invoke(self, prompt, **kwargs):
+            calls.append((prompt, kwargs))
+            return _Message()
+
+    settings = {
+        "provider": provider,
+        "model": "deepseek-v4-flash" if provider == "deepseek" else "qwen",
+        "served_model": "deepseek-v4-flash" if provider == "deepseek" else SERVED_MODEL,
+        "revision": None if provider == "deepseek" else REVISION,
+    }
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(multi_agent_v2, "llm", _ReviewerLLM())
+
+    result = asyncio.run(
+        multi_agent_v2.reviewer_node(
+            _state(
+                official=True,
+                candidate_paths=[["O", "O"], ["B-PER", "O"]],
+                provider_settings=settings,
+            )
+        )
+    )
+
+    assert result["rag_weights"] == [0.8, 0.2]
+    assert len(calls) == 1
+    prompt, kwargs = calls[0]
+    assert '"weights"' in prompt
+    response_format = kwargs["response_format"]
+    if provider == "deepseek":
+        assert response_format == {"type": "json_object"}
+    else:
+        weight_schema = response_format["json_schema"]["schema"]["properties"]["weights"]
+        assert response_format["type"] == "json_schema"
+        assert weight_schema["minItems"] == weight_schema["maxItems"] == 2
+        assert weight_schema["items"] == {
+            "type": "number", "minimum": 0.0, "maximum": 1.0,
+        }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "[0.8,0.2]",
+        '{"weights":[0.8,0.2],"extra":true}',
+        '{"weights":[0.8]}',
+        '{"weights":[0.8,1.2]}',
+    ],
+)
+def test_official_reviewer_rejects_nonexact_structured_response(content):
+    with pytest.raises(ValueError):
+        multi_agent_v2._official_reviewer_weights(content, 2)
 
 
 def test_official_pipeline_rejects_any_reported_fallback(monkeypatch):

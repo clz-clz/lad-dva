@@ -248,18 +248,41 @@ def _with_stage_records(state: Mapping[str, Any], stage: str,
     return evidence
 
 
+def _official_response_format(name: str, schema: Mapping[str, Any],
+                              provider_settings: Any) -> dict[str, Any]:
+    provider = str(_plain_mapping(provider_settings).get("provider", "")).lower()
+    if provider == "deepseek":
+        return {"type": "json_object"}
+    if provider == "vllm":
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "strict": True,
+                "schema": dict(schema),
+            },
+        }
+    raise ValueError("official structured output requires provider deepseek or vllm")
+
+
 def _official_tag_path(content: Any, expected_length: int,
                        valid_tags: set[str]) -> List[str]:
     if not isinstance(content, str):
         raise ValueError("official Coder response content must be a JSON string")
     try:
-        path = json.loads(content)
+        payload = json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError("official Coder response must be valid JSON") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"tags"}:
+        raise ValueError("official Coder response must match the {'tags': [...]} schema")
+    path = payload["tags"]
     if not isinstance(path, list) or not all(isinstance(tag, str) for tag in path):
-        raise ValueError("official Coder response must be a JSON tag list")
+        raise ValueError("official Coder response tags must be a JSON string list")
     if len(path) != expected_length:
-        raise ValueError("official Coder response must contain exactly one tag per token")
+        raise ValueError(
+            "official Coder response must contain exactly one tag per token; "
+            f"expected {expected_length}, received {len(path)}"
+        )
     if any(tag not in valid_tags for tag in path):
         raise ValueError("official Coder response uses a tag outside the dataset ontology")
     return list(path)
@@ -269,9 +292,12 @@ def _official_reviewer_weights(content: Any, expected_length: int) -> List[float
     if not isinstance(content, str):
         raise ValueError("official Reviewer response content must be a JSON string")
     try:
-        values = json.loads(content)
+        payload = json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError("official Reviewer response must be valid JSON") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"weights"}:
+        raise ValueError("official Reviewer response must match the {'weights': [...]} schema")
+    values = payload["weights"]
     if (not isinstance(values, list) or len(values) != expected_length
             or not all(type(value) in (int, float) and 0.0 <= value <= 1.0
                        for value in values)):
@@ -407,6 +433,9 @@ async def coder_node(state: State):
     noise_type = state.get("noise_type", "BT")
     deanchor_atf = state.get("deanchor_atf", False) and noise_type == "ATF"
     valid_tags_str = _format_valid_tags(dataset_name)
+    valid_types = DATASET_ENTITY_TYPES.get(dataset_name, ["PER", "LOC", "ORG"])
+    valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                          for entity_type in valid_types for prefix in ("B", "I")}
     misc_guidance = _format_misc_guidance(dataset_name)
     sentence_initial_guidance = _format_sentence_initial_guidance(dataset_name)
 
@@ -498,35 +527,69 @@ CRITICAL DENOISING POLICY — follow these rules precisely:
     n_paths = len(path_strategies)
     print(f" [Coder] {noise_type}: {n_paths} individual LLM calls (parallel)")
 
-    prompts = []
+    requests = []
+    coder_schema = {
+        "type": "object",
+        "properties": {
+            "tags": {
+                "type": "array",
+                "items": {"type": "string", "enum": sorted(valid_tags)},
+                "minItems": len(tokens),
+                "maxItems": len(tokens),
+            },
+        },
+        "required": ["tags"],
+        "additionalProperties": False,
+    }
     for pidx, pdesc in path_strategies.items():
+        if official:
+            output_instruction = f"""
+Generate EXACTLY 1 repair path in a JSON object whose only key is "tags".
+The "tags" array MUST preserve all {len(tokens)} positions in order.
+Copy this exact-length slot template and replace every null with one valid IOB2 tag;
+never add, remove, merge, split, or reorder slots:
+{json.dumps({"tags": [None] * len(tokens)})}
+Output ONLY that JSON object, no markdown, no explanation."""
+            response_kwargs = {
+                "response_format": _official_response_format(
+                    f"lad_rg_coder_path_{pidx}", coder_schema,
+                    state.get("provider_settings"),
+                )
+            }
+        else:
+            output_instruction = f"""
+Generate EXACTLY 1 repair path (a JSON list of {len(tokens)} IOB2 tags).
+Output ONLY the JSON list, no markdown, no explanation."""
+            response_kwargs = {}
         prompt = shared_prefix + f"""
 
 PATH {pidx} STRATEGY — your ONLY task:
 {pdesc}
 
-Generate EXACTLY 1 repair path (a JSON list of {len(tokens)} IOB2 tags).
-Output ONLY the JSON list, no markdown, no explanation."""
-        prompts.append(prompt)
+{output_instruction}"""
+        requests.append((pidx, prompt, response_kwargs))
 
     responses = await asyncio.gather(*[
-        asyncio.to_thread(coder_llm.invoke, p) for p in prompts
+        asyncio.to_thread(coder_llm.invoke, prompt, **response_kwargs)
+        for _pidx, prompt, response_kwargs in requests
     ])
 
     candidate_paths = []
-    for r in responses:
-        valid_types = DATASET_ENTITY_TYPES.get(dataset_name, ["PER", "LOC", "ORG"])
-        valid_tags = {"O"} | {f"{prefix}-{entity_type}"
-                              for entity_type in valid_types for prefix in ("B", "I")}
-        path = (_official_tag_path(r.content, len(tokens), valid_tags) if official
-                else extract_json_list(r.content, fallback_length=len(tokens)))
+    for (strategy_key, _prompt, _kwargs), response in zip(requests, responses):
+        if official:
+            try:
+                path = _official_tag_path(response.content, len(tokens), valid_tags)
+            except ValueError as exc:
+                raise ValueError(f"official Coder path {strategy_key}: {exc}") from exc
+        else:
+            path = extract_json_list(response.content, fallback_length=len(tokens))
         candidate_paths.append(path)
 
     coder_records = [
         _response_stage_record(
             response, f"coder_path_{strategy_key}", state.get("provider_settings")
         )
-        for strategy_key, response in zip(path_strategies, responses)
+        for (strategy_key, _prompt, _kwargs), response in zip(requests, responses)
     ]
 
     # Length normalization
@@ -916,6 +979,7 @@ async def reviewer_node(state: State):
     candidate_paths = state.get("candidate_paths", [])
     ds_name = state.get("dataset_name", "conll2003")
     use_lads = state.get("use_lads", True)
+    official = bool(state.get("official", False))
 
     if not candidate_paths:
         return {"rag_weights": []}
@@ -943,6 +1007,37 @@ async def reviewer_node(state: State):
 
     # DEER retrieval: use label statistics to find similar training sentences
     deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=ds_name)
+    if official:
+        reviewer_output_instruction = f"""
+    Output ONLY a JSON object whose only key is "weights".
+    The "weights" array must contain exactly {len(candidate_paths)} numbers in
+    candidate-path order, each between 0.0 and 1.0.
+    Required shape: {json.dumps({"weights": [None] * len(candidate_paths)})}
+    Replace every null; never add, remove, or reorder slots."""
+        reviewer_schema = {
+            "type": "object",
+            "properties": {
+                "weights": {
+                    "type": "array",
+                    "items": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    "minItems": len(candidate_paths),
+                    "maxItems": len(candidate_paths),
+                },
+            },
+            "required": ["weights"],
+            "additionalProperties": False,
+        }
+        response_kwargs = {
+            "response_format": _official_response_format(
+                "lad_rg_reviewer", reviewer_schema,
+                state.get("provider_settings"),
+            )
+        }
+    else:
+        reviewer_output_instruction = f"""
+    Output ONLY a JSON list of {len(candidate_paths)} float numbers between 0.0 and 1.0.
+    Example: [0.15, 0.92, 0.48, 0.05, 0.78]"""
+        response_kwargs = {}
 
     reviewer_prompt = f"""
     You are an IOB2 Adjudicator. Your task is to score candidate IOB2 tag paths for quality and identify the BEST path among them.
@@ -991,14 +1086,13 @@ async def reviewer_node(state: State):
 
     CRITICAL: Best path ≥ 0.85. Worst path ≤ 0.25. Spread scores across the full range.
 
-    Output ONLY a JSON list of {len(candidate_paths)} float numbers between 0.0 and 1.0.
-    Example: [0.15, 0.92, 0.48, 0.05, 0.78]
+    {reviewer_output_instruction}
     """
 
-    response = await asyncio.to_thread(llm.invoke, reviewer_prompt)
+    response = await asyncio.to_thread(llm.invoke, reviewer_prompt, **response_kwargs)
     rag_weights = (
         _official_reviewer_weights(response.content, len(candidate_paths))
-        if state.get("official", False)
+        if official
         else extract_float_weights(response.content, expected_len=len(candidate_paths))
     )
     reviewer_record = _response_stage_record(
