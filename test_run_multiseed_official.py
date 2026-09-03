@@ -353,7 +353,8 @@ def test_official_request_model_configuration_uses_immutable_served_name(monkeyp
         base_url="http://127.0.0.1:8000/v1", api_key="test",
         revision="a" * 40,
     )
-    monkeypatch.delenv("BACKBONE_SERVED_MODEL", raising=False)
+    monkeypatch.setenv("BACKBONE_SERVED_MODEL", "")
+    monkeypatch.setenv("LAD_RG_OFFICIAL_REQUESTS", "0")
 
     assert run_multiseed._configure_official_request_model(settings) == settings.served_model
     assert run_multiseed.os.environ["BACKBONE_SERVED_MODEL"] == settings.served_model
@@ -664,6 +665,58 @@ def test_official_failure_removes_only_exact_cell_temp(tmp_path, monkeypatch):
     assert not target.exists()
     assert not target_tmp.exists()
     assert other_tmp.read_text(encoding="utf-8") == "keep"
+
+
+def test_official_failure_cancels_and_drains_pending_sentences(tmp_path, monkeypatch):
+    noisy_dir = tmp_path / "noisy"
+    pred_dir = tmp_path / "pred"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
+    monkeypatch.setattr(run_multiseed, "BACKBONE_TAG", "fail-fast")
+    _write_noisy(noisy_dir / "noisy_seed13__BT__msra__N200.jsonl", count=200)
+
+    class Adapter:
+        ror_reasoner = staticmethod(lambda *_: {})
+        gasd_reason_decoder = staticmethod(lambda *_: {})
+        provider_metadata = staticmethod(_identity)
+
+    calls = 0
+    cancelled = 0
+
+    async def pipeline(tokens, dirty, config, dataset_name=None):
+        nonlocal calls, cancelled
+        calls += 1
+        if calls == 1:
+            await asyncio.sleep(0)
+            raise RuntimeError("provider failed")
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            cancelled += 1
+            raise
+        return {
+            "pred_tags": list(dirty),
+            "candidate_paths": [list(dirty)],
+            "rag_weights": [1.0],
+            "confidence": [1.0] * len(dirty),
+            "ror_reasoning_source": "not_triggered",
+            "gasd_variant_requested": "g",
+            "gasd_variant_used": "g",
+            "provider_metadata": _full_evidence(gasd_status="local"),
+            "fallback_used": False,
+        }
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        asyncio.run(run_multiseed._run_one_cell(
+            "lad_rg_full", run_multiseed.CONFIGURATIONS["lad_rg_full"],
+            "msra", "BT", 13, 200, (pipeline, {}), max_concurrency=5,
+            dummy=False, official=True, failure_policy="abort",
+            request_timeout=10.0, adapter_factory=Adapter,
+        ))
+
+    assert 1 <= calls < 200
+    assert cancelled >= 1
+    assert not list(pred_dir.glob("*fail-fast*"))
 
 
 def test_official_cell_rejects_empty_stage_evidence(tmp_path, monkeypatch):

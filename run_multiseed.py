@@ -912,15 +912,22 @@ async def _run_one_cell_impl(config_name: str, config: dict,
     rate_tag = f"r{int(round(ratio*100))}"
     try:
         if launch_strict:
-            outcomes = await asyncio.gather(
-                *(_process(i, row) for i, row in enumerate(rows)),
-                return_exceptions=True,
-            )
-            first_error = next(
-                (outcome for outcome in outcomes if isinstance(outcome, BaseException)), None
-            )
-            if first_error is not None:
-                raise first_error
+            tasks = [
+                asyncio.create_task(_process(i, row))
+                for i, row in enumerate(rows)
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                # Fail the cell as soon as any sentence fails, then drain every
+                # task so queued requests cannot continue and no exception is
+                # left orphaned. asyncio.run also waits for any already-running
+                # to_thread provider call before the adapter is closed.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
         else:
             try:
                 from tqdm.asyncio import tqdm as async_tqdm

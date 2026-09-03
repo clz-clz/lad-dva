@@ -127,6 +127,8 @@ def test_smoke_cli_keeps_stdout_machine_readable(capsys, monkeypatch, tmp_path):
     for name, value in environment.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("BACKBONE_REVISION", raising=False)
+    monkeypatch.setenv("BACKBONE_SERVED_MODEL", "")
+    monkeypatch.setenv("LAD_RG_OFFICIAL_REQUESTS", "0")
     monkeypatch.setattr(official_smoke.runner, "_import_pipeline", lambda _dummy: object())
     monkeypatch.setattr(official_smoke, "_git_sha", lambda: "1" * 40)
 

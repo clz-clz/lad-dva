@@ -8,7 +8,7 @@ import math
 import threading
 from collections import Counter
 from pathlib import Path
-from typing import Annotated, Any, Mapping, TypedDict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Mapping, TypedDict, List, Optional, Tuple
 from dotenv import load_dotenv
 import argparse
 
@@ -132,10 +132,20 @@ class State(TypedDict):
     # --- Synergistic redesign (LAD-RG) — legacy, superseded by SelectDenoise ---
     ror_proposals: dict          # token-index -> proposed tag from RoR; empty when none fire
     ror_reasoning: dict          # auditable span/type reasoning evidence; never final tags
+    use_lads: bool               # enable LADS retrieval/potential weighting
     use_ror: bool                # enable the RoR recall stage
+    use_gasd: bool               # enable the GASD terminal decoder
     ror_ungated: bool            # ablation: fire RoR everywhere (no ω/conf gate)
     gasd_potentials: bool        # integrate LADS ω(t) potentials in GASD decode
     gasd_variant: str            # g, r, or both
+    ror_reasoner: Optional[
+        Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
+    ]
+    gasd_reason_decoder: Optional[
+        Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    ]
+    gasd_variant_requested: str  # terminal evidence: configured decoder variant
+    gasd_variant_used: str       # terminal evidence: decoder variant actually used
     official: bool               # fail-closed launch semantics
     provider_settings: dict      # immutable provider settings supplied by runner
     provider_metadata: dict      # stage-separated per-response evidence

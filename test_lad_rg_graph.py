@@ -56,6 +56,28 @@ def test_lad_rg_configurations_select_lad_rg_graph_and_preserve_selectdenoise_co
     assert CONFIGURATIONS["selectdenoise_contextual_lattice"]["terminal_decoder"] == "contextual-lattice-v1"
 
 
+def test_lad_rg_state_schema_preserves_live_controls_and_completion_evidence():
+    ror_reasoner = lambda _prompt, _payload: {"spans": []}
+    gasd_reason_decoder = lambda _payload: {"reason": "none", "tags": ["O"]}
+    emitted = {
+        "use_lads": True,
+        "use_gasd": True,
+        "ror_reasoner": ror_reasoner,
+        "gasd_reason_decoder": gasd_reason_decoder,
+        "gasd_variant_requested": "g",
+        "gasd_variant_used": "g",
+    }
+
+    workflow = multi_agent_v2.StateGraph(multi_agent_v2.State)
+    workflow.add_node("emit", lambda _state: emitted)
+    workflow.add_edge(multi_agent_v2.START, "emit")
+    workflow.add_edge("emit", multi_agent_v2.END)
+
+    result = workflow.compile().invoke({})
+
+    assert {key: result.get(key) for key in emitted} == emitted
+
+
 def test_oracle_pool_configs_are_registered_as_offline_only():
     assert CONFIGURATIONS["oracle_pool_sent"]["offline_only"] == "oracle_gap.py"
     assert CONFIGURATIONS["oracle_pool_sent"]["oracle_variant"] == "sentence_selection"
