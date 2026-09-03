@@ -660,6 +660,31 @@ def _supports_candidate_evidence(config_name: str, config: dict) -> bool:
 # Per-cell async runner
 # ---------------------------------------------------------------------------
 
+
+class _CachedAdapterFactory:
+    """Own one live adapter for an official process and close it exactly once."""
+
+    def __init__(self, create: Callable[[], Any]) -> None:
+        self._create = create
+        self._adapter: Any = None
+        self._closed = False
+
+    def __call__(self) -> Any:
+        if self._closed:
+            raise RuntimeError("cached live adapter factory is closed")
+        if self._adapter is None:
+            self._adapter = self._create()
+        return self._adapter
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close_adapter = getattr(self._adapter, "close", None)
+        if callable(close_adapter):
+            close_adapter()
+
+
 async def _run_one_cell(config_name: str, config: dict,
                         dataset: str, noise: str, seed: int,
                         size: int, pipelines,
@@ -970,6 +995,7 @@ def main(argv=None):
     args = _parse_args(argv)
 
     official_settings = None
+    adapter_factory = None
     if args.official:
         if args.dummy:
             raise ValueError("--official cannot be combined with --dummy")
@@ -989,6 +1015,11 @@ def main(argv=None):
             official_settings, BACKBONE_TAG, git_sha, args.request_timeout,
         )
         _ensure_official_manifest(manifest, PRED_DIR, BACKBONE_TAG)
+        from live_backbone import OpenAICompatibleLADRGAdapter
+
+        adapter_factory = _CachedAdapterFactory(
+            lambda: OpenAICompatibleLADRGAdapter(official_settings)
+        )
 
     # Expand default thread pool so MAX_CONCURRENCY LLM calls fit.
     loop = asyncio.new_event_loop()
@@ -1004,40 +1035,39 @@ def main(argv=None):
                  f"({'DUMMY' if args.dummy else 'REAL'} pipeline)")
 
     n_done = n_err = 0
-    for cfg_name in args.configs:
-        if cfg_name not in CONFIGURATIONS:
-            logging.error(f"Unknown config: {cfg_name}; "
-                          f"known: {list(CONFIGURATIONS)}")
-            continue
-        cfg = CONFIGURATIONS[cfg_name]
-        for ds in args.datasets:
-            for nt in args.noise:
-                for s in args.seeds:
-                    for r in args.ratios:
-                        try:
-                            asyncio.run(_run_one_cell(
-                                cfg_name, cfg, ds, nt, s, args.size,
-                                pipeline_fn,
-                                max_concurrency=args.max_concurrency,
-                                dummy=args.dummy,
-                                ratio=r,
-                                official=args.official,
-                                failure_policy=args.failure_policy,
-                                request_timeout=args.request_timeout,
-                                adapter_factory=(
-                                    (lambda settings=official_settings: __import__(
-                                        "live_backbone", fromlist=["OpenAICompatibleLADRGAdapter"]
-                                    ).OpenAICompatibleLADRGAdapter(settings))
-                                    if args.official else None
-                                ),
-                            ))
-                            n_done += 1
-                        except Exception:                    # noqa: BLE001
-                            logging.error("[!] cell raised")
-                            traceback.print_exc(file=sys.stderr)
-                            n_err += 1
-                            if args.official:
-                                raise
+    try:
+        for cfg_name in args.configs:
+            if cfg_name not in CONFIGURATIONS:
+                logging.error(f"Unknown config: {cfg_name}; "
+                              f"known: {list(CONFIGURATIONS)}")
+                continue
+            cfg = CONFIGURATIONS[cfg_name]
+            for ds in args.datasets:
+                for nt in args.noise:
+                    for s in args.seeds:
+                        for r in args.ratios:
+                            try:
+                                asyncio.run(_run_one_cell(
+                                    cfg_name, cfg, ds, nt, s, args.size,
+                                    pipeline_fn,
+                                    max_concurrency=args.max_concurrency,
+                                    dummy=args.dummy,
+                                    ratio=r,
+                                    official=args.official,
+                                    failure_policy=args.failure_policy,
+                                    request_timeout=args.request_timeout,
+                                    adapter_factory=adapter_factory,
+                                ))
+                                n_done += 1
+                            except Exception:                    # noqa: BLE001
+                                logging.error("[!] cell raised")
+                                traceback.print_exc(file=sys.stderr)
+                                n_err += 1
+                                if args.official:
+                                    raise
+    finally:
+        if adapter_factory is not None:
+            adapter_factory.close()
 
     logging.info(f"summary: {n_done} ok, {n_err} failed")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -85,6 +86,9 @@ def test_vllm_ror_uses_configured_served_name_and_retains_pinned_evidence():
             }
         },
     }
+    qwen_prompt = "\n".join(message["content"] for message in request["messages"])
+    assert '{"spans":[{"start":0,"end":1}]}' not in qwen_prompt
+    assert "no additional keys" not in qwen_prompt.lower()
     assert adapter.provider_metadata()["revision"] == PINNED_QWEN_REVISION
     assert adapter.provider_metadata()["served_model"] == (
         f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
@@ -160,6 +164,99 @@ def test_deepseek_v4_flash_ror_enables_thinking():
     assert adapter.ror_reasoner("span_detection", _payload()) == {"spans": []}
     assert transport.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
     assert adapter.settings.revision == "2026-08-01"
+
+
+def test_deepseek_ror_prompts_include_exact_json_schema_examples():
+    transport = _RecordingTransport([
+        _response({"spans": [{"start": 0, "end": 1}]}),
+        _response({"types": [{"start": 0, "end": 1, "type": "ORG"}]}),
+    ])
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="test-key",
+        ),
+        transport=transport,
+    )
+
+    spans = adapter.ror_reasoner("span_detection", _payload())
+    adapter.ror_reasoner("type_assignment", {**_payload(), "spans": spans["spans"]})
+
+    span_prompt = "\n".join(message["content"] for message in transport.calls[0]["messages"])
+    type_prompt = "\n".join(message["content"] for message in transport.calls[1]["messages"])
+    assert '{"spans":[{"start":0,"end":1}]}' in span_prompt
+    assert "no additional keys" in span_prompt.lower()
+    assert '{"types":[{"start":0,"end":1,"type":"PER"}]}' in type_prompt
+    assert "no additional keys" in type_prompt.lower()
+
+
+def test_sdk_adapter_supplies_proxy_isolated_http_client_to_factory():
+    captured = {}
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: None))
+        )
+
+    OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="test-key",
+        ),
+        client_factory=factory,
+    )
+
+    http_client = captured.get("http_client")
+    assert http_client is not None
+    try:
+        assert http_client._trust_env is False
+        assert http_client._transport._pool._max_connections == 1000
+        assert http_client._transport._pool._max_keepalive_connections == 100
+    finally:
+        http_client.close()
+
+
+def test_sdk_adapter_closes_the_client_and_owned_http_transport():
+    captured = {}
+
+    class Client:
+        def __init__(self, http_client):
+            self.http_client = http_client
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **_: None)
+            )
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            self.http_client.close()
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        captured["client"] = Client(kwargs["http_client"])
+        return captured["client"]
+
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            api_key="test-key",
+        ),
+        client_factory=factory,
+    )
+
+    close = getattr(adapter, "close", None)
+    assert callable(close)
+    close()
+    close()
+    assert captured["client"].close_calls == 1
+    assert captured["http_client"].is_closed
 
 
 def test_callback_result_retains_independent_response_metadata_without_changing_dict_api():

@@ -15,6 +15,7 @@ import argparse
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_openai import ChatOpenAI
+from openai import DefaultHttpxClient
 
 from utils import enforce_iob2_syntax, legalize_noise_aware, extract_json_list
 from metrics import _is_valid_transition
@@ -49,6 +50,7 @@ def _provider_client_options(environment: Optional[Mapping[str, str]] = None) ->
     return {
         "timeout": OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
         "max_retries": OFFICIAL_SDK_MAX_RETRIES,
+        "http_client": DefaultHttpxClient(trust_env=False),
     }
 
 

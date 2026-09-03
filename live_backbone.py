@@ -162,23 +162,47 @@ class OpenAICompatibleLADRGAdapter:
         client_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.settings = settings or LiveBackboneSettings.from_env()
+        self._client: Any = None
+        self._http_client: Any = None
+        self._closed = False
         if transport is not None:
             self._transport = transport
             return
         try:
+            from openai import DefaultHttpxClient
+
             if client_factory is None:
                 from openai import OpenAI
 
                 client_factory = OpenAI
-            client = client_factory(
-                api_key=self.settings.api_key,
-                base_url=self.settings.base_url,
-                timeout=self.settings.timeout_seconds,
-                max_retries=self.settings.max_retries,
-            )
+            http_client = DefaultHttpxClient(trust_env=False)
+            try:
+                client = client_factory(
+                    api_key=self.settings.api_key,
+                    base_url=self.settings.base_url,
+                    timeout=self.settings.timeout_seconds,
+                    max_retries=self.settings.max_retries,
+                    http_client=http_client,
+                )
+            except Exception:
+                http_client.close()
+                raise
+            self._client = client
+            self._http_client = http_client
             self._transport = client.chat.completions.create
         except Exception as exc:  # noqa: BLE001 - converted to the public error type
             raise LiveBackboneError("could not initialize live backbone client") from exc
+
+    def close(self) -> None:
+        """Release the owned SDK transport once all experiment cells finish."""
+        if self._closed:
+            return
+        self._closed = True
+        close_client = getattr(self._client, "close", None)
+        if callable(close_client):
+            close_client()
+        elif self._http_client is not None:
+            self._http_client.close()
 
     def provider_metadata(self) -> dict[str, Any]:
         """Stable, response-independent settings for later evidence callbacks."""
@@ -200,7 +224,9 @@ class OpenAICompatibleLADRGAdapter:
             response, response_metadata = self._request(
                 name="lad_rg_span_detection",
                 schema=_SPAN_SCHEMA,
-                messages=_ror_messages("span_detection", payload, valid_types),
+                messages=_ror_messages(
+                    "span_detection", payload, valid_types, provider=self.settings.provider
+                ),
                 enable_thinking=True,
             )
             return LiveBackboneResult(
@@ -212,7 +238,9 @@ class OpenAICompatibleLADRGAdapter:
             response, response_metadata = self._request(
                 name="lad_rg_type_assignment",
                 schema=_TYPE_SCHEMA,
-                messages=_ror_messages("type_assignment", payload, valid_types),
+                messages=_ror_messages(
+                    "type_assignment", payload, valid_types, provider=self.settings.provider
+                ),
                 enable_thinking=True,
             )
             return LiveBackboneResult(
@@ -427,18 +455,45 @@ def _validate_gasd(response: Mapping[str, Any], token_count: int, valid_tags: se
     return reason, list(tags)
 
 
-def _ror_messages(stage: str, payload: Mapping[str, Any], valid_types: list[str]) -> list[dict[str, str]]:
-    task = (
-        "Detect only entity spans using zero-based, end-exclusive token offsets."
-        if stage == "span_detection"
-        else "Assign exactly one ontology type to every supplied zero-based, end-exclusive span."
-    )
+def _ror_messages(
+    stage: str,
+    payload: Mapping[str, Any],
+    valid_types: list[str],
+    *,
+    provider: str,
+) -> list[dict[str, str]]:
+    json_contract = ""
+    if stage == "span_detection":
+        task = "Detect only entity spans using zero-based, end-exclusive token offsets."
+        deepseek_json_contract = (
+            'Required JSON output: {"spans":[{"start":0,"end":1}]}. '
+            'The top-level object must contain exactly the key "spans"; every span item must '
+            'contain exactly "start" and "end", with no additional keys. Do not include entity '
+            'types, token text, names, or explanations. Use {"spans":[]} when no span exists.'
+        )
+    else:
+        task = "Assign exactly one ontology type to every supplied zero-based, end-exclusive span."
+        deepseek_json_contract = (
+            'Required JSON output: {"types":[{"start":0,"end":1,"type":"PER"}]}. '
+            'The top-level object must contain exactly the key "types"; every type item must '
+            'contain exactly "start", "end", and "type", with no additional keys. Return every '
+            'supplied span exactly once and no other spans.'
+        )
+    if provider == "deepseek":
+        json_contract = deepseek_json_contract
+    contract_line = f"\n{json_contract}" if json_contract else ""
     return [
-        {"role": "system", "content": "You are a strict LAD-RG RoR component. Return only the requested JSON object."},
+        {
+            "role": "system",
+            "content": (
+                "You are a strict LAD-RG RoR component. Return only the requested JSON object."
+                + (f" {json_contract}" if json_contract else "")
+            ),
+        },
         {
             "role": "user",
             "content": (
-                f"{task}\nOntology: {json.dumps(valid_types)}\n"
+                f"{task}{contract_line}\nOntology: {json.dumps(valid_types)}\n"
                 f"Payload: {json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)}"
             ),
         },

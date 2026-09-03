@@ -378,8 +378,14 @@ def test_official_coder_and_reviewer_clients_use_manifest_sdk_controls():
                 "print(json.dumps({"
                 "'reviewer_timeout': m.llm.request_timeout, "
                 "'reviewer_retries': m.llm.max_retries, "
+                "'reviewer_trust_env': getattr(m.llm.http_client, '_trust_env', None), "
+                "'reviewer_max_connections': m.llm.http_client._transport._pool._max_connections, "
+                "'reviewer_max_keepalive': m.llm.http_client._transport._pool._max_keepalive_connections, "
                 "'coder_timeout': m.coder_llm.request_timeout, "
-                "'coder_retries': m.coder_llm.max_retries}))"
+                "'coder_retries': m.coder_llm.max_retries, "
+                "'coder_trust_env': getattr(m.coder_llm.http_client, '_trust_env', None), "
+                "'coder_max_connections': m.coder_llm.http_client._transport._pool._max_connections, "
+                "'coder_max_keepalive': m.coder_llm.http_client._transport._pool._max_keepalive_connections}))"
             ),
         ],
         cwd=Path(__file__).parent,
@@ -395,10 +401,44 @@ def test_official_coder_and_reviewer_clients_use_manifest_sdk_controls():
     assert controls == {
         "reviewer_timeout": 120.0,
         "reviewer_retries": 2,
+        "reviewer_trust_env": False,
+        "reviewer_max_connections": 1000,
+        "reviewer_max_keepalive": 100,
         "coder_timeout": 120.0,
         "coder_retries": 2,
+        "coder_trust_env": False,
+        "coder_max_connections": 1000,
+        "coder_max_keepalive": 100,
     }
     assert multi_agent_v2._provider_client_options({}) == {}
+
+
+def test_cached_adapter_factory_reuses_one_adapter_and_closes_it_once():
+    factory_type = getattr(run_multiseed, "_CachedAdapterFactory", None)
+    assert factory_type is not None
+    created = []
+
+    class Adapter:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def create():
+        adapter = Adapter()
+        created.append(adapter)
+        return adapter
+
+    factory = factory_type(create)
+    first = factory()
+    assert factory() is first
+    assert created == [first]
+    factory.close()
+    factory.close()
+    assert first.close_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        factory()
 
 
 def test_official_environment_is_explicit_and_rejects_deepseek_gasd_r():

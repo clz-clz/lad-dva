@@ -342,6 +342,7 @@ def run_live_preflight(
     blockers: list[dict[str, Any]] = []
     checks: dict[str, Any] = {}
     fingerprints: set[str] = set()
+    adapter = None
     try:
         _validate_official_settings_for_configs(settings, config_names)
         models = list(models_fetcher(settings))
@@ -410,6 +411,13 @@ def run_live_preflight(
         }
     except Exception as exc:  # noqa: BLE001 - one fail-closed live blocker
         _block(blockers, "live_validation_failed", str(exc))
+    finally:
+        close_adapter = getattr(adapter, "close", None)
+        if callable(close_adapter):
+            try:
+                close_adapter()
+            except Exception as exc:  # noqa: BLE001 - closure is part of the gate
+                _block(blockers, "live_adapter_close_failed", str(exc))
     return {"mode": "live", "ok": not blockers, "checks": checks, "blockers": blockers}
 
 

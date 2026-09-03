@@ -195,19 +195,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         from live_backbone import OpenAICompatibleLADRGAdapter
 
         pipelines = runner._import_pipeline(False)
+        adapter_factory = runner._CachedAdapterFactory(
+            lambda: OpenAICompatibleLADRGAdapter(settings)
+        )
         # Pipeline nodes retain historical human-readable print diagnostics.
         # Keep stdout as one machine-readable report by routing those diagnostics
         # to stderr for this operational CLI.
-        with redirect_stdout(sys.stderr):
-            asyncio.run(runner._run_one_cell(
-                args.config, runner.CONFIGURATIONS[args.config],
-                args.dataset, args.noise, args.seed, runner.OFFICIAL_SAMPLE_SIZE,
-                pipelines, max_concurrency=args.max_concurrency, dummy=False,
-                ratio=runner.OFFICIAL_NOISE_RATIO, official=False,
-                paid_smoke_size=PAID_SMOKE_SIZE, prediction_path=output_path,
-                failure_policy="abort", request_timeout=args.request_timeout,
-                adapter_factory=lambda: OpenAICompatibleLADRGAdapter(settings),
-            ))
+        try:
+            with redirect_stdout(sys.stderr):
+                asyncio.run(runner._run_one_cell(
+                    args.config, runner.CONFIGURATIONS[args.config],
+                    args.dataset, args.noise, args.seed, runner.OFFICIAL_SAMPLE_SIZE,
+                    pipelines, max_concurrency=args.max_concurrency, dummy=False,
+                    ratio=runner.OFFICIAL_NOISE_RATIO, official=False,
+                    paid_smoke_size=PAID_SMOKE_SIZE, prediction_path=output_path,
+                    failure_policy="abort", request_timeout=args.request_timeout,
+                    adapter_factory=adapter_factory,
+                ))
+        finally:
+            adapter_factory.close()
         rows = runner._load_noisy(output_path)
         gate = assess_smoke_rows(rows, config_name=args.config)
         fingerprints = sorted({
