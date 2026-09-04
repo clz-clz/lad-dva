@@ -355,6 +355,39 @@ def test_gasd_r_validates_exact_ontology_tags_and_converts_them_to_fixed_scores(
     }
 
 
+def test_gasd_r_requests_schema_constrains_exact_token_count_and_ontology():
+    transport = _RecordingTransport([
+        _response({"reason": "No entity.", "tags": ["O", "O"]})
+    ])
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="qwen", base_url="http://localhost/v1",
+            api_key="x", revision=PINNED_QWEN_REVISION,
+        ),
+        transport=transport,
+    )
+
+    adapter.gasd_reason_decoder({
+        "tokens": ["No", "entity"],
+        "valid_tags": ["O", "B-PER", "I-PER"],
+    })
+
+    assert transport.calls[0]["response_format"]["json_schema"]["schema"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reason", "tags"],
+        "properties": {
+            "reason": {"type": "string"},
+            "tags": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "string", "enum": ["B-PER", "I-PER", "O"]},
+            },
+        },
+    }
+
+
 @pytest.mark.parametrize(
     "response",
     [

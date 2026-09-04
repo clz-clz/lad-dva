@@ -133,15 +133,21 @@ _TYPE_SCHEMA = {
     },
 }
 
-_GASD_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["reason", "tags"],
-    "properties": {
-        "reason": {"type": "string"},
-        "tags": {"type": "array", "items": {"type": "string"}},
-    },
-}
+def _gasd_schema(token_count: int, valid_tags: set[str]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reason", "tags"],
+        "properties": {
+            "reason": {"type": "string"},
+            "tags": {
+                "type": "array",
+                "minItems": token_count,
+                "maxItems": token_count,
+                "items": {"type": "string", "enum": sorted(valid_tags)},
+            },
+        },
+    }
 
 
 class OpenAICompatibleLADRGAdapter:
@@ -262,7 +268,7 @@ class OpenAICompatibleLADRGAdapter:
         valid_tags = _valid_tags(payload)
         response, response_metadata = self._request(
             name="lad_rg_gasd_r",
-            schema=_GASD_SCHEMA,
+            schema=_gasd_schema(len(tokens), valid_tags),
             messages=_gasd_messages(payload, valid_tags),
             enable_thinking=self.settings.provider == "vllm",
         )
