@@ -82,8 +82,9 @@ D:/py/Anaconda3/python.exe run_multiseed.py --official --size 200 --ratios 0.15 
 
 Resolve the exact Hugging Face commit before launch. `BACKBONE_REVISION` must
 be a 40-hex commit, not `main`, a branch, a tag, or a short hash. On the rented
-Linux GPU host, use a dedicated environment with the launch-tested runtime.
-`accelerate` is required later by the B4 probe's Transformers `device_map`:
+Linux GPU host, use a dedicated service environment with the launch-tested
+runtime. `accelerate` is installed here so the environment can be snapshotted
+for B4 after the paid smoke:
 
 ```bash
 python3 -m venv /path/to/lad-rg-venv
@@ -174,17 +175,39 @@ vLLM/Qwen uses strict JSON Schema with exact array lengths and ontology enums.
 Run the probe on the rented GPU only after the official calls are complete.
 Stop vLLM cleanly in its server terminal (normally `Ctrl+C`) and verify that no
 vLLM process still owns model memory. Keep the same checkout, canonical noisy
-matrix, model ID, `BACKBONE_REVISION`, and `BACKBONE_TAG`. Re-export the same
-Qwen run tag if this is a new GPU shell, inspect GPU ownership, and then run:
+matrix, model ID, `BACKBONE_REVISION`, and `BACKBONE_TAG`.
+
+Do not install GPTQModel into the vLLM service environment. GPTQModel 7.3.6
+requires protobuf 7 while the CUDA CUTLASS packages installed by vLLM 0.28.0
+require protobuf 6. Make a same-filesystem hard-link snapshot after the service
+run, then specialize the snapshot for B4. Always invoke pip through the
+snapshot's Python because copied pip entry-point shebangs still name the source
+environment:
+
+```bash
+cp -al /path/to/lad-rg-venv /path/to/lad-rg-b4-venv
+B4_PY=/path/to/lad-rg-b4-venv/bin/python
+"$B4_PY" -m pip install "cmake==3.31.10" "wheel==0.46.3"
+"$B4_PY" -m pip install --no-build-isolation "PyPcre==0.6.2"
+"$B4_PY" -m pip install "gptqmodel==7.3.6"
+"$B4_PY" -m pip uninstall -y vllm nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu13 nvidia-cutlass-dsl-libs-cu12 tokenspeed-mla quack-kernels flashinfer-python
+"$B4_PY" -m pip check
+```
+
+The final command must report no broken requirements. The original service
+environment must independently continue to pass its own `python -m pip check`.
+Re-export the same Qwen run tag if this is a new GPU shell, inspect GPU
+ownership, and then run the probe with the B4 Python:
 
 ```bash
 export BACKBONE_TAG="<same-qwen-backbone-tag>"
 nvidia-smi
-python logit_gap_probe.py --confirm-vllm-stopped --revision "$BACKBONE_REVISION" --backbone-tag "$BACKBONE_TAG" --input-root results_multiseed --output-root predictions_multiseed --batch-size 8 --bootstrap-iterations 10000
+"$B4_PY" logit_gap_probe.py --confirm-vllm-stopped --revision "$BACKBONE_REVISION" --backbone-tag "$BACKBONE_TAG" --input-root results_multiseed --output-root predictions_multiseed --batch-size 8 --bootstrap-iterations 10000
 ```
 
-Invoke the same pinned environment shown above; do not run B4 until both
-`python -c "import accelerate"` and `pip check` succeed. The committed outputs are
+Do not run B4 until the B4 Python can import `accelerate` and `gptqmodel`, both
+environment checks pass, and an eight-prompt raw-logit forward check succeeds.
+The committed outputs are
 `predictions_multiseed/logit_gap__<BACKBONE_TAG>.jsonl` and
 `predictions_multiseed/logit_gap__<BACKBONE_TAG>__aggregate.json`; the aggregate
 is installed last and commits the exact JSONL hash and record count.
