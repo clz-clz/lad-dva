@@ -82,8 +82,20 @@ D:/py/Anaconda3/python.exe run_multiseed.py --official --size 200 --ratios 0.15 
 
 Resolve the exact Hugging Face commit before launch. `BACKBONE_REVISION` must
 be a 40-hex commit, not `main`, a branch, a tag, or a short hash. On the rented
-Linux GPU host, launch the already-installed vLLM from that immutable revision
-and serve the same synthetic identity the client records:
+Linux GPU host, use a dedicated environment with the launch-tested runtime.
+`accelerate` is required later by the B4 probe's Transformers `device_map`:
+
+```bash
+python3 -m venv /path/to/lad-rg-venv
+source /path/to/lad-rg-venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "vllm==0.28.0" "accelerate==1.14.0"
+python -m pip check
+```
+
+Keep that environment activated so its `ninja` executable remains on `PATH`.
+Launch vLLM from the immutable revision and serve the same synthetic identity
+the client records:
 
 ```bash
 export BACKBONE_REVISION="<40-hex-qwen-commit>"
@@ -96,11 +108,14 @@ vllm serve Qwen/Qwen3-32B-AWQ \
   --api-key "$VLLM_API_KEY" \
   --quantization awq \
   --dtype half \
-  --enable-reasoning \
   --reasoning-parser qwen3 \
   --max-model-len 32768 \
   --gpu-memory-utilization 0.95
 ```
+
+vLLM 0.28.0 has no server-level `--enable-reasoning` option. The committed
+adapter enables Qwen thinking per request with `chat_template_kwargs` and uses
+`--reasoning-parser qwen3` for the server-side parser.
 
 Keep vLLM bound to loopback. On the Windows experiment host, open the SSH
 tunnel in a dedicated terminal and leave it running:
@@ -168,8 +183,8 @@ nvidia-smi
 python logit_gap_probe.py --confirm-vllm-stopped --revision "$BACKBONE_REVISION" --backbone-tag "$BACKBONE_TAG" --input-root results_multiseed --output-root predictions_multiseed --batch-size 8 --bootstrap-iterations 10000
 ```
 
-Invoke the GPU host's pinned Python environment if `python` is not already that
-interpreter. The committed outputs are
+Invoke the same pinned environment shown above; do not run B4 until both
+`python -c "import accelerate"` and `pip check` succeed. The committed outputs are
 `predictions_multiseed/logit_gap__<BACKBONE_TAG>.jsonl` and
 `predictions_multiseed/logit_gap__<BACKBONE_TAG>__aggregate.json`; the aggregate
 is installed last and commits the exact JSONL hash and record count.
