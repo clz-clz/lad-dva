@@ -7,6 +7,7 @@ import pytest
 import multi_agent_v2
 from metrics import compute_ser
 from run_multiseed import CONFIGURATIONS
+from live_backbone import LiveBackboneResult
 
 
 REVISION = "a" * 40
@@ -17,6 +18,7 @@ def _provider_settings():
     return {
         "provider": "vllm", "model": "Qwen/Qwen3-32B-AWQ",
         "served_model": SERVED_MODEL, "revision": REVISION,
+        "structured_api": "chat-completions-json-schema",
     }
 
 
@@ -272,9 +274,6 @@ def test_ror_reasoner_malformed_response_falls_back_to_gated_candidate_vote(monk
 def test_ror_reports_not_triggered_without_calling_provider(monkeypatch):
     monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
 
-    def should_not_run(stage, payload):
-        raise AssertionError("RoR provider must not run without gated proposals")
-
     result = multi_agent_v2.ror_node(
         _state(
             tokens=["arrived"],
@@ -282,7 +281,9 @@ def test_ror_reports_not_triggered_without_calling_provider(monkeypatch):
             candidate_paths=[["O"], ["O"]],
             rag_weights=[0.5, 0.5],
             official=True,
-            ror_reasoner=should_not_run,
+            structured_requester=lambda *_: (_ for _ in ()).throw(
+                AssertionError("RoR provider must not run without gated proposals")
+            ),
         )
     )
 
@@ -295,7 +296,7 @@ def test_ror_live_empty_span_response_rejects_all_deterministic_proposals(monkey
     monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
     calls = []
 
-    def reasoner(stage, payload):
+    def structured_requester(stage, payload):
         calls.append(stage)
         return {"spans": []}
 
@@ -306,11 +307,11 @@ def test_ror_live_empty_span_response_rejects_all_deterministic_proposals(monkey
             candidate_paths=[["O"], ["B-PER"]],
             rag_weights=[0.5, 0.5],
             official=True,
-            ror_reasoner=reasoner,
+            structured_requester=structured_requester,
         )
     )
 
-    assert calls == ["span_detection"]
+    assert calls == ["ror_span_detection"]
     assert result["ror_proposals"] == {}
     assert result["ror_reasoning"] == {"source": "live", "spans": []}
     assert result["provider_metadata"]["ror"][0]["status"] == "live"
@@ -334,7 +335,7 @@ def test_official_ror_missing_failed_or_malformed_callback_raises(monkeypatch, r
                 candidate_paths=[["O"], ["B-PER"]],
                 rag_weights=[0.5, 0.5],
                 official=True,
-                ror_reasoner=reasoner,
+                structured_requester=reasoner,
             )
         )
 
@@ -342,8 +343,8 @@ def test_official_ror_missing_failed_or_malformed_callback_raises(monkeypatch, r
 def test_official_ror_rejects_boolean_offsets_in_type_response(monkeypatch):
     monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
 
-    def reasoner(stage, payload):
-        if stage == "span_detection":
+    def structured_requester(stage, payload):
+        if stage == "ror_span_detection":
             return {"spans": [{"start": 0, "end": 1}]}
         return {"types": [{"start": False, "end": 1, "type": "PER"}]}
 
@@ -355,7 +356,7 @@ def test_official_ror_rejects_boolean_offsets_in_type_response(monkeypatch):
                 candidate_paths=[["O"], ["B-PER"]],
                 rag_weights=[0.5, 0.5],
                 official=True,
-                ror_reasoner=reasoner,
+                structured_requester=structured_requester,
             )
         )
 
@@ -468,19 +469,21 @@ def test_gasd_r_decoder_error_falls_back_to_gasd_g(monkeypatch):
 
 @pytest.mark.parametrize("variant", ["r", "both"])
 @pytest.mark.parametrize(
-    "decoder",
+    "structured_requester",
     [
         None,
         lambda payload: (_ for _ in ()).throw(RuntimeError("provider down")),
-        lambda payload: {"tag_scores": [{"B-NOT-IN-ONTOLOGY": 2.0}]},
-        lambda payload: {
+        lambda stage, payload: {"tag_scores": [{"B-NOT-IN-ONTOLOGY": 2.0}]},
+        lambda stage, payload: {
             "reason": "inconsistent",
             "tags": ["B-NOT-IN-ONTOLOGY"],
             "tag_scores": [{"B-PER": 2.0}],
         },
     ],
 )
-def test_official_gasd_reason_variants_fail_closed(monkeypatch, variant, decoder):
+def test_official_gasd_reason_variants_fail_closed(
+    monkeypatch, variant, structured_requester
+):
     monkeypatch.setattr(multi_agent_v2, "_omega_weights", lambda tokens, dataset_name: [1.0])
     with pytest.raises(Exception):
         multi_agent_v2.gasd_node(
@@ -492,7 +495,7 @@ def test_official_gasd_reason_variants_fail_closed(monkeypatch, variant, decoder
                 rag_weights=[0.5, 0.5],
                 ror_proposals={0: "PER"},
                 gasd_variant=variant,
-                gasd_reason_decoder=decoder,
+                structured_requester=structured_requester,
                 official=True,
             )
         )
@@ -589,26 +592,29 @@ def test_official_candidate_evidence_exposes_stage_separated_launch_fields(monke
 
 
 def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(monkeypatch):
-    class _Message:
-        def __init__(self, content, stage):
-            self.content = content
-            self.response_metadata = {
-                "model_name": "served-model",
-                "system_fingerprint": f"fp-{stage}",
-                "token_usage": {"prompt_tokens": 5, "completion_tokens": 2},
-            }
-            self.usage_metadata = None
-
-    class _CoderLLM:
-        def invoke(self, prompt, **kwargs):
-            return _Message('{"tags":["O","O"]}', "coder")
-
-    class _ReviewerLLM:
-        def invoke(self, prompt, **kwargs):
-            return _Message('{"weights":[0.75,0.25]}', "reviewer")
+    def structured_requester(stage, payload):
+        return LiveBackboneResult(
+            {"tags": ["O", "O"]}
+            if stage.startswith("coder_path_")
+            else {"weights": [0.75, 0.25]},
+            {
+                "stage": stage,
+                "status": "live",
+                "provider": "vllm",
+                "model": "Qwen/Qwen3-32B-AWQ",
+                "served_model": SERVED_MODEL,
+                "revision": REVISION,
+                "response_model": SERVED_MODEL,
+                "structured_api": "chat-completions-json-schema",
+                "response_status": "completed",
+                "finish_reason": "stop",
+                "incomplete_reason": None,
+                "system_fingerprint": f"fp-{stage.split('_')[0]}",
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2},
+            },
+        )
 
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
-    monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
     coded = asyncio.run(
         multi_agent_v2.coder_node(
             _state(
@@ -616,7 +622,8 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
                 tokens=["Alice", "arrived"],
                 dirty_tags=["O", "O"],
                 candidate_paths=[],
-                provider_settings={"provider": "vllm", "revision": "rev-1"},
+                structured_requester=structured_requester,
+                provider_settings=_provider_settings(),
                 provider_metadata={"coder": [], "reviewer": [], "ror": [], "gasd": []},
             )
         )
@@ -625,13 +632,13 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
     assert coded["provider_metadata"]["reviewer"] == []
     assert coded["provider_metadata"]["coder"][0]["system_fingerprint"] == "fp-coder"
 
-    monkeypatch.setattr(multi_agent_v2, "llm", _ReviewerLLM())
     reviewed = asyncio.run(
         multi_agent_v2.reviewer_node(
             _state(
                 official=True,
                 candidate_paths=[["O", "O"], ["B-PER", "O"]],
-                provider_settings={"provider": "vllm", "revision": "rev-1"},
+                structured_requester=structured_requester,
+                provider_settings=_provider_settings(),
                 provider_metadata=coded["provider_metadata"],
             )
         )
@@ -645,17 +652,10 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
 
 
 def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monkeypatch):
-    class _Message:
-        content = '{"tags":["O"]}'
-        response_metadata = {}
-        usage_metadata = None
-
-    class _CoderLLM:
-        def invoke(self, prompt, **kwargs):
-            return _Message()
+    def structured_requester(stage, payload):
+        return {"tags": ["O"]}
 
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
-    monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
     result = asyncio.run(
         multi_agent_v2.coder_node(
             _state(
@@ -664,6 +664,7 @@ def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monke
                 tokens=["Alice"],
                 dirty_tags=["B-PER"],
                 candidate_paths=[],
+                structured_requester=structured_requester,
                 provider_metadata={"coder": [], "reviewer": [], "ror": [], "gasd": []},
             )
         )
@@ -679,24 +680,21 @@ def test_official_coder_uses_provider_structured_output_with_exact_tag_count(
 ):
     calls = []
 
-    class _Message:
-        content = '{"tags":["O","O"]}'
-        response_metadata = {}
-        usage_metadata = None
-
-    class _CoderLLM:
-        def invoke(self, prompt, **kwargs):
-            calls.append((prompt, kwargs))
-            return _Message()
-
     settings = {
         "provider": provider,
         "model": "deepseek-v4-flash" if provider == "deepseek" else "qwen",
         "served_model": "deepseek-v4-flash" if provider == "deepseek" else SERVED_MODEL,
         "revision": None if provider == "deepseek" else REVISION,
+        "structured_api": (
+            "responses-json-schema"
+            if provider == "deepseek" else "chat-completions-json-schema"
+        ),
     }
+    def structured_requester(stage, payload):
+        calls.append((stage, payload))
+        return {"tags": ["O", "O"]}
+
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
-    monkeypatch.setattr(multi_agent_v2, "coder_llm", _CoderLLM())
 
     result = asyncio.run(
         multi_agent_v2.coder_node(
@@ -707,26 +705,30 @@ def test_official_coder_uses_provider_structured_output_with_exact_tag_count(
                 dirty_tags=["O", "O"],
                 candidate_paths=[],
                 provider_settings=settings,
+                structured_requester=structured_requester,
             )
         )
     )
 
     assert result["candidate_paths"] == [["O", "O"]] * 3
     assert len(calls) == 3
-    for prompt, kwargs in calls:
-        assert '"tags"' in prompt
-        assert "[null, null]" in prompt
-        response_format = kwargs["response_format"]
-        if provider == "deepseek":
-            assert response_format == {"type": "json_object"}
-        else:
-            tag_schema = response_format["json_schema"]["schema"]["properties"]["tags"]
-            assert response_format["type"] == "json_schema"
-            assert tag_schema["minItems"] == tag_schema["maxItems"] == 2
-            assert set(tag_schema["items"]["enum"]) == {
-                "O", "B-PER", "I-PER", "B-LOC", "I-LOC",
-                "B-ORG", "I-ORG", "B-MISC", "I-MISC",
-            }
+    assert [stage for stage, _payload in calls] == [
+        "coder_path_1", "coder_path_2", "coder_path_5"
+    ]
+    for stage, payload in calls:
+        assert payload["name"] == f"lad_rg_{stage}"
+        assert payload["temperature"] == 1.0
+        assert payload["enable_thinking"] is True
+        tag_schema = payload["schema"]["properties"]["tags"]
+        assert tag_schema["minItems"] == tag_schema["maxItems"] == 2
+        assert set(tag_schema["items"]["enum"]) == {
+            "O", "B-PER", "I-PER", "B-LOC", "I-LOC",
+            "B-ORG", "I-ORG", "B-MISC", "I-MISC",
+        }
+    assert settings["structured_api"] == (
+        "responses-json-schema"
+        if provider == "deepseek" else "chat-completions-json-schema"
+    )
 
 
 @pytest.mark.parametrize(
@@ -749,24 +751,21 @@ def test_official_reviewer_uses_provider_structured_output_with_exact_weight_cou
 ):
     calls = []
 
-    class _Message:
-        content = '{"weights":[0.8,0.2]}'
-        response_metadata = {}
-        usage_metadata = None
-
-    class _ReviewerLLM:
-        def invoke(self, prompt, **kwargs):
-            calls.append((prompt, kwargs))
-            return _Message()
-
     settings = {
         "provider": provider,
         "model": "deepseek-v4-flash" if provider == "deepseek" else "qwen",
         "served_model": "deepseek-v4-flash" if provider == "deepseek" else SERVED_MODEL,
         "revision": None if provider == "deepseek" else REVISION,
+        "structured_api": (
+            "responses-json-schema"
+            if provider == "deepseek" else "chat-completions-json-schema"
+        ),
     }
+    def structured_requester(stage, payload):
+        calls.append((stage, payload))
+        return {"weights": [0.8, 0.2]}
+
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
-    monkeypatch.setattr(multi_agent_v2, "llm", _ReviewerLLM())
 
     result = asyncio.run(
         multi_agent_v2.reviewer_node(
@@ -774,24 +773,23 @@ def test_official_reviewer_uses_provider_structured_output_with_exact_weight_cou
                 official=True,
                 candidate_paths=[["O", "O"], ["B-PER", "O"]],
                 provider_settings=settings,
+                structured_requester=structured_requester,
             )
         )
     )
 
     assert result["rag_weights"] == [0.8, 0.2]
     assert len(calls) == 1
-    prompt, kwargs = calls[0]
-    assert '"weights"' in prompt
-    response_format = kwargs["response_format"]
-    if provider == "deepseek":
-        assert response_format == {"type": "json_object"}
-    else:
-        weight_schema = response_format["json_schema"]["schema"]["properties"]["weights"]
-        assert response_format["type"] == "json_schema"
-        assert weight_schema["minItems"] == weight_schema["maxItems"] == 2
-        assert weight_schema["items"] == {
-            "type": "number", "minimum": 0.0, "maximum": 1.0,
-        }
+    stage, payload = calls[0]
+    assert stage == "reviewer"
+    assert payload["name"] == "lad_rg_reviewer"
+    assert payload["temperature"] == 0.7
+    assert payload["enable_thinking"] is True
+    weight_schema = payload["schema"]["properties"]["weights"]
+    assert weight_schema["minItems"] == weight_schema["maxItems"] == 2
+    assert weight_schema["items"] == {
+        "type": "number", "minimum": 0.0, "maximum": 1.0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -836,7 +834,7 @@ def test_official_pipeline_rejects_any_reported_fallback(monkeypatch):
 
 @pytest.mark.parametrize("variant", ["r", "both"])
 def test_official_disabled_gasd_reason_variant_still_requires_live_decoder(variant):
-    with pytest.raises(RuntimeError, match="live gasd_reason_decoder"):
+    with pytest.raises(RuntimeError, match="structured_requester"):
         multi_agent_v2.gasd_node(
             _state(
                 official=True,
@@ -967,3 +965,103 @@ def test_gasd_falls_back_to_legal_base_without_candidates_or_on_decode_error(mon
     )["current_tags"]
     assert failed_decode == ["B-PER", "O"]
     assert compute_ser([failed_decode]) == 0.0
+
+
+def test_official_coder_and_reviewer_use_only_structured_requester(monkeypatch):
+    calls = []
+
+    def structured_requester(stage, payload):
+        calls.append((stage, payload))
+        metadata = {
+            "stage": stage,
+            "status": "live",
+            "provider": "vllm",
+            "model": "Qwen/Qwen3-32B-AWQ",
+            "served_model": SERVED_MODEL,
+            "revision": REVISION,
+            "response_model": SERVED_MODEL,
+            "structured_api": "chat-completions-json-schema",
+            "response_status": "completed",
+            "finish_reason": "stop",
+            "incomplete_reason": None,
+            "system_fingerprint": "fp-test",
+            "usage": {},
+        }
+        if stage.startswith("coder_path_"):
+            return LiveBackboneResult({"tags": ["O", "O"]}, metadata)
+        assert stage == "reviewer"
+        return LiveBackboneResult({"weights": [0.8, 0.2]}, metadata)
+
+    class _ForbiddenLLM:
+        def invoke(self, *args, **kwargs):
+            raise AssertionError("official Coder/Reviewer must not touch global LLMs")
+
+    monkeypatch.setattr(multi_agent_v2, "coder_llm", _ForbiddenLLM())
+    monkeypatch.setattr(multi_agent_v2, "llm", _ForbiddenLLM())
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+
+    coded = asyncio.run(
+        multi_agent_v2.coder_node(
+            _state(
+                official=True,
+                tokens=["Alice", "arrived"],
+                dirty_tags=["O", "O"],
+                candidate_paths=[],
+                structured_requester=structured_requester,
+                provider_metadata={stage: [] for stage in ("coder", "reviewer", "ror", "gasd")},
+            )
+        )
+    )
+    reviewed = asyncio.run(
+        multi_agent_v2.reviewer_node(
+            _state(
+                official=True,
+                candidate_paths=[["O", "O"], ["B-PER", "O"]],
+                structured_requester=structured_requester,
+                provider_metadata=coded["provider_metadata"],
+            )
+        )
+    )
+
+    assert [stage for stage, _payload in calls] == [
+        "coder_path_1", "coder_path_2", "coder_path_5", "reviewer"
+    ]
+    assert all(
+        {"name", "schema", "messages", "temperature", "enable_thinking"}
+        <= set(payload)
+        for _stage, payload in calls
+    )
+    assert calls[0][1]["schema"]["properties"]["tags"]["minItems"] == 2
+    assert reviewed["rag_weights"] == [0.8, 0.2]
+    assert reviewed["provider_metadata"]["reviewer"][0]["structured_api"] == (
+        "chat-completions-json-schema"
+    )
+
+
+@pytest.mark.parametrize("node", [multi_agent_v2.coder_node, multi_agent_v2.reviewer_node])
+def test_official_coder_and_reviewer_fail_immediately_without_structured_requester(node):
+    state = _state(official=True)
+    if node is multi_agent_v2.coder_node:
+        state.update({"tokens": ["Alice"], "dirty_tags": ["O"], "candidate_paths": []})
+    with pytest.raises(RuntimeError, match="structured_requester"):
+        asyncio.run(node(state))
+
+
+def test_official_coder_rejects_68_69_length_mismatch_without_normalization(monkeypatch):
+    def structured_requester(stage, payload):
+        return {"tags": ["O"] * 69}
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+
+    with pytest.raises(ValueError, match="exactly one tag per token"):
+        asyncio.run(
+            multi_agent_v2.coder_node(
+                _state(
+                    official=True,
+                    tokens=["token"] * 68,
+                    dirty_tags=["O"] * 68,
+                    candidate_paths=[],
+                    structured_requester=structured_requester,
+                )
+            )
+        )

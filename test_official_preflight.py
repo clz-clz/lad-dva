@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 
 import official_preflight
-from live_backbone import LiveBackboneSettings, OpenAICompatibleLADRGAdapter
+from live_backbone import LiveBackboneResult, LiveBackboneSettings, OpenAICompatibleLADRGAdapter
 
 
 DATASETS = ["msra", "conll2003", "wnut17", "fewnerd", "ontonotes5"]
@@ -303,7 +303,7 @@ def test_live_preflight_blocks_qwen_gasd_length_error():
     assert report["ok"] is False
     assert any(
         item["code"] == "live_validation_failed"
-        and "exactly 3 tags" in item["message"]
+        and "exactly 3 items" in item["message"]
         for item in report["blockers"]
     )
 
@@ -431,6 +431,79 @@ def test_live_preflight_rejects_deepseek_reason_configs_before_network():
 
     assert report["ok"] is False
     assert any("GASD-R/Both" in item["message"] for item in report["blockers"])
+
+
+def test_deepseek_live_preflight_probes_69_item_responses_schema():
+    settings = LiveBackboneSettings(
+        provider="deepseek", model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1", api_key="test",
+    )
+    calls = []
+    identity = {
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "served_model": "deepseek-v4-flash",
+        "revision": None,
+        "structured_api": "responses-json-schema",
+    }
+
+    class Adapter:
+        def __init__(self, configured):
+            assert configured is settings
+
+        def provider_metadata(self):
+            return dict(identity)
+
+        def structured_requester(self, stage, payload):
+            calls.append((stage, payload))
+            return LiveBackboneResult(
+                {"tags": ["O"] * 69},
+                {
+                    **identity,
+                    "stage": stage,
+                    "status": "live",
+                    "response_model": settings.served_model,
+                    "response_status": "completed",
+                    "finish_reason": None,
+                    "incomplete_reason": None,
+                    "system_fingerprint": None,
+                    "usage": {},
+                },
+            )
+
+        def ror_reasoner(self, stage, payload):
+            return LiveBackboneResult(
+                {"spans": []} if stage == "span_detection" else {"types": []},
+                {
+                    **identity,
+                    "stage": "ror_span_detection" if stage == "span_detection" else "ror_type_assignment",
+                    "status": "live",
+                    "response_model": settings.served_model,
+                    "response_status": "completed",
+                    "finish_reason": None,
+                    "incomplete_reason": None,
+                    "system_fingerprint": None,
+                    "usage": {},
+                },
+            )
+
+        def close(self):
+            pass
+
+    report = official_preflight.run_live_preflight(
+        settings=settings,
+        models_fetcher=lambda _: [{"id": settings.served_model}],
+        adapter_factory=Adapter,
+    )
+
+    assert report["ok"] is True
+    assert calls and calls[0][0] == "capability_probe_69"
+    probe_schema = calls[0][1]["schema"]["properties"]["tags"]
+    assert probe_schema["minItems"] == probe_schema["maxItems"] == 69
+    assert set(probe_schema["items"]["enum"]) == {
+        "O", "B-PER", "I-PER", "B-LOC", "I-LOC", "B-ORG", "I-ORG",
+        "B-MISC", "I-MISC",
+    }
 
 
 def test_static_cli_converts_internal_failure_to_json_only(capsys, monkeypatch, tmp_path):

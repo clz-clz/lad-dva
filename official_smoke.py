@@ -235,6 +235,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "model": settings.model,
                 "served_model": settings.served_model,
                 "revision": settings.revision,
+                "structured_api": settings.structured_api,
                 "endpoint_origin": runner._endpoint_origin(settings.base_url),
                 "tag": tag,
                 "system_fingerprints": fingerprints,

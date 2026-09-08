@@ -362,6 +362,7 @@ def run_live_preflight(
             "model": settings.model,
             "served_model": settings.served_model,
             "revision": settings.revision,
+            "structured_api": settings.structured_api,
         }
         adapter_identity = adapter.provider_metadata()
         if (not isinstance(adapter_identity, Mapping)
@@ -370,6 +371,64 @@ def run_live_preflight(
             raise ValueError("live adapter identity does not match official settings")
         tokens = ["Alice", "met", "Paris"]
         valid_types = ["PER", "LOC", "ORG", "MISC"]
+        evidence = []
+        if settings.provider == "deepseek":
+            structured_requester = getattr(adapter, "structured_requester", None)
+            if not callable(structured_requester):
+                raise ValueError(
+                    "DeepSeek live preflight requires the Responses structured_requester"
+                )
+            valid_tags = ["O"] + [
+                f"{prefix}-{entity_type}"
+                for entity_type in valid_types
+                for prefix in ("B", "I")
+            ]
+            probe_schema = {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["tags"],
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "minItems": 69,
+                        "maxItems": 69,
+                        "items": {"type": "string", "enum": valid_tags},
+                    },
+                },
+            }
+            probe = structured_requester(
+                "capability_probe_69",
+                {
+                    "name": "lad_rg_capability_probe_69",
+                    "schema": probe_schema,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return only the requested exact-length JSON object.",
+                        },
+                        {
+                            "role": "user",
+                            "content": "Emit exactly 69 ontology-valid O tags.",
+                        },
+                    ],
+                    "temperature": 0.0,
+                    "enable_thinking": False,
+                },
+            )
+            if not isinstance(probe, Mapping) or set(probe) != {"tags"}:
+                raise ValueError("DeepSeek 69-item Responses probe returned an invalid mapping")
+            probe_tags = probe.get("tags")
+            if (not isinstance(probe_tags, list) or len(probe_tags) != 69
+                    or any(tag not in valid_tags for tag in probe_tags)):
+                raise ValueError(
+                    "DeepSeek 69-item Responses probe did not return exactly 69 ontology tags"
+                )
+            checks["deepseek_responses_schema_probe"] = {
+                "stage": "capability_probe_69",
+                "tag_count": len(probe_tags),
+                "structured_api": settings.structured_api,
+            }
+            evidence.append((probe, "capability_probe_69"))
         spans = adapter.ror_reasoner(
             "span_detection", {"tokens": tokens, "valid_types": valid_types, "dirty_tags": ["O"] * 3},
         )
@@ -378,7 +437,7 @@ def run_live_preflight(
                                 "dirty_tags": ["O"] * 3, "spans": spans["spans"]},
         )
         checks["ror"] = {"spans": spans["spans"], "types": typed["types"]}
-        evidence = [(spans, "ror_span_detection"), (typed, "ror_type_assignment")]
+        evidence.extend([(spans, "ror_span_detection"), (typed, "ror_type_assignment")])
         if settings.provider == "vllm":
             valid_tags = ["O"] + [
                 f"{prefix}-{entity_type}" for entity_type in valid_types for prefix in ("B", "I")
@@ -396,6 +455,8 @@ def run_live_preflight(
                     or metadata.get("stage") != expected_stage
                     or metadata.get("status") != "live"
                     or metadata.get("response_model") != settings.served_model
+                    or metadata.get("structured_api") != settings.structured_api
+                    or metadata.get("response_status") != "completed"
                     or any(metadata.get(key) != value
                            for key, value in expected_identity.items())):
                 raise ValueError(

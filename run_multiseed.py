@@ -63,7 +63,7 @@ OFFICIAL_REQUEST_TIMEOUT = 600.0
 OFFICIAL_SAMPLE_SIZE = 200
 PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
-OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v1"
+OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v2"
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
 DATASET_ENTITY_TYPES = {
     "msra": ["PER", "LOC", "ORG"],
@@ -282,6 +282,7 @@ def _build_official_manifest(settings, tag: str, git_sha: str,
             "model": settings.model,
             "served_model": settings.served_model,
             "revision": settings.revision,
+            "structured_api": settings.structured_api,
             "immutable_revision": settings.revision or settings.model,
             "endpoint_origin": _endpoint_origin(settings.base_url),
             "tag": tag,
@@ -295,7 +296,9 @@ def _build_official_manifest(settings, tag: str, git_sha: str,
             "noise_types": list(NOISE_TYPES),
         },
         "dependencies": _dependency_versions(),
-        "decoder_constants": official_manifest_decoder_constants(request_timeout),
+        "decoder_constants": official_manifest_decoder_constants(
+            request_timeout, structured_api=settings.structured_api
+        ),
     }
 
 
@@ -382,7 +385,8 @@ def _validate_official_provider_evidence(
     if set(evidence) != {"coder", "reviewer", "ror", "gasd"}:
         raise RuntimeError("official provider evidence must contain exactly four stages")
     expected_identity = {
-        key: identity.get(key) for key in ("provider", "model", "served_model", "revision")
+        key: identity.get(key)
+        for key in ("provider", "model", "served_model", "revision", "structured_api")
     }
 
     provider = expected_identity["provider"]
@@ -396,10 +400,14 @@ def _validate_official_provider_evidence(
                 or served_model != f"{model}@{revision}"):
             raise RuntimeError("official provider identity is not immutable vLLM/Qwen")
     elif provider == "deepseek":
-        if model != "deepseek-v4-flash" or served_model != model:
+        if (model != "deepseek-v4-flash" or served_model != model
+                or expected_identity["structured_api"] != "responses-json-schema"):
             raise RuntimeError("official provider identity is not exact DeepSeek")
     else:
         raise RuntimeError("official provider identity has an invalid provider")
+    if (provider == "vllm"
+            and expected_identity["structured_api"] != "chat-completions-json-schema"):
+        raise RuntimeError("official provider identity has an invalid vLLM structured API")
 
     def records(stage: str, allowed_stages: set[str]) -> list[Mapping[str, Any]]:
         value = evidence.get(stage)
@@ -416,6 +424,10 @@ def _validate_official_provider_evidence(
                 if record.get("response_model") != expected_identity["served_model"]:
                     raise RuntimeError(
                         f"official provider response identity mismatch for {stage}"
+                    )
+                if record.get("response_status") != "completed":
+                    raise RuntimeError(
+                        f"official provider response status is not completed for {stage}"
                     )
             elif record.get("response_model") is not None:
                 raise RuntimeError(f"non-live official evidence cannot claim a response for {stage}")
@@ -826,8 +838,12 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             if launch_strict:
                 cfg.update({
                     "official": True,
-                    "ror_reasoner": adapter.ror_reasoner,
-                    "gasd_reason_decoder": adapter.gasd_reason_decoder,
+                    "structured_requester": getattr(adapter, "structured_requester", None),
+                    # Retain the stage-specific adapter attributes for
+                    # preflight and compatibility callers; official graph
+                    # stages use structured_requester.
+                    "ror_reasoner": getattr(adapter, "ror_reasoner", None),
+                    "gasd_reason_decoder": getattr(adapter, "gasd_reason_decoder", None),
                     "provider_metadata": dict(provider_identity),
                 })
             # Log the Coder candidate pool for the main methods only (oracle /

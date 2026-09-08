@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import os
 import json
@@ -8,7 +9,7 @@ import math
 import threading
 from collections import Counter
 from pathlib import Path
-from typing import Annotated, Any, Callable, Mapping, TypedDict, List, Optional, Tuple
+from typing import Annotated, Any, Callable, Mapping, TypedDict, List, Optional, Sequence, Tuple
 from dotenv import load_dotenv
 import argparse
 
@@ -144,6 +145,9 @@ class State(TypedDict):
     gasd_reason_decoder: Optional[
         Callable[[Mapping[str, Any]], Mapping[str, Any]]
     ]
+    structured_requester: Optional[
+        Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
+    ]
     gasd_variant_requested: str  # terminal evidence: configured decoder variant
     gasd_variant_used: str       # terminal evidence: decoder variant actually used
     official: bool               # fail-closed launch semantics
@@ -204,6 +208,10 @@ def _response_stage_record(response: Any, stage: str,
         "response_model": response_model,
         "system_fingerprint": response_metadata.get("system_fingerprint"),
         "usage": usage,
+        "structured_api": settings.get("structured_api"),
+        "response_status": response_metadata.get("response_status"),
+        "finish_reason": response_metadata.get("finish_reason"),
+        "incomplete_reason": response_metadata.get("incomplete_reason"),
     }
 
 
@@ -220,6 +228,10 @@ def _callback_stage_record(result: Any, stage: str,
         record.setdefault("revision", None)
         record.setdefault("response_model", None)
         record.setdefault("system_fingerprint", None)
+        record.setdefault("structured_api", _plain_mapping(provider_settings).get("structured_api"))
+        record.setdefault("response_status", None)
+        record.setdefault("finish_reason", None)
+        record.setdefault("incomplete_reason", None)
         record["usage"] = _plain_mapping(record.get("usage"))
         return record
     return _response_stage_record(None, stage, provider_settings)
@@ -238,6 +250,10 @@ def _stage_status_record(stage: str, status: str,
         "response_model": None,
         "system_fingerprint": None,
         "usage": {},
+        "structured_api": settings.get("structured_api"),
+        "response_status": None,
+        "finish_reason": None,
+        "incomplete_reason": None,
     }
 
 
@@ -248,31 +264,17 @@ def _with_stage_records(state: Mapping[str, Any], stage: str,
     return evidence
 
 
-def _official_response_format(name: str, schema: Mapping[str, Any],
-                              provider_settings: Any) -> dict[str, Any]:
-    provider = str(_plain_mapping(provider_settings).get("provider", "")).lower()
-    if provider == "deepseek":
-        return {"type": "json_object"}
-    if provider == "vllm":
-        return {
-            "type": "json_schema",
-            "json_schema": {
-                "name": name,
-                "strict": True,
-                "schema": dict(schema),
-            },
-        }
-    raise ValueError("official structured output requires provider deepseek or vllm")
-
-
 def _official_tag_path(content: Any, expected_length: int,
                        valid_tags: set[str]) -> List[str]:
-    if not isinstance(content, str):
-        raise ValueError("official Coder response content must be a JSON string")
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("official Coder response must be valid JSON") from exc
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("official Coder response must be valid JSON") from exc
+    elif isinstance(content, Mapping):
+        payload = dict(content)
+    else:
+        raise ValueError("official Coder response must be a JSON mapping")
     if not isinstance(payload, Mapping) or set(payload) != {"tags"}:
         raise ValueError("official Coder response must match the {'tags': [...]} schema")
     path = payload["tags"]
@@ -289,12 +291,15 @@ def _official_tag_path(content: Any, expected_length: int,
 
 
 def _official_reviewer_weights(content: Any, expected_length: int) -> List[float]:
-    if not isinstance(content, str):
-        raise ValueError("official Reviewer response content must be a JSON string")
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("official Reviewer response must be valid JSON") from exc
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("official Reviewer response must be valid JSON") from exc
+    elif isinstance(content, Mapping):
+        payload = dict(content)
+    else:
+        raise ValueError("official Reviewer response must be a JSON mapping")
     if not isinstance(payload, Mapping) or set(payload) != {"weights"}:
         raise ValueError("official Reviewer response must match the {'weights': [...]} schema")
     values = payload["weights"]
@@ -303,6 +308,49 @@ def _official_reviewer_weights(content: Any, expected_length: int) -> List[float
                        for value in values)):
         raise ValueError("official Reviewer response must contain one score in [0, 1] per path")
     return [float(value) for value in values]
+
+
+def _require_structured_requester(
+    state: Mapping[str, Any], stage: str
+) -> Callable[[str, Mapping[str, Any]], Mapping[str, Any]]:
+    requester = state.get("structured_requester")
+    if not callable(requester):
+        raise RuntimeError(
+            f"official {stage} requires a live structured_requester callback"
+        )
+    return requester
+
+
+async def _invoke_structured_requester(
+    requester: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
+    stage: str,
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    # The cached OpenAI adapter exposes the synchronous SDK client.  Keep its
+    # transport off the event loop so the runner's sentence/path concurrency
+    # remains effective; async test or custom requesters still work because
+    # invoking an async callable only creates its coroutine here.
+    result = await asyncio.to_thread(requester, stage, payload)
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, Mapping):
+        raise ValueError(f"official {stage} requester returned a non-mapping response")
+    return result
+
+
+def _invoke_structured_requester_sync(
+    requester: Callable[[str, Mapping[str, Any]], Mapping[str, Any]],
+    stage: str,
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    result = requester(stage, payload)
+    if inspect.isawaitable(result):
+        raise RuntimeError(
+            f"official {stage} structured_requester must be synchronous"
+        )
+    if not isinstance(result, Mapping):
+        raise ValueError(f"official {stage} requester returned a non-mapping response")
+    return result
     
 
 def extract_nested_json_list(llm_output: str, expected_paths: int = 5) -> List[List[str]]:
@@ -430,6 +478,9 @@ async def coder_node(state: State):
     dirty_tags = state.get("dirty_tags", [])
     dataset_name = state.get("dataset_name", "conll2003")
     official = bool(state.get("official", False))
+    structured_requester = (
+        _require_structured_requester(state, "Coder") if official else None
+    )
     noise_type = state.get("noise_type", "BT")
     deanchor_atf = state.get("deanchor_atf", False) and noise_type == "ATF"
     valid_tags_str = _format_valid_tags(dataset_name)
@@ -542,6 +593,7 @@ CRITICAL DENOISING POLICY — follow these rules precisely:
         "additionalProperties": False,
     }
     for pidx, pdesc in path_strategies.items():
+        response_kwargs = {}
         if official:
             output_instruction = f"""
 Generate EXACTLY 1 repair path in a JSON object whose only key is "tags".
@@ -550,12 +602,6 @@ Copy this exact-length slot template and replace every null with one valid IOB2 
 never add, remove, merge, split, or reorder slots:
 {json.dumps({"tags": [None] * len(tokens)})}
 Output ONLY that JSON object, no markdown, no explanation."""
-            response_kwargs = {
-                "response_format": _official_response_format(
-                    f"lad_rg_coder_path_{pidx}", coder_schema,
-                    state.get("provider_settings"),
-                )
-            }
         else:
             output_instruction = f"""
 Generate EXACTLY 1 repair path (a JSON list of {len(tokens)} IOB2 tags).
@@ -569,16 +615,38 @@ PATH {pidx} STRATEGY — your ONLY task:
 {output_instruction}"""
         requests.append((pidx, prompt, response_kwargs))
 
-    responses = await asyncio.gather(*[
-        asyncio.to_thread(coder_llm.invoke, prompt, **response_kwargs)
-        for _pidx, prompt, response_kwargs in requests
-    ])
+    if official:
+        responses = await asyncio.gather(*[
+            _invoke_structured_requester(
+                structured_requester,
+                f"coder_path_{strategy_key}",
+                {
+                    "name": f"lad_rg_coder_path_{strategy_key}",
+                    "schema": coder_schema,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a strict LAD-RG Coder. Return only the requested JSON object.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 1.0,
+                    "enable_thinking": True,
+                },
+            )
+            for strategy_key, prompt, _response_kwargs in requests
+        ])
+    else:
+        responses = await asyncio.gather(*[
+            asyncio.to_thread(coder_llm.invoke, prompt, **response_kwargs)
+            for _pidx, prompt, response_kwargs in requests
+        ])
 
     candidate_paths = []
     for (strategy_key, _prompt, _kwargs), response in zip(requests, responses):
         if official:
             try:
-                path = _official_tag_path(response.content, len(tokens), valid_tags)
+                path = _official_tag_path(response, len(tokens), valid_tags)
             except ValueError as exc:
                 raise ValueError(f"official Coder path {strategy_key}: {exc}") from exc
         else:
@@ -586,19 +654,34 @@ PATH {pidx} STRATEGY — your ONLY task:
         candidate_paths.append(path)
 
     coder_records = [
-        _response_stage_record(
-            response, f"coder_path_{strategy_key}", state.get("provider_settings")
+        (
+            _callback_stage_record(
+                response, f"coder_path_{strategy_key}", state.get("provider_settings")
+            )
+            if official
+            else _response_stage_record(
+                response, f"coder_path_{strategy_key}", state.get("provider_settings")
+            )
         )
         for (strategy_key, _prompt, _kwargs), response in zip(requests, responses)
     ]
 
-    # Length normalization
-    candidate_paths = [p[:len(tokens)] + ["O"] * max(0, len(tokens) - len(p)) for p in candidate_paths]
+    if official:
+        if any(not _is_legal_tag_sequence(path) for path in candidate_paths):
+            raise ValueError("official Coder response contains an illegal IOB2 transition")
+    else:
+        # Legacy behavior retains its defensive length and DFA normalization.
+        candidate_paths = [
+            p[:len(tokens)] + ["O"] * max(0, len(tokens) - len(p))
+            for p in candidate_paths
+        ]
 
-    # IOB2语法清洗：每条Coder路径先过DFA修复，保证Reviewer只判边界+类型
+    # IOB2语法清洗：legacy paths先过DFA修复，保证Reviewer只判边界+类型
     ds_name = state.get("dataset_name", "conll2003")
     valid_set = set(DATASET_ENTITY_TYPES.get(ds_name, ["PER", "LOC", "ORG"]))
-    candidate_paths = [enforce_iob2_syntax(p, valid_entity_types=valid_set) for p in candidate_paths]
+    if not official:
+        candidate_paths = [enforce_iob2_syntax(p, valid_entity_types=valid_set)
+                           for p in candidate_paths]
 
     # ---- Lever 1: re-impose correct ATF boundaries, keep model TYPE ----
     # De-anchored paths may drift on structure; ATF boundaries are given/correct,
@@ -980,6 +1063,9 @@ async def reviewer_node(state: State):
     ds_name = state.get("dataset_name", "conll2003")
     use_lads = state.get("use_lads", True)
     official = bool(state.get("official", False))
+    structured_requester = (
+        _require_structured_requester(state, "Reviewer") if official else None
+    )
 
     if not candidate_paths:
         return {"rag_weights": []}
@@ -1026,12 +1112,6 @@ async def reviewer_node(state: State):
             },
             "required": ["weights"],
             "additionalProperties": False,
-        }
-        response_kwargs = {
-            "response_format": _official_response_format(
-                "lad_rg_reviewer", reviewer_schema,
-                state.get("provider_settings"),
-            )
         }
     else:
         reviewer_output_instruction = f"""
@@ -1089,15 +1169,36 @@ async def reviewer_node(state: State):
     {reviewer_output_instruction}
     """
 
-    response = await asyncio.to_thread(llm.invoke, reviewer_prompt, **response_kwargs)
-    rag_weights = (
-        _official_reviewer_weights(response.content, len(candidate_paths))
-        if official
-        else extract_float_weights(response.content, expected_len=len(candidate_paths))
-    )
-    reviewer_record = _response_stage_record(
-        response, "reviewer", state.get("provider_settings")
-    )
+    if official:
+        response = await _invoke_structured_requester(
+            structured_requester,
+            "reviewer",
+            {
+                "name": "lad_rg_reviewer",
+                "schema": reviewer_schema,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a strict LAD-RG Reviewer. Return only the requested JSON object.",
+                    },
+                    {"role": "user", "content": reviewer_prompt},
+                ],
+                "temperature": 0.7,
+                "enable_thinking": True,
+            },
+        )
+        rag_weights = _official_reviewer_weights(response, len(candidate_paths))
+        reviewer_record = _callback_stage_record(
+            response, "reviewer", state.get("provider_settings")
+        )
+    else:
+        response = await asyncio.to_thread(llm.invoke, reviewer_prompt, **response_kwargs)
+        rag_weights = extract_float_weights(
+            response.content, expected_len=len(candidate_paths)
+        )
+        reviewer_record = _response_stage_record(
+            response, "reviewer", state.get("provider_settings")
+        )
     return {
         "rag_weights": rag_weights,
         "provider_metadata": _with_stage_records(
@@ -1335,6 +1436,75 @@ def _official_ror_types(response: Any, spans: List[dict[str, int]],
     return typed, proposals
 
 
+def _official_ror_request(
+    stage: str, payload: Mapping[str, Any], valid_types: Sequence[str]
+) -> dict[str, Any]:
+    if stage == "span_detection":
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["spans"],
+            "properties": {
+                "spans": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["start", "end"],
+                        "properties": {
+                            "start": {"type": "integer"},
+                            "end": {"type": "integer"},
+                        },
+                    },
+                }
+            },
+        }
+        task = "Detect only entity spans using zero-based, end-exclusive offsets."
+        name = "lad_rg_span_detection"
+    else:
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["types"],
+            "properties": {
+                "types": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["start", "end", "type"],
+                        "properties": {
+                            "start": {"type": "integer"},
+                            "end": {"type": "integer"},
+                            "type": {"type": "string", "enum": list(valid_types)},
+                        },
+                    },
+                }
+            },
+        }
+        task = "Assign one ontology type to every supplied span."
+        name = "lad_rg_type_assignment"
+    return {
+        "name": name,
+        "schema": schema,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a strict LAD-RG RoR component. Return only the requested JSON object.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"{task}\nOntology: {json.dumps(list(valid_types))}\n"
+                    f"Payload: {json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)}"
+                ),
+            },
+        ],
+        "temperature": 0.7,
+        "enable_thinking": True,
+    }
+
+
 def ror_node(state: State):
     """Recall-Oriented Reasoning stage (replaces voting_node).
 
@@ -1351,6 +1521,9 @@ def ror_node(state: State):
     valid_set = set(valid_types)
     official = bool(state.get("official", False))
     fallback_used = bool(state.get("fallback_used", False))
+    structured_requester = (
+        _require_structured_requester(state, "RoR") if official else None
+    )
 
     if not candidate_paths:
         if official:
@@ -1409,9 +1582,7 @@ def ror_node(state: State):
     reasoning = {"source": "deterministic_fallback", "spans": []}
     ror_records = []
     reasoner = state.get("ror_reasoner")
-    if official and not callable(reasoner):
-        raise RuntimeError("official RoR requires a live ror_reasoner callback")
-    if callable(reasoner):
+    if official or callable(reasoner):
         payload = {
             "tokens": list(tokens),
             "base_tags": list(base),
@@ -1420,7 +1591,14 @@ def ror_node(state: State):
             "valid_types": list(valid_types),
         }
         try:
-            span_response = reasoner("span_detection", payload)
+            if official:
+                span_response = _invoke_structured_requester_sync(
+                    structured_requester,
+                    "ror_span_detection",
+                    _official_ror_request("span_detection", payload, valid_types),
+                )
+            else:
+                span_response = reasoner("span_detection", payload)
             gated = set(proposals)
             ror_records.append(_callback_stage_record(
                 span_response, "ror_span_detection", state.get("provider_settings")))
@@ -1444,8 +1622,17 @@ def ror_node(state: State):
                 proposals = {}
                 reasoning = {"source": "live", "spans": []}
             if valid_spans:
-                type_response = reasoner(
-                    "type_assignment", {**payload, "spans": valid_spans})
+                type_payload = {**payload, "spans": valid_spans}
+                if official:
+                    type_response = _invoke_structured_requester_sync(
+                        structured_requester,
+                        "ror_type_assignment",
+                        _official_ror_request(
+                            "type_assignment", type_payload, valid_types
+                        ),
+                    )
+                else:
+                    type_response = reasoner("type_assignment", type_payload)
                 ror_records.append(_callback_stage_record(
                     type_response, "ror_type_assignment", state.get("provider_settings")))
                 if official:
@@ -1588,6 +1775,66 @@ def _is_legal_tag_sequence(tags: List[str]) -> bool:
     return True
 
 
+def _official_gasd_request(
+    payload: Mapping[str, Any], valid_tags: Sequence[str], token_count: int
+) -> dict[str, Any]:
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reason", "tags"],
+        "properties": {
+            "reason": {"type": "string"},
+            "tags": {
+                "type": "array",
+                "minItems": token_count,
+                "maxItems": token_count,
+                "items": {"type": "string", "enum": list(valid_tags)},
+            },
+        },
+    }
+    return {
+        "name": "lad_rg_gasd_r",
+        "schema": schema,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a strict LAD-RG GASD-R component. Return only the requested JSON object.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Return exactly one ontology-valid tag per token. The downstream decoder "
+                    "enforces hard IOB2 transitions.\n"
+                    f"Valid tags: {json.dumps(list(valid_tags))}\n"
+                    f"Payload: {json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)}"
+                ),
+            },
+        ],
+        "temperature": 0.0,
+        "enable_thinking": True,
+    }
+
+
+def _official_structured_gasd_evidence(
+    evidence: Any, token_count: int, valid_tags: set[str]
+) -> dict[str, Any]:
+    if (not isinstance(evidence, Mapping)
+            or set(evidence) != {"reason", "tags"}):
+        raise ValueError("official GASD-R structured response has an invalid schema")
+    tags = evidence.get("tags")
+    if (not isinstance(evidence.get("reason"), str)
+            or not isinstance(tags, list)
+            or len(tags) != token_count
+            or any(not isinstance(tag, str) or tag not in valid_tags for tag in tags)):
+        raise ValueError("official GASD-R structured response has invalid tags")
+    return {
+        "reason": evidence["reason"],
+        "tags": list(tags),
+        "tag_scores": [{tag: OFFICIAL_DECODER_CONSTANTS["gasd_reason_bonus"]}
+                        for tag in tags],
+    }
+
+
 def gasd_node(state: State):
     """GASD structural integrator (replaces physical_wash_node)."""
     print(f"\n [GASD] global constrained decode")
@@ -1608,8 +1855,9 @@ def gasd_node(state: State):
 
     try:
         decoder = state.get("gasd_reason_decoder")
-        if official and variant in {"r", "both"} and not callable(decoder):
-            raise RuntimeError("official GASD-R requires a live gasd_reason_decoder callback")
+        structured_requester = None
+        if official and variant in {"r", "both"}:
+            structured_requester = _require_structured_requester(state, "GASD-R")
         if not state.get("use_gasd", True):
             fallback = base or state.get("dirty_tags", []) or ["O"] * len(tokens)
             fallback = enforce_iob2_syntax(fallback, valid_set)
@@ -1647,9 +1895,9 @@ def gasd_node(state: State):
         reason_scores = None
         variant_used = "g"
         if variant in {"r", "both"}:
-            if callable(decoder):
+            if official or callable(decoder):
                 try:
-                    evidence = decoder({
+                    decoder_payload = {
                         "tokens": list(tokens),
                         "base_tags": list(base),
                         "candidate_paths": [list(path) for path in candidate_paths],
@@ -1657,7 +1905,21 @@ def gasd_node(state: State):
                         "ror_reasoning": state.get("ror_reasoning", {}),
                         "valid_tags": ["O"] + [f"{p}-{t}" for t in valid_types for p in ("B", "I")],
                         "constraint": "hard_iob2",
-                    })
+                    }
+                    if official:
+                        evidence = _invoke_structured_requester_sync(
+                            structured_requester,
+                            "gasd_r",
+                            _official_gasd_request(
+                                decoder_payload,
+                                ["O"] + [
+                                    f"{p}-{t}" for t in valid_types for p in ("B", "I")
+                                ],
+                                len(tokens),
+                            ),
+                        )
+                    else:
+                        evidence = decoder(decoder_payload)
                 except Exception as exc:                      # noqa: BLE001
                     if official:
                         raise
@@ -1667,6 +1929,9 @@ def gasd_node(state: State):
                     gasd_records.append(_callback_stage_record(
                         evidence, "gasd_r", state.get("provider_settings")))
                 if official:
+                    evidence = _official_structured_gasd_evidence(
+                        evidence, len(tokens), valid_tags
+                    )
                     reason_scores = _official_reason_scores(
                         evidence, len(tokens), valid_tags)
                     variant_used = variant
@@ -2042,6 +2307,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "gasd_variant": config.get("gasd_variant", "g"),
         "ror_reasoner": config.get("ror_reasoner"),
         "gasd_reason_decoder": config.get("gasd_reason_decoder"),
+        "structured_requester": config.get("structured_requester"),
         "official": official,
         "provider_settings": (dict(config.get("provider_metadata", {}))
                               if isinstance(config.get("provider_metadata"), Mapping)

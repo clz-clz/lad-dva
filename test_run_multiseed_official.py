@@ -9,7 +9,7 @@ import pytest
 
 import multi_agent_v2
 import run_multiseed
-from live_backbone import LiveBackboneSettings
+from live_backbone import LiveBackboneResult, LiveBackboneSettings
 
 
 def _env(provider="vllm"):
@@ -35,6 +35,7 @@ def _identity():
         "model": "Qwen/Qwen3-32B-AWQ",
         "served_model": f"Qwen/Qwen3-32B-AWQ@{revision}",
         "revision": revision,
+        "structured_api": "chat-completions-json-schema",
     }
 
 
@@ -45,17 +46,26 @@ def _live_record(stage):
         "status": "live",
         **identity,
         "response_model": identity["served_model"],
+        "structured_api": identity["structured_api"],
+        "response_status": "completed",
+        "finish_reason": "stop",
+        "incomplete_reason": None,
         "system_fingerprint": "fp-test",
         "usage": {},
     }
 
 
 def _status_record(stage, status):
+    identity = _identity()
     return {
         "stage": stage,
         "status": status,
         **_identity(),
         "response_model": None,
+        "structured_api": identity["structured_api"],
+        "response_status": None,
+        "finish_reason": None,
+        "incomplete_reason": None,
         "system_fingerprint": None,
         "usage": {},
     }
@@ -112,21 +122,22 @@ def test_real_coder_evidence_validates_exact_noise_stage_set(
 ):
     identity = _identity()
 
-    class Response:
-        content = '{"tags":["B-PER","O"]}'
-        response_metadata = {
-            "model_name": identity["served_model"],
-            "system_fingerprint": "fp-test",
-            "token_usage": {},
-        }
-        usage_metadata = None
+    def structured_requester(stage, payload):
+        return LiveBackboneResult(
+            {"tags": ["B-PER", "O"]},
+            {
+                **identity,
+                "stage": stage,
+                "status": "live",
+                "response_model": identity["served_model"],
+                "response_status": "completed",
+                "finish_reason": "stop",
+                "incomplete_reason": None,
+                "system_fingerprint": "fp-test",
+                "usage": {},
+            },
+        )
 
-    class CoderLLM:
-        @staticmethod
-        def invoke(_prompt, **kwargs):
-            return Response()
-
-    monkeypatch.setattr(multi_agent_v2, "coder_llm", CoderLLM())
     monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
     result = asyncio.run(multi_agent_v2.coder_node({
         "tokens": ["Alice", "works"],
@@ -136,6 +147,7 @@ def test_real_coder_evidence_validates_exact_noise_stage_set(
         "official": True,
         "provider_settings": identity,
         "provider_metadata": {},
+        "structured_requester": structured_requester,
     }))
     evidence = _full_evidence()
     evidence["coder"] = result["provider_metadata"]["coder"]
@@ -462,7 +474,8 @@ def test_manifest_is_canonical_sanitized_and_required_for_resume(tmp_path):
     assert manifest["backbone"]["served_model"] == settings.served_model
     assert "secret" not in run_multiseed._canonical_json(manifest)
     assert manifest["decoder_constants"] == {
-        "contract_version": "lad-rg-official-decoder-v1",
+        "contract_version": "lad-rg-official-decoder-v2",
+        "structured_api": "chat-completions-json-schema",
         "hard_constraint": "strict-iob2-v1",
         "provider_timeout_seconds": 120.0,
         "sdk_max_retries": 2,
@@ -557,6 +570,7 @@ def test_paid_smoke_uses_first_20_canonical_rows_with_strict_evidence(
         "model": "deepseek-v4-flash",
         "served_model": "deepseek-v4-flash",
         "revision": None,
+        "structured_api": "responses-json-schema",
     }
     calls = []
 
@@ -571,6 +585,9 @@ def test_paid_smoke_uses_first_20_canonical_rows_with_strict_evidence(
             "status": status,
             **identity,
             "response_model": response_model,
+            "response_status": "completed" if response_model else None,
+            "finish_reason": None,
+            "incomplete_reason": None,
             "system_fingerprint": "fp-smoke" if response_model else None,
             "usage": {},
         }
@@ -792,3 +809,55 @@ def test_official_gasd_disabled_cell_accepts_disabled_variant_evidence(tmp_path,
 
     output = pred_dir / "pred_seed13__lad_rg_no_gasd__msra__BT__qwen32b-g-off.jsonl"
     assert run_multiseed._load_noisy(output)[0]["gasd_variant_used"] == "disabled"
+
+
+def test_official_runner_injects_one_adapter_structured_requester_into_pipeline(
+    tmp_path, monkeypatch
+):
+    noisy_dir = tmp_path / "noisy"
+    pred_dir = tmp_path / "pred"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
+    monkeypatch.setattr(run_multiseed, "BACKBONE_TAG", "qwen-structured-v2")
+    _write_noisy(noisy_dir / "noisy_seed13__BT__msra__N200.jsonl", count=200)
+
+    adapters = []
+
+    class Adapter:
+        def __init__(self):
+            adapters.append(self)
+
+        def structured_requester(self, stage, payload):
+            raise AssertionError("fake pipeline should receive, not call, requester")
+
+        def ror_reasoner(self, stage, payload):
+            raise AssertionError("fake pipeline should not call RoR")
+
+        def gasd_reason_decoder(self, payload):
+            raise AssertionError("fake pipeline should not call GASD")
+
+        def provider_metadata(self):
+            return _identity()
+
+    async def pipeline(tokens, dirty, config, dataset_name=None):
+        assert config["structured_requester"].__self__ is adapters[0]
+        return {
+            "pred_tags": list(dirty),
+            "candidate_paths": [list(dirty)],
+            "rag_weights": [1.0],
+            "confidence": [1.0] * len(dirty),
+            "ror_reasoning_source": "not_triggered",
+            "gasd_variant_requested": "g",
+            "gasd_variant_used": "g",
+            "provider_metadata": _full_evidence(gasd_status="local"),
+            "fallback_used": False,
+        }
+
+    asyncio.run(run_multiseed._run_one_cell(
+        "lad_rg_full", run_multiseed.CONFIGURATIONS["lad_rg_full"],
+        "msra", "BT", 13, 200, (pipeline, {}), max_concurrency=1,
+        dummy=False, official=True, failure_policy="abort", request_timeout=10.0,
+        adapter_factory=Adapter,
+    ))
+
+    assert len(adapters) == 1

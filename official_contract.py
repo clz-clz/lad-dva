@@ -10,7 +10,7 @@ OFFICIAL_SDK_MAX_RETRIES = 2
 
 
 OFFICIAL_DECODER_CONSTANTS: dict[str, Any] = {
-    "contract_version": "lad-rg-official-decoder-v1",
+    "contract_version": "lad-rg-official-decoder-v2",
     "hard_constraint": "strict-iob2-v1",
     "gasd_beta_omega": 2.0,
     "gasd_gamma_proposal": 1.0,
@@ -24,8 +24,10 @@ OFFICIAL_DECODER_CONSTANTS: dict[str, Any] = {
 }
 
 
-def official_manifest_decoder_constants(request_timeout: float) -> dict[str, Any]:
-    return {
+def official_manifest_decoder_constants(
+    request_timeout: float, *, structured_api: str | None = None
+) -> dict[str, Any]:
+    constants = {
         "contract_version": OFFICIAL_DECODER_CONSTANTS["contract_version"],
         "hard_constraint": OFFICIAL_DECODER_CONSTANTS["hard_constraint"],
         "provider_timeout_seconds": OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
@@ -36,3 +38,6 @@ def official_manifest_decoder_constants(request_timeout: float) -> dict[str, Any
             if key not in {"contract_version", "hard_constraint"}
         },
     }
+    if structured_api is not None:
+        constants["structured_api"] = structured_api
+    return constants

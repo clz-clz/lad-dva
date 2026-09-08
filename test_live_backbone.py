@@ -17,7 +17,14 @@ PINNED_QWEN_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 def _response(payload: dict, **metadata) -> dict:
     metadata.setdefault("model", f"qwen@{PINNED_QWEN_REVISION}")
-    return {"choices": [{"message": {"content": json.dumps(payload)}}], **metadata}
+    finish_reason = metadata.pop("finish_reason", "stop")
+    return {
+        "choices": [{
+            "message": {"content": json.dumps(payload)},
+            "finish_reason": finish_reason,
+        }],
+        **metadata,
+    }
 
 
 class _RecordingTransport:
@@ -149,7 +156,7 @@ def test_immutable_qwen_revision_is_enforced_in_served_model_evidence():
 
 
 def test_deepseek_v4_flash_ror_enables_thinking():
-    transport = _RecordingTransport([_response({"spans": []})])
+    transport = _RecordingTransport([_responses_response({"spans": []})])
     adapter = OpenAICompatibleLADRGAdapter(
         LiveBackboneSettings(
             provider="deepseek",
@@ -162,14 +169,15 @@ def test_deepseek_v4_flash_ror_enables_thinking():
     )
 
     assert adapter.ror_reasoner("span_detection", _payload()) == {"spans": []}
-    assert transport.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert transport.calls[0]["reasoning"] == {"effort": "high"}
+    assert transport.calls[0]["text"]["format"]["type"] == "json_schema"
     assert adapter.settings.revision == "2026-08-01"
 
 
-def test_deepseek_ror_prompts_include_exact_json_schema_examples():
+def test_deepseek_ror_requests_use_responses_schema_and_ontology_enum():
     transport = _RecordingTransport([
-        _response({"spans": [{"start": 0, "end": 1}]}),
-        _response({"types": [{"start": 0, "end": 1, "type": "ORG"}]}),
+        _responses_response({"spans": [{"start": 0, "end": 1}]}),
+        _responses_response({"types": [{"start": 0, "end": 1, "type": "ORG"}]}),
     ])
     adapter = OpenAICompatibleLADRGAdapter(
         LiveBackboneSettings(
@@ -184,12 +192,15 @@ def test_deepseek_ror_prompts_include_exact_json_schema_examples():
     spans = adapter.ror_reasoner("span_detection", _payload())
     adapter.ror_reasoner("type_assignment", {**_payload(), "spans": spans["spans"]})
 
-    span_prompt = "\n".join(message["content"] for message in transport.calls[0]["messages"])
-    type_prompt = "\n".join(message["content"] for message in transport.calls[1]["messages"])
-    assert '{"spans":[{"start":0,"end":1}]}' in span_prompt
-    assert "no additional keys" in span_prompt.lower()
-    assert '{"types":[{"start":0,"end":1,"type":"PER"}]}' in type_prompt
-    assert "no additional keys" in type_prompt.lower()
+    span_request = transport.calls[0]
+    type_request = transport.calls[1]
+    assert "input" in span_request and "messages" not in span_request
+    assert span_request["text"]["format"]["strict"] is True
+    assert span_request["text"]["format"]["schema"]["additionalProperties"] is False
+    type_schema = type_request["text"]["format"]["schema"]
+    assert type_schema["properties"]["types"]["items"]["properties"]["type"]["enum"] == [
+        "PER", "LOC", "ORG", "MISC"
+    ]
 
 
 def test_sdk_adapter_supplies_proxy_isolated_http_client_to_factory():
@@ -198,7 +209,8 @@ def test_sdk_adapter_supplies_proxy_isolated_http_client_to_factory():
     def factory(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(
-            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: None))
+            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: None)),
+            responses=SimpleNamespace(create=lambda **_: None),
         )
 
     OpenAICompatibleLADRGAdapter(
@@ -221,6 +233,32 @@ def test_sdk_adapter_supplies_proxy_isolated_http_client_to_factory():
         http_client.close()
 
 
+def test_sdk_vllm_adapter_does_not_require_responses_resource():
+    captured = {}
+
+    def factory(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: None))
+        )
+
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm",
+            model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="test-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        client_factory=factory,
+    )
+
+    assert adapter.provider_metadata()["structured_api"] == (
+        "chat-completions-json-schema"
+    )
+    adapter.close()
+
+
 def test_sdk_adapter_closes_the_client_and_owned_http_transport():
     captured = {}
 
@@ -230,6 +268,7 @@ def test_sdk_adapter_closes_the_client_and_owned_http_transport():
             self.chat = SimpleNamespace(
                 completions=SimpleNamespace(create=lambda **_: None)
             )
+            self.responses = SimpleNamespace(create=lambda **_: None)
             self.close_calls = 0
 
         def close(self):
@@ -302,6 +341,10 @@ def test_callback_result_retains_independent_response_metadata_without_changing_
         "served_model": f"qwen@{PINNED_QWEN_REVISION}",
         "revision": PINNED_QWEN_REVISION,
         "response_model": f"qwen@{PINNED_QWEN_REVISION}",
+        "structured_api": "chat-completions-json-schema",
+        "response_status": "completed",
+        "finish_reason": "stop",
+        "incomplete_reason": None,
         "system_fingerprint": "fp-span",
         "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
     }
@@ -406,3 +449,183 @@ def test_official_malformed_or_failed_responses_raise_live_backbone_error(respon
 
     with pytest.raises(LiveBackboneError):
         adapter.ror_reasoner("span_detection", _payload())
+
+
+def _responses_response(payload, *, status="completed", model="deepseek-v4-flash",
+                        output_text=True, incomplete_reason=None):
+    response = {
+        "status": status,
+        "model": model,
+        "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+    }
+    if output_text:
+        response["output_text"] = json.dumps(payload)
+    if incomplete_reason is not None:
+        response["incomplete_details"] = {"reason": incomplete_reason}
+    return response
+
+
+def _deepseek_settings():
+    return LiveBackboneSettings(
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        base_url="https://api.deepseek.com/v1",
+        api_key="test-key",
+    )
+
+
+def test_deepseek_structured_request_uses_responses_json_schema_with_exact_69_items():
+    transport = _RecordingTransport([
+        _responses_response({"tags": ["O"] * 69}),
+    ])
+    adapter = OpenAICompatibleLADRGAdapter(_deepseek_settings(), transport=transport)
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["tags"],
+        "properties": {
+            "tags": {
+                "type": "array",
+                "minItems": 69,
+                "maxItems": 69,
+                "items": {"type": "string", "enum": ["O", "B-PER", "I-PER"]},
+            },
+        },
+    }
+
+    result = adapter.structured_requester(
+        "coder_path_1",
+        {
+            "name": "lad_rg_coder_path_1",
+            "schema": schema,
+            "messages": [
+                {"role": "system", "content": "strict"},
+                {"role": "user", "content": "label"},
+            ],
+            "temperature": 1.0,
+            "enable_thinking": True,
+        },
+    )
+
+    assert result == {"tags": ["O"] * 69}
+    request = transport.calls[0]
+    assert request["model"] == "deepseek-v4-flash"
+    assert request["input"] == [
+        {"role": "system", "content": "strict"},
+        {"role": "user", "content": "label"},
+    ]
+    assert request["temperature"] == 1.0
+    assert request["reasoning"] == {"effort": "high"}
+    assert request["text"]["format"] == {
+        "type": "json_schema",
+        "name": "lad_rg_coder_path_1",
+        "strict": True,
+        "schema": schema,
+    }
+    assert result.provider_metadata["structured_api"] == "responses-json-schema"
+    assert result.provider_metadata["response_status"] == "completed"
+    assert result.provider_metadata["finish_reason"] is None
+    assert result.provider_metadata["incomplete_reason"] is None
+    assert result.provider_metadata["response_model"] == "deepseek-v4-flash"
+
+
+@pytest.mark.parametrize(
+    "response, match",
+    [
+        (_responses_response({"tags": ["O"] * 69}, status="incomplete",
+                            incomplete_reason="max_output_tokens"), "completed"),
+        (_responses_response({"tags": ["O"] * 69}, status="failed"), "completed"),
+        (_responses_response({"tags": ["O"] * 69}, model="deepseek-chat"), "model"),
+        (_responses_response({"tags": ["O"] * 69}, output_text=False), "output_text"),
+        (_responses_response({"tags": ["O"] * 68}), "exactly 69"),
+        (_responses_response({"tags": ["O"] * 69 + ["B-PER"]}), "exactly 69"),
+        (_responses_response({"tags": ["B-UNKNOWN"] * 69}), "enum"),
+        (_responses_response({"tags": ["O"] * 69, "extra": True}), "schema"),
+    ],
+)
+def test_deepseek_structured_request_fails_closed_for_status_identity_and_schema(
+    response, match
+):
+    adapter = OpenAICompatibleLADRGAdapter(
+        _deepseek_settings(), transport=_RecordingTransport([response])
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["tags"],
+        "properties": {
+            "tags": {
+                "type": "array",
+                "minItems": 69,
+                "maxItems": 69,
+                "items": {"type": "string", "enum": ["O", "B-PER"]},
+            },
+        },
+    }
+
+    with pytest.raises(LiveBackboneError, match=match):
+        adapter.structured_requester(
+            "capability_probe_69",
+            {
+                "name": "probe",
+                "schema": schema,
+                "messages": [{"role": "user", "content": "probe"}],
+                "temperature": 0.0,
+                "enable_thinking": False,
+            },
+        )
+
+
+def test_vllm_structured_request_keeps_chat_completions_strict_schema_route():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    transport = _RecordingTransport([
+        _response({"tags": ["O", "B-PER"]}, model=served_model),
+    ])
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm",
+            model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1",
+            api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=transport,
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["tags"],
+        "properties": {
+            "tags": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "string", "enum": ["O", "B-PER"]},
+            },
+        },
+    }
+
+    result = adapter.structured_requester(
+        "coder_path_1",
+        {
+            "name": "lad_rg_coder_path_1",
+            "schema": schema,
+            "messages": [{"role": "user", "content": "label"}],
+            "temperature": 1.0,
+            "enable_thinking": True,
+        },
+    )
+
+    request = transport.calls[0]
+    assert result == {"tags": ["O", "B-PER"]}
+    assert request["messages"] == [{"role": "user", "content": "label"}]
+    assert request["temperature"] == 1.0
+    assert request["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "lad_rg_coder_path_1",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+    assert result.provider_metadata["structured_api"] == "chat-completions-json-schema"

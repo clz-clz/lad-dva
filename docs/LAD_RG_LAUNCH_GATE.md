@@ -42,7 +42,9 @@ $env:BACKBONE_PROVIDER = "deepseek"
 $env:BACKBONE_MODEL = "deepseek-v4-flash"
 $env:BACKBONE_BASE_URL = "https://api.deepseek.com/v1"
 $env:BACKBONE_API_KEY = "<deepseek-api-key>"
-$env:BACKBONE_TAG = "deepseek-v4-flash-<run-id>"
+# Run this after the v2 fix is committed; the tag binds evidence to that HEAD.
+$head7 = (git rev-parse HEAD).Trim().Substring(0, 7)
+$env:BACKBONE_TAG = "deepseek-v4-flash-responses-v2-$head7-20260907"
 Remove-Item Env:BACKBONE_REVISION -ErrorAction SilentlyContinue
 ```
 
@@ -58,6 +60,15 @@ $env:LAD_RG_LIVE_CONFIGS = "lad_rg_full"
 D:/py/Anaconda3/python.exe -m pytest -q test_lad_rg_live_integration.py
 Remove-Item Env:RUN_LAD_RG_LIVE_TESTS,Env:LAD_RG_LIVE_CONFIGS -ErrorAction SilentlyContinue
 ```
+
+DeepSeek official Coder, Reviewer, and RoR requests use the cached adapter's
+`/v1/responses` route; GASD-G remains local. Each provider request sends
+`text.format={type:"json_schema", strict:true, schema:...}` with exact array
+lengths and ontology enums; thinking stages send `reasoning.effort="high"`
+and explicitly non-thinking stages send `"none"`. The adapter accepts only a
+`completed` response with the configured model identity, non-empty
+`output_text`, valid JSON, and a locally revalidated schema. The live preflight
+includes a 69-item exact-length Responses schema capability probe.
 
 DeepSeek is GASD-G only. GASD-R/Both are Qwen-only and the runner rejects them
 for DeepSeek before any provider call.
@@ -166,9 +177,10 @@ edit the manifest or reuse stale predictions.
 Official Coder, Reviewer, RoR, and GASD-R provider clients are all pinned to
 the manifest's 120-second provider timeout and at most two SDK retries; the
 runner's outer per-sentence deadline remains 600 seconds.
-Official Coder and Reviewer responses are structured as single-key JSON
-objects. DeepSeek uses `json_object` plus an explicit fixed-slot template;
-vLLM/Qwen uses strict JSON Schema with exact array lengths and ontology enums.
+Official Coder, Reviewer, RoR, and GASD-R responses are single-key JSON
+objects returned through the structured requester. DeepSeek uses
+`responses-json-schema`; vLLM/Qwen continues to use
+`chat-completions-json-schema`, with exact array lengths and ontology enums.
 
 ## 4. B4 raw-logit probe
 
