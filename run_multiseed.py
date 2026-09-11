@@ -39,6 +39,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 from official_contract import official_manifest_decoder_constants
+from official_provider_cache import PROVIDER_CACHE_SCHEMA
 
 # Silence telemetry noise from chroma / langchain
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -64,6 +65,10 @@ OFFICIAL_SAMPLE_SIZE = 200
 PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
 OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v2"
+# Staged Contextual Lattice runs use this immutable provider-evidence schema.
+# The provider-cache and contextual-replay execution phases are intentionally
+# introduced in later tasks; legacy/end-to-end execution remains unchanged.
+OFFICIAL_PROVIDER_CACHE_SCHEMA = PROVIDER_CACHE_SCHEMA
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
 DATASET_ENTITY_TYPES = {
     "msra": ["PER", "LOC", "ORG"],
