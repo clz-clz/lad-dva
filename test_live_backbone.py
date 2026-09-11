@@ -17,6 +17,7 @@ PINNED_QWEN_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 def _response(payload: dict, **metadata) -> dict:
     metadata.setdefault("model", f"qwen@{PINNED_QWEN_REVISION}")
+    metadata.setdefault("usage", {"prompt_tokens": 2, "completion_tokens": 1})
     finish_reason = metadata.pop("finish_reason", "stop")
     return {
         "choices": [{
@@ -629,3 +630,37 @@ def test_vllm_structured_request_keeps_chat_completions_strict_schema_route():
         },
     }
     assert result.provider_metadata["structured_api"] == "chat-completions-json-schema"
+
+
+@pytest.mark.parametrize(
+    "response, match",
+    [
+        (_response({"tags": ["O"]}, finish_reason=None), "finish_reason"),
+        (_response({"tags": ["O"]}, usage={}), "usage metadata"),
+    ],
+)
+def test_vllm_structured_request_requires_terminal_finish_reason_and_usage(response, match):
+    response["model"] = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=_RecordingTransport([response]),
+    )
+
+    with pytest.raises(LiveBackboneError, match=match):
+        adapter.structured_requester("verifier", {
+            "name": "selectdenoise_verifier",
+            "schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["tags"],
+                "properties": {"tags": {"type": "array", "minItems": 1,
+                                            "maxItems": 1,
+                                            "items": {"type": "string", "enum": ["O"]}}},
+            },
+            "messages": [{"role": "user", "content": "label"}],
+            "temperature": 0.0,
+            "enable_thinking": True,
+        })

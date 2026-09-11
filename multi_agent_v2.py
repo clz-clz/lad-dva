@@ -166,14 +166,22 @@ class State(TypedDict):
 
 
 _PROVIDER_STAGES = ("coder", "reviewer", "ror", "gasd")
+_CONTEXTUAL_PROVIDER_STAGES = ("coder", "reviewer", "verifier")
+_QWEN_OFFICIAL_MODEL = "Qwen/Qwen3-32B-AWQ"
+_QWEN_OFFICIAL_REVISION = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
 
 
 def _provider_evidence(value: Any = None) -> dict[str, list[dict[str, Any]]]:
     source = value if isinstance(value, Mapping) else {}
+    stages = (
+        _CONTEXTUAL_PROVIDER_STAGES
+        if set(source) == set(_CONTEXTUAL_PROVIDER_STAGES)
+        else _PROVIDER_STAGES
+    )
     return {
         stage: [dict(record) for record in source.get(stage, [])
                 if isinstance(record, Mapping)]
-        for stage in _PROVIDER_STAGES
+        for stage in stages
     }
 
 
@@ -262,6 +270,38 @@ def _with_stage_records(state: Mapping[str, Any], stage: str,
     evidence = _provider_evidence(state.get("provider_metadata"))
     evidence[stage].extend(records)
     return evidence
+
+
+def _validate_contextual_official_evidence(evidence: Mapping[str, Any]) -> None:
+    """Reject unbound or incomplete provider evidence before cache publication."""
+    if set(evidence) != set(_CONTEXTUAL_PROVIDER_STAGES):
+        raise RuntimeError("official contextual pipeline is missing stage-separated evidence")
+    for stage in _CONTEXTUAL_PROVIDER_STAGES:
+        records = evidence.get(stage)
+        if not isinstance(records, list) or not records:
+            raise RuntimeError("official contextual pipeline has omitted stage evidence")
+        for record in records:
+            if not isinstance(record, Mapping) or record.get("stage") != stage:
+                raise RuntimeError("official contextual pipeline has invalid stage evidence")
+            if (record.get("provider") != "vllm"
+                    or record.get("model") != _QWEN_OFFICIAL_MODEL
+                    or record.get("revision") != _QWEN_OFFICIAL_REVISION
+                    or record.get("served_model") != (
+                        f"{_QWEN_OFFICIAL_MODEL}@{_QWEN_OFFICIAL_REVISION}"
+                    )
+                    or record.get("structured_api") != "chat-completions-json-schema"):
+                raise RuntimeError("official contextual evidence lacks pinned Qwen identity")
+            if record.get("status") == "live":
+                if (record.get("response_model") != record.get("served_model")
+                        or record.get("response_status") != "completed"
+                        or record.get("finish_reason") != "stop"
+                        or not isinstance(record.get("usage"), Mapping)
+                        or not record["usage"]):
+                    raise RuntimeError("official contextual live evidence is incomplete")
+            elif (record.get("response_model") is not None
+                  or record.get("response_status") is not None
+                  or record.get("finish_reason") is not None):
+                raise RuntimeError("official contextual skipped evidence claims a response")
 
 
 def _official_tag_path(content: Any, expected_length: int,
@@ -478,6 +518,10 @@ async def coder_node(state: State):
     dirty_tags = state.get("dirty_tags", [])
     dataset_name = state.get("dataset_name", "conll2003")
     official = bool(state.get("official", False))
+    contextual_official = (
+        official and set(state.get("provider_metadata", {}))
+        == set(_CONTEXTUAL_PROVIDER_STAGES)
+    )
     structured_requester = (
         _require_structured_requester(state, "Coder") if official else None
     )
@@ -619,9 +663,12 @@ PATH {pidx} STRATEGY — your ONLY task:
         responses = await asyncio.gather(*[
             _invoke_structured_requester(
                 structured_requester,
-                f"coder_path_{strategy_key}",
+                "coder" if contextual_official else f"coder_path_{strategy_key}",
                 {
-                    "name": f"lad_rg_coder_path_{strategy_key}",
+                    "name": (
+                        f"selectdenoise_coder_path_{strategy_key}"
+                        if contextual_official else f"lad_rg_coder_path_{strategy_key}"
+                    ),
                     "schema": coder_schema,
                     "messages": [
                         {
@@ -656,7 +703,9 @@ PATH {pidx} STRATEGY — your ONLY task:
     coder_records = [
         (
             _callback_stage_record(
-                response, f"coder_path_{strategy_key}", state.get("provider_settings")
+                response,
+                "coder" if contextual_official else f"coder_path_{strategy_key}",
+                state.get("provider_settings"),
             )
             if official
             else _response_stage_record(
@@ -900,11 +949,26 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
     except Exception as exc:
         raise ContextualLatticeError("Contextual lattice sentence validation failed") from exc
     tags = list(result.tags)
-    if len(tags) != len(tokens):
+    valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                           for entity_type in valid_types for prefix in ("B", "I")}
+    result_model_hash = getattr(result, "model_hash", None)
+    terminal_model_hash = getattr(terminal, "model_hash", None)
+    invalid = (
+        not isinstance(result_model_hash, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{64}", result_model_hash)
+        or result_model_hash != terminal_model_hash
+        or len(tags) != len(tokens)
+        or any(tag not in valid_tags for tag in tags)
+        or not _is_legal_tag_sequence(tags)
+    )
+    if invalid and state.get("official", False):
+        raise ContextualLatticeError("Contextual lattice terminal result is invalid")
+    if invalid:
         tags = anchor_tags
     return {
         "current_tags": tags,
-        "terminal_model_hash": result.model_hash,
+        "terminal_anchor_tags": anchor_tags,
+        "terminal_model_hash": result_model_hash,
         "terminal_used_anchor": bool(result.used_anchor),
         "terminal_predicted_gain": float(result.predicted_gain),
         "terminal_fallback_count": int(terminal.fallback_count),
@@ -2090,6 +2154,19 @@ async def verifier_node(state: State):
     dirty_tags = state.get("dirty_tags", [])
     ds = state.get("dataset_name", "conll2003")
     valid_set = set(DATASET_ENTITY_TYPES.get(ds, ["PER", "LOC", "ORG"]))
+    valid_tags = {"O"} | {f"{prefix}-{entity_type}"
+                            for entity_type in valid_set for prefix in ("B", "I")}
+    official = bool(state.get("official", False))
+
+    def skipped(status: str, tags: List[str]) -> dict:
+        result = {"current_tags": tags}
+        if official:
+            result["provider_metadata"] = _with_stage_records(
+                state, "verifier", [_stage_status_record(
+                    "verifier", status, state.get("provider_settings")
+                )]
+            )
+        return result
 
     # Noise-aware final legalization. On IF, a residual dangling I- is a
     # failed-merge artifact — DEMOTE it to O (promoting to B- invents a
@@ -2098,9 +2175,13 @@ async def verifier_node(state: State):
     dangling_policy = "demote" if state.get("noise_type") == "IF" else "promote"
 
     if not candidate_paths:
-        return {"current_tags": legalize_noise_aware(
-            list(dirty_tags), valid_set, dangling_policy)}
+        if official:
+            raise ValueError("official Verifier requires a non-empty candidate pool")
+        return skipped("skipped_no_candidates", legalize_noise_aware(
+            list(dirty_tags), valid_set, dangling_policy))
     if len(weights) != len(candidate_paths):
+        if official:
+            raise ValueError("official Verifier requires one weight per candidate")
         weights = [1.0] * len(candidate_paths)
 
     # Base / fallback: noise-adaptive (global Viterbi on BT/IF, vote on ATF).
@@ -2113,12 +2194,12 @@ async def verifier_node(state: State):
     fire = state.get("use_verifier", True) and (
         state.get("verify_all", False) or _is_type_contested(candidate_paths))
     if not fire:
-        return {"current_tags": base}
+        return skipped("skipped_uncontested", base)
 
     topk = int(state.get("verifier_topk", 4))
     distinct = _distinct_paths_by_weight(candidate_paths, weights, topk)
     if len(distinct) < 2:                       # nothing to choose between
-        return {"current_tags": base}
+        return skipped("skipped_identical", base)
 
     deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=ds)
     cand_block = "\n".join(
@@ -2143,7 +2224,36 @@ Candidate labelings to choose among:
 
 Decide by: (1) IOB2 legality; (2) entity TYPES consistent with the calibration examples and token semantics; (3) correct boundaries. When candidates disagree on an entity's type, pick the type the calibration/context best supports — the majority candidate is NOT automatically right.
 
-Output ONLY a JSON list of exactly {n} IOB2 tags — the single best labeling. No markdown, no explanation."""
+Output ONLY a JSON object whose only key is "tags". The "tags" array must
+contain exactly {n} IOB2 tags in token order. No markdown or explanation."""
+
+    if official:
+        requester = _require_structured_requester(state, "Verifier")
+        schema = {
+            "type": "object", "additionalProperties": False,
+            "required": ["tags"],
+            "properties": {"tags": {
+                "type": "array", "minItems": n, "maxItems": n,
+                "items": {"type": "string", "enum": sorted(valid_tags)},
+            }},
+        }
+        response = await _invoke_structured_requester(requester, "verifier", {
+            "name": "selectdenoise_verifier", "schema": schema,
+            "messages": [
+                {"role": "system", "content": "You are a strict SelectDenoise Verifier. Return only the requested JSON object."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0, "enable_thinking": True,
+        })
+        picked = _official_tag_path(response, n, valid_tags)
+        if not _is_legal_tag_sequence(picked):
+            raise ValueError("official Verifier returned an illegal IOB2 sequence")
+        return {
+            "current_tags": picked,
+            "provider_metadata": _with_stage_records(state, "verifier", [
+                _callback_stage_record(response, "verifier", state.get("provider_settings"))
+            ]),
+        }
 
     try:
         response = await asyncio.to_thread(llm.invoke, prompt)
@@ -2261,7 +2371,10 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
     if config is None:
         config = {"lambda_bias": 1.0, "use_dfa": True}
     official = bool(config.get("official", False))
-    if official and config.get("terminal_graph") != "lad-rg":
+    contextual_official = (
+        official and config.get("terminal_decoder") == "contextual-lattice-v1"
+    )
+    if official and not contextual_official and config.get("terminal_graph") != "lad-rg":
         raise ValueError("official pipeline requires terminal_graph='lad-rg'")
 
     # Dataset name resolution: explicit arg → config["__dataset__"] → default
@@ -2312,7 +2425,10 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "provider_settings": (dict(config.get("provider_metadata", {}))
                               if isinstance(config.get("provider_metadata"), Mapping)
                               else {}),
-        "provider_metadata": _provider_evidence(),
+        "provider_metadata": (
+            {stage: [] for stage in _CONTEXTUAL_PROVIDER_STAGES}
+            if contextual_official else _provider_evidence()
+        ),
         "fallback_used": False,
         # SelectDenoise controls (defaults = full system)
         "deanchor_atf": config.get("deanchor_atf", True),
@@ -2345,33 +2461,43 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
             if (any(tag not in valid_tags for tag in predicted_tags)
                     or not _is_legal_tag_sequence(predicted_tags)):
                 raise ValueError("official pipeline returned an illegal or out-of-ontology sequence")
-            reasoning = final_state.get("ror_reasoning", {})
-            reasoning_source = (
-                reasoning.get("source") if isinstance(reasoning, Mapping) else None
-            )
-            if reasoning_source not in {"not_triggered", "live", "disabled"}:
-                raise RuntimeError("official pipeline is missing valid RoR completion evidence")
-            requested_value = final_state.get("gasd_variant_requested")
-            used = final_state.get("gasd_variant_used")
-            if not isinstance(requested_value, str) or not isinstance(used, str):
-                raise RuntimeError("official pipeline is missing GASD completion evidence")
-            requested = requested_value.lower()
-            configured_variant = str(config.get("gasd_variant", "g")).lower()
-            if requested != configured_variant:
-                raise RuntimeError("official GASD requested variant does not match configuration")
-            if requested in {"r", "both"} and used != requested:
-                raise RuntimeError("official GASD-R did not use the requested variant")
-            if bool(final_state.get("fallback_used", False)):
-                raise RuntimeError("official pipeline cannot publish fallback evidence")
-            official_metadata = {
-                "ror_reasoning_source": reasoning_source,
-                "gasd_variant_requested": requested,
-                "gasd_variant_used": used,
-                "provider_metadata": _provider_evidence(
-                    final_state.get("provider_metadata")
-                ),
-                "fallback_used": bool(final_state.get("fallback_used", False)),
-            }
+            if contextual_official:
+                evidence = _provider_evidence(final_state.get("provider_metadata"))
+                _validate_contextual_official_evidence(evidence)
+                if bool(final_state.get("fallback_used", False)):
+                    raise RuntimeError("official pipeline cannot publish fallback evidence")
+                official_metadata = {
+                    "provider_metadata": evidence,
+                    "fallback_used": False,
+                }
+            else:
+                reasoning = final_state.get("ror_reasoning", {})
+                reasoning_source = (
+                    reasoning.get("source") if isinstance(reasoning, Mapping) else None
+                )
+                if reasoning_source not in {"not_triggered", "live", "disabled"}:
+                    raise RuntimeError("official pipeline is missing valid RoR completion evidence")
+                requested_value = final_state.get("gasd_variant_requested")
+                used = final_state.get("gasd_variant_used")
+                if not isinstance(requested_value, str) or not isinstance(used, str):
+                    raise RuntimeError("official pipeline is missing GASD completion evidence")
+                requested = requested_value.lower()
+                configured_variant = str(config.get("gasd_variant", "g")).lower()
+                if requested != configured_variant:
+                    raise RuntimeError("official GASD requested variant does not match configuration")
+                if requested in {"r", "both"} and used != requested:
+                    raise RuntimeError("official GASD-R did not use the requested variant")
+                if bool(final_state.get("fallback_used", False)):
+                    raise RuntimeError("official pipeline cannot publish fallback evidence")
+                official_metadata = {
+                    "ror_reasoning_source": reasoning_source,
+                    "gasd_variant_requested": requested,
+                    "gasd_variant_used": used,
+                    "provider_metadata": _provider_evidence(
+                        final_state.get("provider_metadata")
+                    ),
+                    "fallback_used": bool(final_state.get("fallback_used", False)),
+                }
     except Exception as e:
         logging.error(f"[-] Pipeline : {e}")
         if official or terminal is not None:

@@ -338,6 +338,7 @@ class OpenAICompatibleLADRGAdapter:
             raise LiveBackboneError("structured request temperature must be between 0 and 2")
         if type(enable_thinking) is not bool:
             raise LiveBackboneError("structured request enable_thinking must be boolean")
+        strict_stage = stage in {"reviewer", "verifier"} or stage.startswith("coder")
 
         try:
             if self.settings.provider == "deepseek":
@@ -349,6 +350,12 @@ class OpenAICompatibleLADRGAdapter:
                 parsed, response_metadata = self._chat_request(
                     name=name, schema=schema, messages=list(messages),
                     temperature=float(temperature), enable_thinking=enable_thinking,
+                    strict_completion=strict_stage,
+                )
+            if strict_stage:
+                response_metadata = dict(response_metadata)
+                response_metadata["usage"] = self._usage_metadata(
+                    response_metadata.get("usage")
                 )
             _validate_json_schema(parsed, schema)
             return LiveBackboneResult(
@@ -456,6 +463,16 @@ class OpenAICompatibleLADRGAdapter:
             "incomplete_reason": response_metadata.get("incomplete_reason"),
         }
 
+    @staticmethod
+    def _usage_metadata(raw_usage: Any) -> dict[str, Any]:
+        usage = _mapping_value(raw_usage)
+        if not usage:
+            raise LiveBackboneError("official response is missing usage metadata")
+        if not all(isinstance(key, str) and type(value) in (int, float)
+                   for key, value in usage.items()):
+            raise LiveBackboneError("official response has invalid usage metadata")
+        return usage
+
     def _responses_request(
         self,
         *,
@@ -523,6 +540,7 @@ class OpenAICompatibleLADRGAdapter:
         messages: list[dict[str, str]],
         temperature: float,
         enable_thinking: bool,
+        strict_completion: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         request: dict[str, Any] = {
             "model": self.settings.served_model,
@@ -547,7 +565,11 @@ class OpenAICompatibleLADRGAdapter:
             if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
                 raise LiveBackboneError("official chat response has no completion choice")
             finish_reason = _get(choices[0], "finish_reason")
-            if finish_reason not in (None, "stop"):
+            if strict_completion and finish_reason != "stop":
+                raise LiveBackboneError(
+                    f"official chat response has unsupported finish_reason {finish_reason!r}"
+                )
+            if not strict_completion and finish_reason not in (None, "stop"):
                 raise LiveBackboneError(
                     f"official chat response has unsupported finish_reason {finish_reason!r}"
                 )
