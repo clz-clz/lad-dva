@@ -506,6 +506,52 @@ def test_deepseek_live_preflight_probes_69_item_responses_schema():
     }
 
 
+def test_contextual_qwen_live_preflight_probes_exact_lengths_reasoning_and_verifier():
+    pinned_revision = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision=pinned_revision,
+    )
+    calls = []
+    identity = {
+        "provider": "vllm", "model": settings.model,
+        "served_model": settings.served_model, "revision": settings.revision,
+        "structured_api": settings.structured_api,
+    }
+
+    class Adapter:
+        def __init__(self, configured):
+            assert configured is settings
+
+        def provider_metadata(self):
+            return dict(identity)
+
+        def structured_requester(self, stage, payload):
+            calls.append((stage, payload))
+            count = payload["schema"]["properties"]["tags"]["maxItems"]
+            return LiveBackboneResult({"tags": ["O"] * count}, {
+                **identity, "stage": stage, "status": "live",
+                "response_model": settings.served_model, "response_status": "completed",
+                "finish_reason": "stop", "incomplete_reason": None,
+                "system_fingerprint": "fp-contextual", "usage": {"total_tokens": 1},
+            })
+
+        def close(self):
+            pass
+
+    report = official_preflight.run_live_preflight(
+        settings=settings, config_names=["selectdenoise_contextual_lattice"],
+        models_fetcher=lambda _: [{"id": settings.served_model}], adapter_factory=Adapter,
+    )
+
+    assert report["ok"] is True, report
+    assert [(stage, payload["enable_thinking"]) for stage, payload in calls] == [
+        ("capability_probe_69", True), ("capability_probe_372", True), ("verifier", True),
+    ]
+    assert [payload["schema"]["properties"]["tags"]["maxItems"] for _, payload in calls] == [69, 372, 3]
+
+
 def test_static_cli_converts_internal_failure_to_json_only(capsys, monkeypatch, tmp_path):
     def broken(**kwargs):
         raise RuntimeError("fixture failure")

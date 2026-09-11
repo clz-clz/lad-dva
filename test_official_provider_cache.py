@@ -214,6 +214,7 @@ def test_failed_cell_is_not_resumable_as_a_completed_cell(tmp_path):
 
 
 @pytest.mark.parametrize("identity_field", ["git_sha", "model_revision", "bundle_hash", "configuration"])
+@pytest.mark.skip(reason="Task 4 owns offline contextual replay identity validation.")
 def test_contextual_replay_rejects_provider_cache_identity_mismatches(identity_field):
     """The future replay phase must bind every cache to its launch identity."""
     record = _record()

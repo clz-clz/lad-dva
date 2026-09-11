@@ -372,7 +372,46 @@ def run_live_preflight(
         tokens = ["Alice", "met", "Paris"]
         valid_types = ["PER", "LOC", "ORG", "MISC"]
         evidence = []
-        if settings.provider == "deepseek":
+        contextual_profile = list(config_names) == ["selectdenoise_contextual_lattice"]
+        if contextual_profile:
+            structured_requester = getattr(adapter, "structured_requester", None)
+            if not callable(structured_requester):
+                raise ValueError("Contextual Qwen live preflight requires structured_requester")
+            valid_tags = ["O"] + [
+                f"{prefix}-{entity_type}" for entity_type in valid_types for prefix in ("B", "I")
+            ]
+            for count in (69, 372):
+                probe = structured_requester(
+                    f"capability_probe_{count}",
+                    {"name": f"contextual_capability_probe_{count}",
+                     "schema": {"type": "object", "additionalProperties": False,
+                                "required": ["tags"], "properties": {"tags": {
+                                    "type": "array", "minItems": count, "maxItems": count,
+                                    "items": {"type": "string", "enum": valid_tags}}}},
+                     "messages": [{"role": "system", "content": "Return only the requested exact-length JSON object."},
+                                  {"role": "user", "content": f"Emit exactly {count} ontology-valid tags."}],
+                     "temperature": 0.0, "enable_thinking": True},
+                )
+                tags = probe.get("tags") if isinstance(probe, Mapping) else None
+                if not isinstance(tags, list) or len(tags) != count or any(tag not in valid_tags for tag in tags):
+                    raise ValueError(f"Contextual Qwen {count}-item probe did not return exactly {count} ontology tags")
+                evidence.append((probe, f"capability_probe_{count}"))
+            verifier = structured_requester(
+                "verifier",
+                {"name": "selectdenoise_verifier",
+                 "schema": {"type": "object", "additionalProperties": False,
+                            "required": ["tags"], "properties": {"tags": {
+                                "type": "array", "minItems": len(tokens), "maxItems": len(tokens),
+                                "items": {"type": "string", "enum": valid_tags}}}},
+                 "messages": [{"role": "system", "content": "Return only the requested JSON object."},
+                              {"role": "user", "content": "Verify three ontology-valid tags."}],
+                 "temperature": 0.0, "enable_thinking": True},
+            )
+            verifier_tags = verifier.get("tags") if isinstance(verifier, Mapping) else None
+            if not isinstance(verifier_tags, list) or len(verifier_tags) != len(tokens):
+                raise ValueError("Contextual Qwen Verifier probe returned an invalid tag count")
+            evidence.append((verifier, "verifier"))
+        if not contextual_profile and settings.provider == "deepseek":
             structured_requester = getattr(adapter, "structured_requester", None)
             if not callable(structured_requester):
                 raise ValueError(
@@ -429,16 +468,17 @@ def run_live_preflight(
                 "structured_api": settings.structured_api,
             }
             evidence.append((probe, "capability_probe_69"))
-        spans = adapter.ror_reasoner(
+        if not contextual_profile:
+            spans = adapter.ror_reasoner(
             "span_detection", {"tokens": tokens, "valid_types": valid_types, "dirty_tags": ["O"] * 3},
         )
-        typed = adapter.ror_reasoner(
+            typed = adapter.ror_reasoner(
             "type_assignment", {"tokens": tokens, "valid_types": valid_types,
                                 "dirty_tags": ["O"] * 3, "spans": spans["spans"]},
         )
-        checks["ror"] = {"spans": spans["spans"], "types": typed["types"]}
-        evidence.extend([(spans, "ror_span_detection"), (typed, "ror_type_assignment")])
-        if settings.provider == "vllm":
+            checks["ror"] = {"spans": spans["spans"], "types": typed["types"]}
+            evidence.extend([(spans, "ror_span_detection"), (typed, "ror_type_assignment")])
+        if not contextual_profile and settings.provider == "vllm":
             valid_tags = ["O"] + [
                 f"{prefix}-{entity_type}" for entity_type in valid_types for prefix in ("B", "I")
             ]

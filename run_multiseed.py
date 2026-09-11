@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import hashlib
 import importlib.metadata
 import json
 import logging
@@ -41,6 +42,7 @@ from urllib.parse import urlsplit
 from official_contract import official_manifest_decoder_constants
 from official_provider_cache import (
     PROVIDER_CACHE_SCHEMA, QWEN_MODEL, QWEN_REVISION, QWEN_SERVED_MODEL,
+    read_provider_cell, write_provider_cell,
 )
 
 # Silence telemetry noise from chroma / langchain
@@ -68,10 +70,12 @@ PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
 OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v2"
 # Staged Contextual Lattice runs use this immutable provider-evidence schema.
-# The provider-cache and contextual-replay execution phases are intentionally
-# introduced in later tasks; legacy/end-to-end execution remains unchanged.
+# Provider-cache execution is deliberately isolated from the later offline
+# contextual-replay phase; legacy/end-to-end execution remains unchanged.
 OFFICIAL_PROVIDER_CACHE_SCHEMA = PROVIDER_CACHE_SCHEMA
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
+PROVIDER_CACHE_DIR = Path("provider_cache")
+PROVIDER_CACHE_INDEX_SCHEMA = "selectdenoise-contextual-provider-cache-index-v1"
 _OFFICIAL_CONTEXTUAL_STAGES = frozenset({"coder", "reviewer", "verifier"})
 DATASET_ENTITY_TYPES = {
     "msra": ["PER", "LOC", "ORG"],
@@ -197,6 +201,10 @@ BACKBONE_TAG = os.environ.get("BACKBONE_TAG", "").strip()
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def _endpoint_origin(base_url: str) -> str:
@@ -796,6 +804,198 @@ class _CachedAdapterFactory:
             close_adapter()
 
 
+def _provider_cache_cell_path(root: Path, tag: str, config_name: str,
+                              dataset: str, noise: str, seed: int) -> Path:
+    return Path(root) / tag / f"provider_seed{seed}__{config_name}__{dataset}__{noise}.jsonl"
+
+
+def _provider_cache_index_path(root: Path, tag: str) -> Path:
+    return Path(root) / tag / "index.json"
+
+
+def _provider_cache_cell_key(config_name: str, dataset: str, noise: str, seed: int) -> str:
+    return f"{config_name}__{dataset}__{noise}__seed{seed}"
+
+
+def _provider_input_digest(row: Mapping[str, Any]) -> str:
+    """Hash only the gold-free Stage A input."""
+    tokens, dirty_tags = row.get("tokens"), row.get("dirty_tags")
+    if (not isinstance(tokens, list) or not isinstance(dirty_tags, list)
+            or not all(isinstance(value, str) for value in tokens + dirty_tags)
+            or len(tokens) != len(dirty_tags)):
+        raise ValueError("provider-cache source row requires aligned tokens and dirty_tags")
+    return _sha256_json({"tokens": tokens, "dirty_tags": dirty_tags})
+
+
+def _provider_cache_manifest(rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any], *,
+                             dataset: str, noise: str, seed: int, git_sha: str,
+                             bundle_hash: str) -> dict[str, Any]:
+    return {
+        "schema": PROVIDER_CACHE_SCHEMA,
+        "source_digests": {str(index): _provider_input_digest(row) for index, row in enumerate(rows)},
+        "git_sha": git_sha, "model_revision": QWEN_REVISION, "bundle_hash": bundle_hash,
+        "configuration": {"config": "selectdenoise_contextual_lattice",
+                          "terminal_decoder": config.get("terminal_decoder"),
+                          "dataset": dataset, "noise": noise, "seed": seed},
+    }
+
+
+def _read_provider_cache_manifest(path: Path) -> Mapping[str, Any]:
+    try:
+        header = json.loads(Path(path).read_text(encoding="utf-8").splitlines()[0])
+    except (IndexError, OSError, json.JSONDecodeError) as exc:
+        raise ValueError("provider-cache header is malformed") from exc
+    if not isinstance(header, Mapping) or set(header) != {"schema", "manifest"}:
+        raise ValueError("provider-cache header is malformed")
+    return header["manifest"]
+
+
+def _update_provider_cache_index(root: Path, tag: str, *, key: str,
+                                 cell: Mapping[str, Any]) -> None:
+    index_path = _provider_cache_index_path(root, tag)
+    index: dict[str, Any] = {"schema": PROVIDER_CACHE_INDEX_SCHEMA, "cells": {}}
+    if index_path.exists():
+        try:
+            candidate = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("provider-cache index is malformed") from exc
+        if (not isinstance(candidate, Mapping) or candidate.get("schema") != PROVIDER_CACHE_INDEX_SCHEMA
+                or not isinstance(candidate.get("cells"), Mapping)):
+            raise ValueError("provider-cache index is malformed")
+        index["cells"] = dict(candidate["cells"])
+    index["cells"][key] = dict(cell)
+    temporary = index_path.with_suffix(index_path.suffix + ".tmp")
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        temporary.write_text(_canonical_json(index) + "\n", encoding="utf-8")
+        temporary.replace(index_path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _read_provider_cache_index_cell(root: Path, tag: str, key: str) -> Mapping[str, Any]:
+    index_path = _provider_cache_index_path(root, tag)
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("provider-cache index is required for resume") from exc
+    cells = index.get("cells") if isinstance(index, Mapping) else None
+    cell = cells.get(key) if isinstance(cells, Mapping) else None
+    if (not isinstance(index, Mapping) or index.get("schema") != PROVIDER_CACHE_INDEX_SCHEMA
+            or not isinstance(cell, Mapping)):
+        raise ValueError("provider-cache index is missing the cache cell")
+    required = {"path", "sha256", "row_count", "git_sha", "model_revision", "provider_fingerprint"}
+    if set(cell) != required:
+        raise ValueError("provider-cache index cell is malformed")
+    return cell
+
+
+def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | None,
+                                    ratios: Sequence[float], max_concurrency: int,
+                                    failure_policy: str, dummy: bool) -> None:
+    if dummy or failure_policy != "abort":
+        raise ValueError("provider-cache phase requires real requests and failure-policy abort")
+    if size != OFFICIAL_SAMPLE_SIZE or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
+        raise ValueError("provider-cache phase requires size 200 and ratio 0.15")
+    if max_concurrency != 20:
+        raise ValueError("provider-cache phase requires max-concurrency 20")
+    if list(config_names) != ["selectdenoise_contextual_lattice"]:
+        raise ValueError("provider-cache phase requires exactly the contextual-lattice config")
+
+
+async def _run_provider_cache_cell(
+    config_name: str, config: Mapping[str, Any], dataset: str, noise: str, seed: int,
+    size: int, pipelines, *, cache_root: Path, cache_tag: str, max_concurrency: int,
+    request_timeout: float, adapter_factory: Callable[[], Any], git_sha: str,
+    bundle_hash: str,
+) -> dict[str, Any]:
+    """Execute only the provider graph and atomically publish one gold-free cell."""
+    _validate_provider_cache_launch([config_name], size=size, ratios=[OFFICIAL_NOISE_RATIO],
+                                    max_concurrency=max_concurrency, failure_policy="abort", dummy=False)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cache_tag):
+        raise ValueError("provider-cache tag is invalid")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", git_sha):
+        raise ValueError("provider-cache requires a 40-hex git SHA")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
+        raise ValueError("provider-cache requires a 64-hex bundle hash")
+    noisy_path = _noisy_path(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
+    if not noisy_path.exists():
+        raise FileNotFoundError(f"official noisy file not found: {noisy_path}")
+    rows = _load_noisy(noisy_path)
+    if len(rows) != OFFICIAL_SAMPLE_SIZE:
+        raise RuntimeError("provider-cache cells require exactly 200 noisy rows")
+    manifest = _provider_cache_manifest(rows, config, dataset=dataset, noise=noise, seed=seed,
+                                        git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower())
+    cell_path = _provider_cache_cell_path(cache_root, cache_tag, config_name, dataset, noise, seed)
+    key = _provider_cache_cell_key(config_name, dataset, noise, seed)
+    adapter = adapter_factory()
+    identity = adapter.provider_metadata()
+    fingerprint = _sha256_json(identity)
+    if cell_path.exists():
+        indexed = _read_provider_cache_index_cell(cache_root, cache_tag, key)
+        if (indexed["path"] != str(cell_path) or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
+                or indexed["git_sha"] != manifest["git_sha"]
+                or indexed["model_revision"] != QWEN_REVISION
+                or indexed["provider_fingerprint"] != fingerprint):
+            raise ValueError("provider-cache index identity mismatch; refusing resume")
+        cached = read_provider_cell(cell_path, indexed["sha256"], OFFICIAL_SAMPLE_SIZE)
+        if _read_provider_cache_manifest(cell_path) != manifest:
+            raise ValueError("provider-cache manifest identity mismatch; refusing resume")
+        cell = {"path": str(cell_path), "sha256": indexed["sha256"], "row_count": len(cached),
+                "git_sha": manifest["git_sha"], "model_revision": QWEN_REVISION,
+                "provider_fingerprint": fingerprint}
+        _update_provider_cache_index(cache_root, cache_tag, key=key, cell=cell)
+        return cell
+
+    default_fn, _baseline_fns = pipelines
+    sem = asyncio.Semaphore(max_concurrency)
+    cached: list[Optional[dict[str, Any]]] = [None] * len(rows)
+    provider_config = dict(config)
+    provider_config.pop("terminal_decoder", None)
+
+    async def process(index: int, row: Mapping[str, Any]) -> None:
+        async with sem:
+            tokens, dirty = row["tokens"], row["dirty_tags"]
+            runtime_config = dict(provider_config)
+            runtime_config.update({"__dataset__": dataset, "__noise_type__": noise,
+                                   "official": True, "__return_candidates__": True,
+                                   "structured_requester": getattr(adapter, "structured_requester", None),
+                                   "provider_metadata": dict(identity)})
+            result = await asyncio.wait_for(
+                default_fn(tokens, dirty, runtime_config, dataset_name=dataset), timeout=request_timeout)
+            if not isinstance(result, Mapping):
+                raise RuntimeError(f"provider-cache sentence {index} returned no stage evidence")
+            anchor, evidence = result.get("pred_tags"), result.get("provider_metadata")
+            if (not isinstance(anchor, list) or len(anchor) != len(tokens)
+                    or any(tag not in _valid_tags(dataset) for tag in anchor) or not _is_legal_iob2(anchor)):
+                raise RuntimeError(f"provider-cache sentence {index} returned invalid anchor tags")
+            _validate_contextual_provider_evidence(evidence, identity, noise)
+            cached[index] = {"row_index": index, "input_digest": _provider_input_digest(row),
+                             "anchor_tags": anchor, "candidate_paths": result.get("candidate_paths"),
+                             "rag_weights": result.get("rag_weights"), "confidence": result.get("confidence"),
+                             "provider_metadata": evidence, "fallback_used": result.get("fallback_used")}
+
+    tasks = [asyncio.create_task(process(index, row)) for index, row in enumerate(rows)]
+    try:
+        await asyncio.gather(*tasks)
+        if any(record is None for record in cached):
+            raise RuntimeError("provider-cache cell has an incomplete result buffer")
+        digest = write_provider_cell(cell_path, [record for record in cached if record is not None], manifest)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        cell_path.with_suffix(cell_path.suffix + ".tmp").unlink(missing_ok=True)
+        raise
+    cell = {"path": str(cell_path), "sha256": digest, "row_count": len(cached),
+            "git_sha": manifest["git_sha"], "model_revision": QWEN_REVISION,
+            "provider_fingerprint": fingerprint}
+    _update_provider_cache_index(cache_root, cache_tag, key=key, cell=cell)
+    return cell
+
+
 async def _run_one_cell(config_name: str, config: dict,
                         dataset: str, noise: str, seed: int,
                         size: int, pipelines,
@@ -1114,6 +1314,9 @@ def _parse_args(argv=None):
                     help="Sentence failure behavior; dirty is legacy opt-in only.")
     ap.add_argument("--request-timeout", type=float, default=None,
                     help="Outer per-sentence timeout in seconds.")
+    ap.add_argument("--phase", choices=("end-to-end", "provider-cache"), default="end-to-end")
+    ap.add_argument("--provider-cache-root", type=Path, default=PROVIDER_CACHE_DIR)
+    ap.add_argument("--bundle-hash", help="Pinned 64-hex contextual lattice bundle hash.")
     args = ap.parse_args(argv)
     args.failure_policy = args.failure_policy or "abort"
     args.request_timeout = (
@@ -1128,6 +1331,17 @@ def _parse_args(argv=None):
 def main(argv=None):
     global BACKBONE_TAG
     args = _parse_args(argv)
+
+    if args.phase == "provider-cache":
+        if not args.official:
+            raise ValueError("provider-cache phase requires --official")
+        _validate_provider_cache_launch(
+            args.configs, size=args.size, ratios=args.ratios,
+            max_concurrency=args.max_concurrency, failure_policy=args.failure_policy,
+            dummy=args.dummy,
+        )
+        if not isinstance(args.bundle_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", args.bundle_hash):
+            raise ValueError("provider-cache phase requires --bundle-hash with 64 hexadecimal characters")
 
     official_settings = None
     adapter_factory = None
@@ -1171,6 +1385,26 @@ def main(argv=None):
 
     n_done = n_err = 0
     try:
+        if args.phase == "provider-cache":
+            git_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], check=True, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            ).stdout.strip()
+            for ds in args.datasets:
+                for nt in args.noise:
+                    for seed in args.seeds:
+                        asyncio.run(_run_provider_cache_cell(
+                            "selectdenoise_contextual_lattice",
+                            CONFIGURATIONS["selectdenoise_contextual_lattice"],
+                            ds, nt, seed, args.size, pipeline_fn,
+                            cache_root=args.provider_cache_root, cache_tag=BACKBONE_TAG,
+                            max_concurrency=args.max_concurrency,
+                            request_timeout=args.request_timeout,
+                            adapter_factory=adapter_factory, git_sha=git_sha,
+                            bundle_hash=args.bundle_hash,
+                        ))
+                        n_done += 1
+            return
         for cfg_name in args.configs:
             if cfg_name not in CONFIGURATIONS:
                 logging.error(f"Unknown config: {cfg_name}; "

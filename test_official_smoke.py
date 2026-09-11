@@ -154,3 +154,20 @@ def test_smoke_cli_keeps_stdout_machine_readable(capsys, monkeypatch, tmp_path):
     assert payload["ok"] is True
     assert "pipeline chatter" not in captured.out
     assert "pipeline chatter" in captured.err
+
+
+def test_contextual_smoke_selector_keeps_fixed_and_length_representative_rows():
+    cells = {}
+    for dataset in official_smoke.runner.DATASETS:
+        for noise in official_smoke.runner.NOISE_TYPES:
+            cells[(dataset, noise, 13)] = [
+                {"tokens": ["x"] * length} for length in range(1, 201)
+            ]
+
+    selected = official_smoke.select_contextual_smoke_rows(cells)
+
+    assert {("msra", "BT", 13, 125), ("msra", "BT", 13, 133),
+            ("msra", "ATF", 13, 2)} <= set(selected)
+    for key in cells:
+        representatives = [entry for entry in selected if entry[:3] == key]
+        assert {entry[3] for entry in representatives} >= {99, 189, 199}

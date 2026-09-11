@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -199,6 +200,79 @@ def test_official_contextual_runner_persists_terminal_anchor_evidence(tmp_path, 
     output = next(pred_dir.glob("*.jsonl"))
     first = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert first["terminal_anchor_tags"] == ["B-PER", "O"]
+
+
+def test_provider_cache_cell_runs_preterminal_graph_once_and_is_exactly_resumable(tmp_path, monkeypatch):
+    """Changing a source digest or manifest identity must prevent cache reuse."""
+    noisy_dir, cache_root = tmp_path / "noisy", tmp_path / "cache"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    _write_noisy(noisy_dir / "noisy_seed13__BT__msra__N200.jsonl", count=200)
+    calls = []
+
+    class Adapter:
+        def __init__(self):
+            self.closed = False
+
+        provider_metadata = staticmethod(_contextual_identity)
+        structured_requester = staticmethod(lambda *_args: None)
+
+        def close(self):
+            self.closed = True
+
+    adapter = Adapter()
+
+    async def pipeline(tokens, dirty, config, **_kwargs):
+        calls.append(dict(config))
+        return {
+            "pred_tags": ["B-PER", "O"],
+            "candidate_paths": [["B-PER", "O"]],
+            "rag_weights": [1.0], "confidence": [1.0, 1.0],
+            "provider_metadata": {
+                "coder": [_contextual_live_record("coder") for _ in range(3)],
+                "reviewer": [_contextual_skipped_record("reviewer", "skipped_identical")],
+                "verifier": [_contextual_skipped_record("verifier", "skipped_uncontested")],
+            },
+            "fallback_used": False,
+        }
+
+    first = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice", run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, 200, (pipeline, {}), cache_root=cache_root,
+        cache_tag="qwen-test", max_concurrency=20, request_timeout=10.0,
+        adapter_factory=lambda: adapter, git_sha="a" * 40, bundle_hash="b" * 64,
+    ))
+
+    assert len(calls) == 200
+    assert all("terminal_decoder" not in config for config in calls)
+    assert first["row_count"] == 200
+    assert first["sha256"] == hashlib.sha256(Path(first["path"]).read_bytes()).hexdigest()
+    assert adapter.closed is False
+    calls.clear()
+
+    second = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice", run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, 200, (pipeline, {}), cache_root=cache_root,
+        cache_tag="qwen-test", max_concurrency=20, request_timeout=10.0,
+        adapter_factory=lambda: adapter, git_sha="a" * 40, bundle_hash="b" * 64,
+    ))
+
+    assert second == first
+    assert calls == []
+
+
+def test_provider_cache_phase_rejects_non_contextual_or_noncanonical_launches():
+    args = run_multiseed._parse_args(["--phase", "provider-cache"])
+    assert args.phase == "provider-cache"
+    with pytest.raises(ValueError, match="contextual-lattice"):
+        run_multiseed._validate_provider_cache_launch(
+            ["lad_rg_full"], size=200, ratios=[0.15], max_concurrency=20,
+            failure_policy="abort", dummy=False,
+        )
+    with pytest.raises(ValueError, match="max-concurrency 20"):
+        run_multiseed._validate_provider_cache_launch(
+            ["selectdenoise_contextual_lattice"], size=200, ratios=[0.15],
+            max_concurrency=19, failure_policy="abort", dummy=False,
+        )
 
 
 def _write_noisy(path: Path, count=1):

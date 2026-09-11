@@ -27,6 +27,29 @@ SMOKE_REPORT_SCHEMA = "lad-rg-paid-smoke-v1"
 SMOKE_CONFIGS = ("lad_rg_full", "lad_rg_gasd_r", "lad_rg_gasd_both")
 
 
+def select_contextual_smoke_rows(
+    cells: Mapping[tuple[str, str, int], Sequence[Mapping[str, Any]]],
+) -> list[tuple[str, str, int, int]]:
+    """Return reproducible fixed and length-distribution representatives.
+
+    The historical fixed records use zero-based row indices.  Percentiles are
+    nearest-rank over the stable input order after sorting by token length.
+    """
+    selected: set[tuple[str, str, int, int]] = {
+        entry for entry in (("msra", "BT", 13, 125), ("msra", "BT", 13, 133),
+                            ("msra", "ATF", 13, 2))
+        if entry[:3] in cells
+    }
+    for (dataset, noise, seed), rows in cells.items():
+        if len(rows) != runner.OFFICIAL_SAMPLE_SIZE:
+            raise ValueError("contextual smoke selection requires canonical 200-row cells")
+        ordered = sorted(range(len(rows)), key=lambda index: (len(rows[index].get("tokens", [])), index))
+        for percentile in (0.50, 0.95, 1.0):
+            rank = max(0, min(len(ordered) - 1, int(percentile * len(ordered)) - 1))
+            selected.add((dataset, noise, seed, ordered[rank]))
+    return sorted(selected)
+
+
 def _candidate_evidence_present(row: Mapping[str, Any]) -> bool:
     tokens = row.get("tokens")
     paths = row.get("candidate_paths")
