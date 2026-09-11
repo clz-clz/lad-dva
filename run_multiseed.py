@@ -983,6 +983,8 @@ def _validate_contextual_replay_bundle(bundle_hash: str) -> tuple[Path, Path]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("contextual replay bundle manifest is unreadable") from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError("contextual replay bundle manifest must be an object")
     checkpoint_value = manifest.get("checkpoint") if isinstance(manifest, Mapping) else None
     checkpoint = (checkpoint_value.get("path") if isinstance(checkpoint_value, Mapping)
                   else checkpoint_value)
