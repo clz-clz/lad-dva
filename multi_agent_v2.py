@@ -850,6 +850,34 @@ def _all_paths_identical(paths: List[List[str]]) -> bool:
 _deer_stats = {}     # dataset_name -> DEERStatistics
 _deer_retriever = {}  # dataset_name -> DEERRetriever
 
+_DEER_CACHED_TRAIN_FILES = {
+    "msra": ("msra_ner", "msra_ner-train.arrow"),
+    "conll2003": ("conll2003", "conll2003-train.arrow"),
+    "wnut17": ("wnut_17", "wnut_17-train.arrow"),
+    "fewnerd": ("DFKI-SLT___few-nerd", "few-nerd-train.arrow"),
+    "ontonotes5": ("tner___ontonotes5", "ontonotes5-train.arrow"),
+}
+
+
+def _load_cached_deer_training_split(dataset_name: str):
+    """Open the newest cached training Arrow directly without taking HF locks."""
+    from datasets import Dataset, config as datasets_config
+
+    cache_directory, arrow_name = _DEER_CACHED_TRAIN_FILES[dataset_name]
+    cache_root = Path(
+        os.environ.get("HF_DATASETS_CACHE", str(datasets_config.HF_DATASETS_CACHE))
+    )
+    candidates = [
+        path for path in (cache_root / cache_directory).rglob(arrow_name)
+        if path.is_file()
+    ]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No cached DEER training Arrow found for {dataset_name} under {cache_root}"
+        )
+    arrow_path = max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+    return Dataset.from_file(str(arrow_path))
+
 # The contextual lattice is an optional terminal replacement.  It is loaded
 # once per process only when the versioned configuration requests it; legacy
 # SelectDenoise behavior does not import the frozen encoder or bundle.
@@ -1074,24 +1102,30 @@ def run_contextual_lattice_replay(
     return {"pred_tags": result["current_tags"], **result}
 
 
-def _init_deer(dataset_name: str = "conll2003"):
+def _init_deer(dataset_name: str = "conll2003", *, cache_only: bool = False):
     """Lazy-init DEER statistics and retriever for a given dataset."""
     global _deer_stats, _deer_retriever
     if dataset_name in _deer_stats:
         return
 
     from deer_retriever import DEERStatistics, DEERRetriever
-    from datasets import load_dataset
+
+    def load_training_split(dataset_path: str, *args, **kwargs):
+        if cache_only:
+            return _load_cached_deer_training_split(dataset_name)
+        from datasets import load_dataset
+
+        return load_dataset(dataset_path, *args, **kwargs)
 
     if dataset_name == "msra":
         print("[DEER] Building token statistics from MSRA-NER training set...")
-        ds = load_dataset("msra_ner", split="train", trust_remote_code=True)
+        ds = load_training_split("msra_ner", split="train", trust_remote_code=True)
         id2tag = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
     elif dataset_name == "wnut17":
         # WNUT-17 original tags coarsened to 4-class: person->PER, location->LOC,
         # corporation/group->ORG, creative-work/product->MISC
         print("[DEER] Building token statistics from WNUT-17 training set...")
-        ds = load_dataset("wnut_17", split="train", trust_remote_code=True)
+        ds = load_training_split("wnut_17", split="train", trust_remote_code=True)
         id2tag = ["O",
                   "B-ORG", "I-ORG",      # 1,2: corporation -> ORG
                   "B-MISC", "I-MISC",     # 3,4: creative-work -> MISC
@@ -1103,7 +1137,9 @@ def _init_deer(dataset_name: str = "conll2003"):
         # Few-NERD supervised: person->PER, location->LOC, organization->ORG,
         # art/building/event/other/product->MISC
         print("[DEER] Building token statistics from Few-NERD training set...")
-        ds = load_dataset("DFKI-SLT/few-nerd", "supervised", split="train", trust_remote_code=True)
+        ds = load_training_split(
+            "DFKI-SLT/few-nerd", "supervised", split="train", trust_remote_code=True
+        )
         id2tag = ds.features["ner_tags"].feature.names
         # Coarsen fine-grained types to 4-class
         _coarse = {
@@ -1122,7 +1158,7 @@ def _init_deer(dataset_name: str = "conll2003"):
     elif dataset_name == "ontonotes5":
         # OntoNotes5 via tner: tags field (not ner_tags). 37 IOB2 tags → coarsen to 4-class.
         print("[DEER] Building token statistics from OntoNotes5 training set...")
-        ds = load_dataset("tner/ontonotes5", split="train", trust_remote_code=True)
+        ds = load_training_split("tner/ontonotes5", split="train", trust_remote_code=True)
         _id2tag_raw = [
             "O",
             "B-CARDINAL", "B-DATE", "I-DATE",
@@ -1168,7 +1204,7 @@ def _init_deer(dataset_name: str = "conll2003"):
                 id2tag.append(f"{prefix}-{_coarse.get(etype, 'MISC')}")
     else:
         print("[DEER] Building token statistics from CoNLL2003 training set...")
-        ds = load_dataset("conll2003", split="train", trust_remote_code=True)
+        ds = load_training_split("conll2003", split="train", trust_remote_code=True)
         id2tag = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"]
 
     _tags_field = "tags" if dataset_name == "ontonotes5" else "ner_tags"

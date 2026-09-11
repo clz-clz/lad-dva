@@ -84,6 +84,23 @@ def test_deer_check_is_cache_only_and_has_no_provider_credentials(
         assert secret_name not in child_env
 
 
+def test_deer_check_enables_read_only_arrow_cache_mode(tmp_path):
+    (tmp_path / "multi_agent_v2.py").write_text(
+        "_deer_stats = {}\n"
+        "_deer_retriever = {}\n"
+        "def _init_deer(dataset, *, cache_only=False):\n"
+        "    if not cache_only:\n"
+        "        raise RuntimeError('read-only Arrow cache mode was not enabled')\n"
+        "    _deer_stats[dataset] = object()\n"
+        "    _deer_retriever[dataset] = object()\n",
+        encoding="utf-8",
+    )
+
+    assert official_preflight._one_deer_check(tmp_path, "msra", 3.0) == {
+        "ok": True,
+    }
+
+
 def test_deer_check_fails_closed_on_timeout(tmp_path, monkeypatch):
     def time_out(command, **kwargs):
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])

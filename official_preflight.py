@@ -114,7 +114,7 @@ def _validate_noisy_matrix(noisy_dir: Path, blockers: list[dict[str, Any]]) -> d
 def _one_deer_check(repo_root: Path, dataset: str, timeout: float) -> dict[str, Any]:
     code = (
         "import json, multi_agent_v2 as m; "
-        f"m._init_deer({dataset!r}); "
+        f"m._init_deer({dataset!r}, cache_only=True); "
         f"assert {dataset!r} in m._deer_stats and {dataset!r} in m._deer_retriever; "
         "print(json.dumps({'ok': True}))"
     )
