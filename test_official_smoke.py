@@ -171,3 +171,57 @@ def test_contextual_smoke_selector_keeps_fixed_and_length_representative_rows():
     for key in cells:
         representatives = [entry for entry in selected if entry[:3] == key]
         assert {entry[3] for entry in representatives} >= {99, 189, 199}
+
+
+def test_contextual_smoke_main_wires_selected_rows_into_production_runner(
+    capsys, monkeypatch, tmp_path,
+):
+    environment = {
+        "BACKBONE_PROVIDER": "vllm",
+        "BACKBONE_MODEL": "Qwen/Qwen3-32B-AWQ",
+        "BACKBONE_BASE_URL": "http://127.0.0.1:8000/v1",
+        "BACKBONE_API_KEY": "offline-key",
+        "BACKBONE_TAG": "qwen-contextual-smoke-test",
+        "BACKBONE_REVISION": "0499c3ac83fdef8810b907a23894ba91e95eddd8",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(official_smoke, "_contextual_smoke_plan", lambda: [
+        ("msra", "BT", 13, 125), ("msra", "BT", 13, 199),
+    ])
+    monkeypatch.setattr(official_smoke.runner, "_import_pipeline", lambda _dummy: object())
+    monkeypatch.setattr(official_smoke, "_git_sha", lambda: "1" * 40)
+
+    class Factory:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(official_smoke.runner, "_CachedAdapterFactory", lambda _factory: Factory())
+    calls = []
+
+    async def fake_run(*args, **kwargs):
+        calls.append(kwargs["row_indices"])
+        row = {
+            "tokens": ["Alice", "works"], "gold_tags": ["B-PER", "O"],
+            "pred_tags": ["B-PER", "O"], "fallback_used": False,
+            "candidate_paths": [["B-PER", "O"]], "rag_weights": [1.0],
+            "confidence": [1.0, 1.0],
+        }
+        output = kwargs["prediction_path"]
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            "".join(json.dumps(row) + "\n" for _ in kwargs["row_indices"]),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(official_smoke.runner, "_run_one_cell", fake_run)
+
+    code = official_smoke.main([
+        "--config", "selectdenoise_contextual_lattice", "--output-root", str(tmp_path),
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["ok"] is True
+    assert calls == [[125, 199]]
+    assert payload["cell"]["smoke_records"] == 2

@@ -408,8 +408,11 @@ def run_live_preflight(
                  "temperature": 0.0, "enable_thinking": True},
             )
             verifier_tags = verifier.get("tags") if isinstance(verifier, Mapping) else None
-            if not isinstance(verifier_tags, list) or len(verifier_tags) != len(tokens):
-                raise ValueError("Contextual Qwen Verifier probe returned an invalid tag count")
+            if (not isinstance(verifier_tags, list) or len(verifier_tags) != len(tokens)
+                    or any(tag not in valid_tags for tag in verifier_tags)):
+                raise ValueError(
+                    "Contextual Qwen Verifier probe returned an invalid ontology tag sequence"
+                )
             evidence.append((verifier, "verifier"))
         if not contextual_profile and settings.provider == "deepseek":
             structured_requester = getattr(adapter, "structured_requester", None)

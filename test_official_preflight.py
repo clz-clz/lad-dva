@@ -552,6 +552,49 @@ def test_contextual_qwen_live_preflight_probes_exact_lengths_reasoning_and_verif
     assert [payload["schema"]["properties"]["tags"]["maxItems"] for _, payload in calls] == [69, 372, 3]
 
 
+def test_contextual_qwen_live_preflight_rejects_invalid_verifier_ontology_tag():
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision="0499c3ac83fdef8810b907a23894ba91e95eddd8",
+    )
+    identity = {
+        "provider": "vllm", "model": settings.model,
+        "served_model": settings.served_model, "revision": settings.revision,
+        "structured_api": settings.structured_api,
+    }
+
+    class Adapter:
+        def __init__(self, configured):
+            assert configured is settings
+
+        def provider_metadata(self):
+            return dict(identity)
+
+        def structured_requester(self, stage, payload):
+            count = payload["schema"]["properties"]["tags"]["maxItems"]
+            tags = ["O"] * count
+            if stage == "verifier":
+                tags[-1] = "B-NOT-AN-ONTOLOGY-TAG"
+            return LiveBackboneResult({"tags": tags}, {
+                **identity, "stage": stage, "status": "live",
+                "response_model": settings.served_model, "response_status": "completed",
+                "finish_reason": "stop", "incomplete_reason": None,
+                "system_fingerprint": "fp-contextual", "usage": {"total_tokens": 1},
+            })
+
+        def close(self):
+            pass
+
+    report = official_preflight.run_live_preflight(
+        settings=settings, config_names=["selectdenoise_contextual_lattice"],
+        models_fetcher=lambda _: [{"id": settings.served_model}], adapter_factory=Adapter,
+    )
+
+    assert report["ok"] is False
+    assert "ontology" in report["blockers"][0]["message"]
+
+
 def test_static_cli_converts_internal_failure_to_json_only(capsys, monkeypatch, tmp_path):
     def broken(**kwargs):
         raise RuntimeError("fixture failure")

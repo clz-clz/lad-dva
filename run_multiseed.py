@@ -893,7 +893,10 @@ def _read_provider_cache_index_cell(root: Path, tag: str, key: str) -> Mapping[s
 
 def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | None,
                                     ratios: Sequence[float], max_concurrency: int,
-                                    failure_policy: str, dummy: bool) -> None:
+                                    failure_policy: str, dummy: bool,
+                                    datasets: Sequence[str] | None = None,
+                                    noise_types: Sequence[str] | None = None,
+                                    seeds: Sequence[int] | None = None) -> None:
     if dummy or failure_policy != "abort":
         raise ValueError("provider-cache phase requires real requests and failure-policy abort")
     if size != OFFICIAL_SAMPLE_SIZE or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
@@ -902,6 +905,13 @@ def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | 
         raise ValueError("provider-cache phase requires max-concurrency 20")
     if list(config_names) != ["selectdenoise_contextual_lattice"]:
         raise ValueError("provider-cache phase requires exactly the contextual-lattice config")
+    for name, actual, expected in (
+        ("datasets", datasets, DATASETS),
+        ("noise_types", noise_types, NOISE_TYPES),
+        ("seeds", seeds, SEEDS),
+    ):
+        if actual is not None and list(actual) != list(expected):
+            raise ValueError(f"provider-cache phase requires canonical {name}: {list(expected)}")
 
 
 async def _run_provider_cache_cell(
@@ -952,7 +962,7 @@ async def _run_provider_cache_cell(
     sem = asyncio.Semaphore(max_concurrency)
     cached: list[Optional[dict[str, Any]]] = [None] * len(rows)
     provider_config = dict(config)
-    provider_config.pop("terminal_decoder", None)
+    provider_config["preterminal_only"] = True
 
     async def process(index: int, row: Mapping[str, Any]) -> None:
         async with sem:
@@ -1005,6 +1015,7 @@ async def _run_one_cell(config_name: str, config: dict,
                         request_timeout: float = PER_REQUEST_TIMEOUT,
                         adapter_factory: Optional[Callable[[], Any]] = None,
                         paid_smoke_size: Optional[int] = None,
+                        row_indices: Optional[Sequence[int]] = None,
                         prediction_path: Optional[Path] = None):
     """Run one cell and clean only its exact temporary output on abort."""
     pred_p = (Path(prediction_path) if prediction_path is not None
@@ -1016,7 +1027,8 @@ async def _run_one_cell(config_name: str, config: dict,
             max_concurrency=max_concurrency, dummy=dummy, ratio=ratio,
             official=official, failure_policy=failure_policy,
             request_timeout=request_timeout, adapter_factory=adapter_factory,
-            paid_smoke_size=paid_smoke_size, prediction_path=prediction_path,
+            paid_smoke_size=paid_smoke_size, row_indices=row_indices,
+            prediction_path=prediction_path,
         )
     except Exception:
         if failure_policy == "abort":
@@ -1033,6 +1045,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
                              request_timeout: float = PER_REQUEST_TIMEOUT,
                              adapter_factory: Optional[Callable[[], Any]] = None,
                              paid_smoke_size: Optional[int] = None,
+                             row_indices: Optional[Sequence[int]] = None,
                              prediction_path: Optional[Path] = None):
     if config.get("offline_only"):
         raise RuntimeError(
@@ -1044,21 +1057,27 @@ async def _run_one_cell_impl(config_name: str, config: dict,
         raise ValueError("failure_policy must be 'abort' or 'dirty'")
     is_paid_smoke = paid_smoke_size is not None
     launch_strict = official or is_paid_smoke
-    official_profile = _official_profile(config) if official else None
+    official_profile = _official_profile(config) if launch_strict else None
     if official and is_paid_smoke:
         raise ValueError("official publication and paid smoke modes are mutually exclusive")
     if official and prediction_path is not None:
         raise ValueError("official predictions must use the canonical tagged namespace")
     if is_paid_smoke:
-        if paid_smoke_size != PAID_SMOKE_SIZE:
+        contextual_smoke = config.get("terminal_decoder") == "contextual-lattice-v1"
+        if (not contextual_smoke and paid_smoke_size != PAID_SMOKE_SIZE):
             raise ValueError(f"paid smoke requires exactly {PAID_SMOKE_SIZE} records")
+        if contextual_smoke and (
+                not row_indices or paid_smoke_size != len(row_indices)
+                or len(set(row_indices)) != len(row_indices)):
+            raise ValueError("contextual paid smoke requires unique selected row indices")
         if prediction_path is None:
             raise ValueError("paid smoke requires a dedicated prediction_path")
         if dummy:
             raise ValueError("paid smoke cannot use --dummy")
         if failure_policy != "abort":
             raise ValueError("paid smoke requires failure_policy='abort'")
-        if config.get("terminal_graph") != "lad-rg":
+        if (config.get("terminal_graph") != "lad-rg"
+                and config.get("terminal_decoder") != "contextual-lattice-v1"):
             raise ValueError("paid smoke requires a LAD-RG configuration")
         if size != OFFICIAL_SAMPLE_SIZE:
             raise ValueError("paid smoke must read the canonical size 200 noisy cell")
@@ -1098,7 +1117,8 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             f"found {len(rows)} in {noisy_p.name}"
         )
     if is_paid_smoke:
-        rows = rows[:paid_smoke_size]
+        rows = ([rows[index] for index in row_indices]
+                if row_indices is not None else rows[:paid_smoke_size])
     logging.info(f"[run]  {pred_p.name}  ({len(rows)} sentences)")
     t0 = time.time()
 
@@ -1338,7 +1358,8 @@ def main(argv=None):
         _validate_provider_cache_launch(
             args.configs, size=args.size, ratios=args.ratios,
             max_concurrency=args.max_concurrency, failure_policy=args.failure_policy,
-            dummy=args.dummy,
+            dummy=args.dummy, datasets=args.datasets, noise_types=args.noise,
+            seeds=args.seeds,
         )
         if not isinstance(args.bundle_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", args.bundle_hash):
             raise ValueError("provider-cache phase requires --bundle-hash with 64 hexadecimal characters")
@@ -1360,10 +1381,11 @@ def main(argv=None):
             ["git", "rev-parse", "HEAD"], check=True, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         ).stdout.strip()
-        manifest = _build_official_manifest(
-            official_settings, BACKBONE_TAG, git_sha, args.request_timeout,
-        )
-        _ensure_official_manifest(manifest, PRED_DIR, BACKBONE_TAG)
+        if args.phase != "provider-cache":
+            manifest = _build_official_manifest(
+                official_settings, BACKBONE_TAG, git_sha, args.request_timeout,
+            )
+            _ensure_official_manifest(manifest, PRED_DIR, BACKBONE_TAG)
         from live_backbone import OpenAICompatibleLADRGAdapter
 
         adapter_factory = _CachedAdapterFactory(

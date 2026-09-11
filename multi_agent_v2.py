@@ -2397,7 +2397,8 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
 
     noise_type = config.get("__noise_type__", "BT")
     terminal = None
-    if config.get("terminal_decoder") == "contextual-lattice-v1":
+    if (config.get("terminal_decoder") == "contextual-lattice-v1"
+            and not config.get("preterminal_only", False)):
         # Load before opening any sentence work so a missing/mismatched bundle
         # is visible to the orchestrator instead of silently changing methods.
         terminal = _load_contextual_lattice_terminal()

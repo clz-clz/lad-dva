@@ -24,7 +24,11 @@ import run_multiseed as runner
 
 PAID_SMOKE_SIZE = runner.PAID_SMOKE_SIZE
 SMOKE_REPORT_SCHEMA = "lad-rg-paid-smoke-v1"
-SMOKE_CONFIGS = ("lad_rg_full", "lad_rg_gasd_r", "lad_rg_gasd_both")
+SMOKE_CONFIGS = (
+    "lad_rg_full", "lad_rg_gasd_r", "lad_rg_gasd_both",
+    "selectdenoise_contextual_lattice",
+)
+CONTEXTUAL_SMOKE_CONFIG = "selectdenoise_contextual_lattice"
 
 
 def select_contextual_smoke_rows(
@@ -145,6 +149,38 @@ def assess_smoke_rows(rows: Sequence[Mapping[str, Any]], *, config_name: str) ->
     }
 
 
+def assess_contextual_smoke_rows(
+    rows: Sequence[Mapping[str, Any]], *, expected_count: int,
+) -> dict[str, Any]:
+    """Gate the selected contextual rows after per-cell official validation."""
+    records = list(rows)
+    fallback_count = sum(row.get("fallback_used") is not False for row in records)
+    candidate_count = sum(_candidate_evidence_present(row) for row in records)
+    blockers: list[dict[str, Any]] = []
+    if len(records) != expected_count:
+        blockers.append({
+            "code": "record_count",
+            "message": f"contextual smoke produced {len(records)} records, expected {expected_count}",
+        })
+    if fallback_count:
+        blockers.append({
+            "code": "fallback_used",
+            "message": f"{fallback_count} contextual smoke rows used or omitted fallback evidence",
+        })
+    if candidate_count != len(records):
+        blockers.append({
+            "code": "candidate_evidence",
+            "message": f"candidate evidence is complete for {candidate_count}/{len(records)} rows",
+        })
+    return {
+        "ok": not blockers,
+        "record_count": len(records),
+        "fallback_count": fallback_count,
+        "candidate_evidence_count": candidate_count,
+        "blockers": blockers,
+    }
+
+
 def _smoke_output_path(
     output_root: Path, *, tag: str, config_name: str, dataset: str,
     noise: str, seed: int,
@@ -170,12 +206,23 @@ def _git_sha() -> str:
     ).stdout.strip()
 
 
+def _contextual_smoke_plan() -> list[tuple[str, str, int, int]]:
+    cells = {
+        (dataset, noise, 13): runner._load_noisy(
+            runner._noisy_path(dataset, noise, 13, runner.OFFICIAL_SAMPLE_SIZE,
+                               runner.OFFICIAL_NOISE_RATIO)
+        )
+        for dataset in runner.DATASETS for noise in runner.NOISE_TYPES
+    }
+    return select_contextual_smoke_rows(cells)
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, choices=SMOKE_CONFIGS)
-    parser.add_argument("--dataset", required=True, choices=runner.DATASETS)
-    parser.add_argument("--noise", required=True, choices=runner.NOISE_TYPES)
-    parser.add_argument("--seed", required=True, type=int, choices=runner.SEEDS)
+    parser.add_argument("--dataset", choices=runner.DATASETS)
+    parser.add_argument("--noise", choices=runner.NOISE_TYPES)
+    parser.add_argument("--seed", type=int, choices=runner.SEEDS)
     parser.add_argument("--noisy-root", type=Path, default=Path("results_multiseed"))
     parser.add_argument(
         "--output-root", type=Path, default=Path("predictions_multiseed") / "smoke"
@@ -201,10 +248,84 @@ def _failure_report(exc: Exception) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
+        if args.config != CONTEXTUAL_SMOKE_CONFIG and (
+                args.dataset is None or args.noise is None or args.seed is None):
+            raise ValueError("historical LAD-RG smoke requires dataset, noise, and seed")
+        if args.config == CONTEXTUAL_SMOKE_CONFIG and any(
+                value is not None for value in (args.dataset, args.noise, args.seed)):
+            raise ValueError("contextual smoke selects all canonical seed-13 cells")
         settings, tag = runner._official_settings_from_env([args.config], os.environ)
         runner._configure_official_request_model(settings)
         runner.BACKBONE_TAG = tag
         runner.NOISY_DIR = args.noisy_root
+        if args.config == CONTEXTUAL_SMOKE_CONFIG:
+            selected = _contextual_smoke_plan()
+            output_root = Path(args.output_root) / "contextual"
+            report_path = output_root / f"contextual_smoke__{tag}.report.json"
+            output_paths = [
+                _smoke_output_path(
+                    output_root, tag=tag, config_name=args.config,
+                    dataset=dataset, noise=noise, seed=seed,
+                )
+                for dataset, noise, seed, _ in selected
+            ]
+            if report_path.exists() or any(path.exists() for path in output_paths):
+                raise FileExistsError(
+                    "contextual smoke artifacts already exist; select a new BACKBONE_TAG or move them first"
+                )
+            from live_backbone import OpenAICompatibleLADRGAdapter
+
+            pipelines = runner._import_pipeline(False)
+            adapter_factory = runner._CachedAdapterFactory(
+                lambda: OpenAICompatibleLADRGAdapter(settings)
+            )
+            by_cell: dict[tuple[str, str, int], list[int]] = {}
+            for dataset, noise, seed, index in selected:
+                by_cell.setdefault((dataset, noise, seed), []).append(index)
+            rows = []
+            try:
+                with redirect_stdout(sys.stderr):
+                    for (dataset, noise, seed), indices in sorted(by_cell.items()):
+                        output_path = _smoke_output_path(
+                            output_root, tag=tag, config_name=args.config,
+                            dataset=dataset, noise=noise, seed=seed,
+                        )
+                        asyncio.run(runner._run_one_cell(
+                            args.config, runner.CONFIGURATIONS[args.config],
+                            dataset, noise, seed, runner.OFFICIAL_SAMPLE_SIZE,
+                            pipelines, max_concurrency=args.max_concurrency, dummy=False,
+                            ratio=runner.OFFICIAL_NOISE_RATIO, official=False,
+                            paid_smoke_size=len(indices), row_indices=indices,
+                            prediction_path=output_path, failure_policy="abort",
+                            request_timeout=args.request_timeout,
+                            adapter_factory=adapter_factory,
+                        ))
+                        rows.extend(runner._load_noisy(output_path))
+            finally:
+                adapter_factory.close()
+            gate = assess_contextual_smoke_rows(rows, expected_count=len(selected))
+            report = {
+                "schema_version": SMOKE_REPORT_SCHEMA,
+                "ok": gate["ok"], "git_sha": _git_sha(),
+                "backbone": {
+                    "provider": settings.provider, "model": settings.model,
+                    "served_model": settings.served_model, "revision": settings.revision,
+                    "structured_api": settings.structured_api,
+                    "endpoint_origin": runner._endpoint_origin(settings.base_url),
+                    "tag": tag,
+                },
+                "cell": {
+                    "config": args.config, "datasets": list(runner.DATASETS),
+                    "noise_types": list(runner.NOISE_TYPES), "seed": 13,
+                    "canonical_source_size": runner.OFFICIAL_SAMPLE_SIZE,
+                    "smoke_records": len(selected),
+                },
+                "selection": [list(entry) for entry in selected],
+                "gate": gate, "blockers": gate["blockers"],
+            }
+            _write_json_atomic(report_path, report)
+            sys.stdout.write(json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n")
+            return 0 if report["ok"] else 1
         output_path = _smoke_output_path(
             args.output_root, tag=tag, config_name=args.config,
             dataset=args.dataset, noise=args.noise, seed=args.seed,

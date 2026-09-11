@@ -243,7 +243,8 @@ def test_provider_cache_cell_runs_preterminal_graph_once_and_is_exactly_resumabl
     ))
 
     assert len(calls) == 200
-    assert all("terminal_decoder" not in config for config in calls)
+    assert all(config["terminal_decoder"] == "contextual-lattice-v1" for config in calls)
+    assert all(config["preterminal_only"] is True for config in calls)
     assert first["row_count"] == 200
     assert first["sha256"] == hashlib.sha256(Path(first["path"]).read_bytes()).hexdigest()
     assert adapter.closed is False
@@ -258,6 +259,99 @@ def test_provider_cache_cell_runs_preterminal_graph_once_and_is_exactly_resumabl
 
     assert second == first
     assert calls == []
+
+
+def test_contextual_provider_cache_uses_real_pipeline_preterminal_mode(monkeypatch):
+    class Graph:
+        async def ainvoke(self, state):
+            assert state["official"] is True
+            assert state["provider_metadata"]
+            return {
+                **state,
+                "current_tags": ["B-PER", "O"],
+                "candidate_paths": [["B-PER", "O"]],
+                "rag_weights": [1.0],
+                "provider_metadata": {
+                    "coder": [_contextual_live_record("coder") for _ in range(3)],
+                    "reviewer": [_contextual_skipped_record("reviewer", "skipped_identical")],
+                    "verifier": [_contextual_skipped_record("verifier", "skipped_uncontested")],
+                },
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "_select_pipeline_graph", lambda config: Graph())
+    monkeypatch.setattr(
+        multi_agent_v2, "_load_contextual_lattice_terminal",
+        lambda: (_ for _ in ()).throw(AssertionError("offline terminal must be skipped")),
+    )
+    config = {
+        **run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "official": True,
+        "preterminal_only": True,
+        "provider_metadata": _contextual_identity(),
+        "__return_candidates__": True,
+    }
+
+    result = asyncio.run(
+        multi_agent_v2.run_agent_pipeline(
+            ["Alice", "works"], ["B-PER", "O"], config, dataset_name="msra"
+        )
+    )
+
+    assert result["pred_tags"] == ["B-PER", "O"]
+    assert result["fallback_used"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("datasets", ["msra"]), ("noise_types", ["BT"]), ("seeds", [13])],
+)
+def test_provider_cache_phase_rejects_partial_canonical_matrix(field, value):
+    kwargs = {
+        "datasets": run_multiseed.DATASETS,
+        "noise_types": run_multiseed.NOISE_TYPES,
+        "seeds": run_multiseed.SEEDS,
+    }
+    kwargs[field] = value
+    with pytest.raises(ValueError, match=field):
+        run_multiseed._validate_provider_cache_launch(
+            ["selectdenoise_contextual_lattice"], size=200, ratios=[0.15],
+            max_concurrency=20, failure_policy="abort", dummy=False, **kwargs,
+        )
+
+
+def test_provider_cache_does_not_create_historical_prediction_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKBONE_PROVIDER", "vllm")
+    monkeypatch.setenv("BACKBONE_MODEL", "Qwen/Qwen3-32B-AWQ")
+    monkeypatch.setenv("BACKBONE_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("BACKBONE_API_KEY", "offline-key")
+    monkeypatch.setenv("BACKBONE_TAG", "qwen-cache-test")
+    monkeypatch.setenv("BACKBONE_REVISION", CONTEXTUAL_REVISION)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", tmp_path / "predictions")
+    monkeypatch.setattr(run_multiseed, "_import_pipeline", lambda _dummy: (None, {}))
+    class Factory:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_multiseed, "_CachedAdapterFactory", lambda _factory: Factory())
+    monkeypatch.setattr(
+        run_multiseed, "_ensure_official_manifest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("historical manifest used")),
+    )
+    calls = []
+
+    async def fake_cell(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(run_multiseed, "_run_provider_cache_cell", fake_cell)
+
+    run_multiseed.main([
+        "--phase", "provider-cache", "--official", "--size", "200",
+        "--max-concurrency", "20", "--bundle-hash", "b" * 64,
+        "--provider-cache-root", str(tmp_path / "cache"),
+    ])
+
+    assert len(calls) == 45
+    assert not list((tmp_path / "predictions").glob("run_manifest__*.json"))
 
 
 def test_provider_cache_phase_rejects_non_contextual_or_noncanonical_launches():
