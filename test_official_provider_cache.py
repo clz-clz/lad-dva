@@ -14,13 +14,23 @@ _SERVED_MODEL = f"{_MODEL}@{_REVISION}"
 
 
 def _evidence(stage, status):
-    return {
+    evidence = {
         "stage": stage,
         "status": status,
+        "provider": "vllm",
         "model": _MODEL,
         "served_model": _SERVED_MODEL,
         "revision": _REVISION,
+        "structured_api": "chat-completions-json-schema",
     }
+    if status == "live":
+        evidence.update({
+            "response_model": _SERVED_MODEL,
+            "response_status": "completed",
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+    return evidence
 
 
 def _record(index=0, digest=None):
@@ -33,8 +43,8 @@ def _record(index=0, digest=None):
         "confidence": [1.0, 1.0],
         "provider_metadata": {
             "coder": [_evidence("coder", "live")],
-            "reviewer": [_evidence("reviewer", "skipped")],
-            "verifier": [_evidence("verifier", "skipped")],
+            "reviewer": [_evidence("reviewer", "skipped_identical")],
+            "verifier": [_evidence("verifier", "skipped_uncontested")],
         },
         "fallback_used": False,
     }
@@ -214,7 +224,6 @@ def test_failed_cell_is_not_resumable_as_a_completed_cell(tmp_path):
 
 
 @pytest.mark.parametrize("identity_field", ["git_sha", "model_revision", "bundle_hash", "configuration"])
-@pytest.mark.skip(reason="Task 4 owns offline contextual replay identity validation.")
 def test_contextual_replay_rejects_provider_cache_identity_mismatches(identity_field):
     """The future replay phase must bind every cache to its launch identity."""
     record = _record()
@@ -228,6 +237,100 @@ def test_contextual_replay_rejects_provider_cache_identity_mismatches(identity_f
 
     with pytest.raises(ValueError, match=identity_field):
         run_multiseed._validate_replay_cache_identity(cached, expected)
+
+
+def test_contextual_replay_phase_parses_an_explicit_cache_tag_and_root(tmp_path):
+    args = run_multiseed._parse_args([
+        "--phase", "contextual-replay",
+        "--provider-cache-root", str(tmp_path),
+        "--provider-cache-tag", "qwen-replay-v1",
+    ])
+
+    assert args.phase == "contextual-replay"
+    assert args.provider_cache_root == tmp_path
+    assert args.provider_cache_tag == "qwen-replay-v1"
+
+
+def test_contextual_replay_cell_rechecks_source_rows_and_persists_cache_provenance(tmp_path, monkeypatch):
+    import asyncio
+
+    noisy_dir = tmp_path / "noisy"
+    prediction_path = tmp_path / "predictions.jsonl"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    source_rows = [
+        {"tokens": ["Acme", "arrived"], "ner_tags": ["B-ORG", "O"],
+         "dirty_tags": ["B-ORG", "O"]}
+        for _ in range(200)
+    ]
+    noisy_dir.mkdir(parents=True)
+    noisy_path = run_multiseed._noisy_path("conll2003", "BT", 13, 200, 0.15)
+    noisy_path.write_text(
+        "".join(json.dumps(row) + "\n" for row in source_rows), encoding="utf-8"
+    )
+    cache_root = tmp_path / "cache"
+    tag = "qwen-replay-v1"
+    config = run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"]
+    manifest = run_multiseed._provider_cache_manifest(
+        source_rows, config, dataset="conll2003", noise="BT", seed=13,
+        git_sha="a" * 40, bundle_hash="b" * 64,
+    )
+    records = []
+    for index, row in enumerate(source_rows):
+        record = _record(index, run_multiseed._provider_input_digest(row))
+        record["provider_metadata"]["coder"] = [
+            _evidence("coder", "live") for _ in range(3)
+        ]
+        records.append(record)
+    cell = run_multiseed._provider_cache_cell_path(
+        cache_root, tag, "selectdenoise_contextual_lattice", "conll2003", "BT", 13
+    )
+    sha = official_provider_cache.write_provider_cell(cell, records, manifest)
+    run_multiseed._update_provider_cache_index(
+        cache_root, tag,
+        key=run_multiseed._provider_cache_cell_key(
+            "selectdenoise_contextual_lattice", "conll2003", "BT", 13
+        ),
+        cell={"path": str(cell), "sha256": sha, "row_count": 200,
+              "git_sha": "a" * 40, "model_revision": _REVISION,
+              "provider_fingerprint": "d" * 64},
+    )
+
+    def replay_fn(**kwargs):
+        assert set(kwargs["provider_record"]) == {
+            "row_index", "input_digest", "anchor_tags", "candidate_paths",
+            "rag_weights", "confidence", "provider_metadata", "fallback_used",
+        }
+        return {
+            "pred_tags": ["B-ORG", "O"],
+            "terminal_anchor_tags": ["B-ORG", "O"],
+            "terminal_model_hash": "2b45770a128cc5a716d3c7dbdc75ab059afc1a1b9ed471ea5cf1bd4f2a150e4e",
+            "terminal_used_anchor": True,
+            "terminal_predicted_gain": 0.0,
+            "terminal_fallback_count": 0,
+        }
+
+    output = asyncio.run(run_multiseed._run_contextual_replay_cell(
+        "conll2003", "BT", 13, 200, cache_root=cache_root, cache_tag=tag,
+        bundle_hash="b" * 64, git_sha="a" * 40, replay_fn=replay_fn,
+        terminal=object(), max_concurrency=4, prediction_path=prediction_path,
+    ))
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 200
+    assert all(row["provider_cache_sha256"] == sha for row in rows)
+    assert all(row["terminal_fallback_count"] == 0 for row in rows)
+
+
+def test_contextual_replay_environment_clears_credentials_and_blocks_sockets(monkeypatch):
+    import socket
+
+    monkeypatch.setenv("BACKBONE_API_KEY", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    with run_multiseed._offline_contextual_replay_environment():
+        assert run_multiseed.os.environ["BACKBONE_API_KEY"] == ""
+        assert run_multiseed.os.environ["OPENAI_API_KEY"] == ""
+        with pytest.raises(RuntimeError, match="network access is disabled"):
+            socket.create_connection(("127.0.0.1", 9), timeout=0.01)
+    assert run_multiseed.os.environ["BACKBONE_API_KEY"] == "secret"
 
 
 def test_provider_cache_phase_is_a_distinct_runner_phase():

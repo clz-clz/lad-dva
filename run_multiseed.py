@@ -24,13 +24,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import contextlib
 import hashlib
 import importlib.metadata
 import json
 import logging
+import math
 import os
 import platform
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -76,6 +79,7 @@ OFFICIAL_PROVIDER_CACHE_SCHEMA = PROVIDER_CACHE_SCHEMA
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
 PROVIDER_CACHE_DIR = Path("provider_cache")
 PROVIDER_CACHE_INDEX_SCHEMA = "selectdenoise-contextual-provider-cache-index-v1"
+CONTEXTUAL_REPLAY_PHASE = "contextual-replay"
 _OFFICIAL_CONTEXTUAL_STAGES = frozenset({"coder", "reviewer", "verifier"})
 DATASET_ENTITY_TYPES = {
     "msra": ["PER", "LOC", "ORG"],
@@ -891,6 +895,213 @@ def _read_provider_cache_index_cell(root: Path, tag: str, key: str) -> Mapping[s
     return cell
 
 
+def _validate_replay_cache_identity(actual: Mapping[str, Any],
+                                    expected: Mapping[str, Any]) -> None:
+    """Bind replay to the exact provider-cache launch identity."""
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        raise ValueError("provider-cache replay identity must be a mapping")
+    for field in ("schema", "git_sha", "model_revision", "bundle_hash", "configuration"):
+        if actual.get(field) != expected.get(field):
+            raise ValueError(f"provider-cache replay {field} identity mismatch")
+
+
+def _validate_replay_source_rows(source_rows: Sequence[Mapping[str, Any]],
+                                 cached_rows: Sequence[Mapping[str, Any]]) -> None:
+    """Re-read canonical noisy inputs before allowing terminal decoding."""
+    if len(source_rows) != len(cached_rows):
+        raise ValueError("provider-cache replay source row count mismatch")
+    for index, (source, cached) in enumerate(zip(source_rows, cached_rows)):
+        if cached.get("row_index") != index:
+            raise ValueError(f"provider-cache replay row index mismatch at {index}")
+        expected_digest = _provider_input_digest(source)
+        if cached.get("input_digest") != expected_digest:
+            raise ValueError(f"provider-cache replay input digest mismatch at row {index}")
+
+
+def _validate_contextual_replay_launch(config_names: Sequence[str], *, size: int | None,
+                                      ratios: Sequence[float], max_concurrency: int,
+                                      failure_policy: str, dummy: bool,
+                                      datasets: Sequence[str] | None = None,
+                                      noise_types: Sequence[str] | None = None,
+                                      seeds: Sequence[int] | None = None) -> None:
+    if dummy or failure_policy != "abort":
+        raise ValueError("contextual-replay phase requires real offline replay and failure-policy abort")
+    if size != OFFICIAL_SAMPLE_SIZE or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
+        raise ValueError("contextual-replay phase requires size 200 and ratio 0.15")
+    if list(config_names) != ["selectdenoise_contextual_lattice"]:
+        raise ValueError("contextual-replay phase requires exactly the contextual-lattice config")
+    if max_concurrency <= 0:
+        raise ValueError("contextual-replay phase requires positive max-concurrency")
+    for name, actual, expected in (
+        ("datasets", datasets, DATASETS),
+        ("noise_types", noise_types, NOISE_TYPES),
+        ("seeds", seeds, SEEDS),
+    ):
+        if actual is not None and list(actual) != list(expected):
+            raise ValueError(f"contextual-replay phase requires canonical {name}: {list(expected)}")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_contextual_replay_bundle(bundle_hash: str) -> tuple[Path, Path]:
+    """Validate the locked local bundle and its pre-existing embedding cache."""
+    from contextual_lattice_runtime import (
+        LOCKED_BUNDLE_MANIFEST_HASH, LOCKED_CHECKPOINT_HASH,
+        LOCKED_DECODER_FILE_HASH, LOCKED_GATE_FILE_HASH,
+        LOCKED_DECODER_MODEL_HASH, LOCKED_SPLIT_HASH,
+    )
+
+    if (not isinstance(bundle_hash, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash)
+            or bundle_hash.lower() != LOCKED_BUNDLE_MANIFEST_HASH):
+        raise ValueError("contextual-replay requires the locked bundle manifest hash")
+    bundle_text = os.environ.get("CONTEXTUAL_LATTICE_BUNDLE", "").strip()
+    if not bundle_text:
+        raise ValueError("contextual-replay requires CONTEXTUAL_LATTICE_BUNDLE")
+    bundle_path = Path(bundle_text).expanduser().resolve()
+    if not bundle_path.is_dir():
+        raise FileNotFoundError(f"contextual replay bundle directory not found: {bundle_path}")
+    manifest_path = bundle_path / "manifest.json"
+    decoder_path = bundle_path / "decoder.pt"
+    gate_path = bundle_path / "gate.joblib"
+    for path in (manifest_path, decoder_path, gate_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"contextual replay bundle file not found: {path}")
+    if _sha256_file(manifest_path) != LOCKED_BUNDLE_MANIFEST_HASH:
+        raise ValueError("contextual replay bundle manifest hash mismatch")
+    if _sha256_file(decoder_path) != LOCKED_DECODER_FILE_HASH:
+        raise ValueError("contextual replay decoder file hash mismatch")
+    if _sha256_file(gate_path) != LOCKED_GATE_FILE_HASH:
+        raise ValueError("contextual replay gate file hash mismatch")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("contextual replay bundle manifest is unreadable") from exc
+    checkpoint_value = manifest.get("checkpoint") if isinstance(manifest, Mapping) else None
+    checkpoint = (checkpoint_value.get("path") if isinstance(checkpoint_value, Mapping)
+                  else checkpoint_value)
+    if not isinstance(checkpoint, str):
+        raise ValueError("contextual replay bundle checkpoint provenance is missing")
+    if manifest.get("checkpoint_hash") != LOCKED_CHECKPOINT_HASH:
+        raise ValueError("contextual replay manifest checkpoint hash is not locked")
+    if (manifest.get("split_hash") != LOCKED_SPLIT_HASH
+            or manifest.get("decoder_model_hash") != LOCKED_DECODER_MODEL_HASH):
+        raise ValueError("contextual replay bundle provenance is not locked")
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        candidates = [Path.cwd() / checkpoint_path,
+                      bundle_path.parents[2] / checkpoint_path]
+        checkpoint_path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    if not checkpoint_path.is_file() or _sha256_file(checkpoint_path) != LOCKED_CHECKPOINT_HASH:
+        raise ValueError("contextual replay checkpoint hash mismatch")
+    embedding_text = os.environ.get("CONTEXTUAL_LATTICE_ENCODER_CACHE", "").strip()
+    embedding_path = (Path(embedding_text).expanduser().resolve()
+                      if embedding_text else bundle_path / "embedding_cache")
+    if not embedding_path.is_dir():
+        raise FileNotFoundError(
+            f"contextual replay embedding cache directory not found: {embedding_path}"
+        )
+    os.environ["CONTEXTUAL_LATTICE_ENCODER_CACHE"] = str(embedding_path)
+    return bundle_path, embedding_path
+
+
+@contextlib.contextmanager
+def _offline_contextual_replay_environment():
+    """Remove provider credentials and fail closed on socket connection attempts."""
+    credential_keys = (
+        "BACKBONE_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "VLLM_API_KEY",
+        "ANTHROPIC_API_KEY", "HF_TOKEN", "HUGGINGFACE_HUB_TOKEN",
+    )
+    offline_keys = credential_keys + (
+        "BACKBONE_PROVIDER", "BACKBONE_MODEL", "BACKBONE_BASE_URL",
+        "BACKBONE_SERVED_MODEL", "BACKBONE_REVISION", "LAD_RG_OFFICIAL_REQUESTS",
+        "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
+    )
+    saved = {key: os.environ.get(key) for key in offline_keys}
+    original_create_connection = socket.create_connection
+    original_getaddrinfo = socket.getaddrinfo
+    original_connect = socket.socket.connect
+    for key in credential_keys:
+        os.environ[key] = ""
+    os.environ.update({
+        "BACKBONE_PROVIDER": "offline",
+        "BACKBONE_MODEL": "offline-contextual-replay",
+        "BACKBONE_BASE_URL": "http://127.0.0.1",
+        "BACKBONE_SERVED_MODEL": "offline-contextual-replay",
+        "BACKBONE_REVISION": "",
+        "LAD_RG_OFFICIAL_REQUESTS": "0",
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+    })
+
+    def blocked(*_args, **_kwargs):
+        raise RuntimeError("network access is disabled during contextual replay")
+
+    socket.create_connection = blocked
+    socket.getaddrinfo = blocked
+    socket.socket.connect = blocked
+    try:
+        yield
+    finally:
+        socket.create_connection = original_create_connection
+        socket.getaddrinfo = original_getaddrinfo
+        socket.socket.connect = original_connect
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _validate_contextual_replay_prediction(
+    path: Path, dataset: str, noise_type: str, expected_sha256: str,
+    expected_count: int = OFFICIAL_SAMPLE_SIZE,
+) -> None:
+    from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
+
+    rows = _load_noisy(path)
+    if len(rows) != expected_count:
+        raise RuntimeError(f"contextual replay prediction has {len(rows)} records, expected {expected_count}")
+    valid = _valid_tags(dataset)
+    identity = {
+        "provider": "vllm", "model": QWEN_MODEL,
+        "served_model": QWEN_SERVED_MODEL, "revision": QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+    }
+    for index, row in enumerate(rows):
+        tokens, gold, pred = row.get("tokens"), row.get("gold_tags"), row.get("pred_tags")
+        if (not isinstance(tokens, list) or not isinstance(gold, list) or not isinstance(pred, list)
+                or not len(tokens) == len(gold) == len(pred)
+                or not all(isinstance(value, str) for values in (tokens, gold, pred) for value in values)
+                or any(tag not in valid for values in (gold, pred) for tag in values)
+                or not _is_legal_iob2(pred)):
+            raise RuntimeError(f"contextual replay row {index} is structurally invalid")
+        anchor = row.get("terminal_anchor_tags")
+        model_hash = row.get("terminal_model_hash")
+        used_anchor = row.get("terminal_used_anchor")
+        gain = row.get("terminal_predicted_gain")
+        fallback_count = row.get("terminal_fallback_count")
+        if (not isinstance(anchor, list) or len(anchor) != len(tokens)
+                or any(tag not in valid for tag in anchor) or not _is_legal_iob2(anchor)
+                or not isinstance(model_hash, str)
+                or model_hash != LOCKED_DECODER_MODEL_HASH
+                or not isinstance(used_anchor, bool)
+                or isinstance(gain, bool) or not isinstance(gain, (int, float)) or not math.isfinite(float(gain))
+                or isinstance(fallback_count, bool) or not isinstance(fallback_count, int) or fallback_count < 0
+                or row.get("provider_cache_sha256") != expected_sha256
+                or row.get("fallback_used") is not False
+                or not isinstance(row.get("provider_metadata"), Mapping)):
+            raise RuntimeError(f"contextual replay row {index} lacks terminal provenance")
+        _validate_contextual_provider_evidence(row["provider_metadata"], identity, noise_type)
+
+
 def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | None,
                                     ratios: Sequence[float], max_concurrency: int,
                                     failure_policy: str, dummy: bool,
@@ -1004,6 +1215,135 @@ async def _run_provider_cache_cell(
             "provider_fingerprint": fingerprint}
     _update_provider_cache_index(cache_root, cache_tag, key=key, cell=cell)
     return cell
+
+
+async def _run_contextual_replay_cell(
+    dataset: str, noise: str, seed: int, size: int, *,
+    cache_root: Path, cache_tag: str, bundle_hash: str, git_sha: str,
+    replay_fn: Callable[..., Mapping[str, Any]], terminal: Any,
+    max_concurrency: int, prediction_path: Optional[Path] = None,
+) -> Path:
+    """Decode one provider-cache cell locally with no provider adapter."""
+    _validate_contextual_replay_launch(
+        ["selectdenoise_contextual_lattice"], size=size,
+        ratios=[OFFICIAL_NOISE_RATIO], max_concurrency=max_concurrency,
+        failure_policy="abort", dummy=False,
+    )
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cache_tag):
+        raise ValueError("contextual-replay provider-cache tag is invalid")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", git_sha):
+        raise ValueError("contextual-replay requires a 40-hex Git SHA")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
+        raise ValueError("contextual-replay requires a 64-hex bundle hash")
+    noisy_path = _noisy_path(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
+    if not noisy_path.exists():
+        raise FileNotFoundError(f"official noisy file not found: {noisy_path}")
+    source_rows = _load_noisy(noisy_path)
+    if len(source_rows) != OFFICIAL_SAMPLE_SIZE:
+        raise RuntimeError("contextual-replay cells require exactly 200 noisy rows")
+    config = CONFIGURATIONS["selectdenoise_contextual_lattice"]
+    expected_manifest = _provider_cache_manifest(
+        source_rows, config, dataset=dataset, noise=noise, seed=seed,
+        git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower(),
+    )
+    key = _provider_cache_cell_key("selectdenoise_contextual_lattice", dataset, noise, seed)
+    indexed = _read_provider_cache_index_cell(cache_root, cache_tag, key)
+    expected_cell_path = _provider_cache_cell_path(
+        cache_root, cache_tag, "selectdenoise_contextual_lattice", dataset, noise, seed,
+    )
+    if (Path(str(indexed["path"])).resolve() != expected_cell_path.resolve()
+            or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
+            or indexed["git_sha"] != expected_manifest["git_sha"]
+            or indexed["model_revision"] != QWEN_REVISION
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["sha256"]))
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["provider_fingerprint"]))):
+        raise ValueError("contextual-replay cache index identity mismatch")
+    cell_path = expected_cell_path
+    cached_rows = read_provider_cell(cell_path, str(indexed["sha256"]), OFFICIAL_SAMPLE_SIZE)
+    cached_manifest = _read_provider_cache_manifest(cell_path)
+    _validate_replay_cache_identity(cached_manifest, expected_manifest)
+    _validate_replay_source_rows(source_rows, cached_rows)
+    provider_identity = {
+        "provider": "vllm", "model": QWEN_MODEL,
+        "served_model": QWEN_SERVED_MODEL, "revision": QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+    }
+    for cached in cached_rows:
+        _validate_contextual_provider_evidence(
+            cached["provider_metadata"], provider_identity, noise,
+        )
+    cache_sha256 = str(indexed["sha256"]).lower()
+    pred_path = Path(prediction_path) if prediction_path is not None else _pred_path(
+        "selectdenoise_contextual_lattice", dataset, noise, seed, OFFICIAL_NOISE_RATIO,
+    )
+    if pred_path.exists() and pred_path.stat().st_size > 0:
+        _validate_contextual_replay_prediction(pred_path, dataset, noise, cache_sha256)
+        return pred_path
+
+    sem = asyncio.Semaphore(max_concurrency)
+    buffer: list[Optional[dict[str, Any]]] = [None] * len(source_rows)
+    tmp_path = pred_path.with_suffix(pred_path.suffix + ".tmp")
+    pred_path.parent.mkdir(parents=True, exist_ok=True)
+
+    async def process(index: int, source: Mapping[str, Any], cached: Mapping[str, Any]) -> None:
+        async with sem:
+            if _provider_input_digest(source) != cached["input_digest"]:
+                raise ValueError(f"contextual-replay input digest changed at row {index}")
+            tokens = source.get("tokens")
+            dirty_tags = source.get("dirty_tags")
+            gold_tags = source.get("ner_tags")
+            if (not isinstance(tokens, list) or not isinstance(dirty_tags, list)
+                    or not isinstance(gold_tags, list)):
+                raise ValueError(f"contextual-replay source row {index} is malformed")
+            result = await asyncio.to_thread(
+                replay_fn,
+                tokens=tokens,
+                dirty_tags=dirty_tags,
+                provider_record=cached,
+                dataset_name=dataset,
+                terminal=terminal,
+            )
+            if not isinstance(result, Mapping):
+                raise RuntimeError(f"contextual-replay row {index} returned no terminal result")
+            required = {
+                "pred_tags", "terminal_anchor_tags", "terminal_model_hash",
+                "terminal_used_anchor", "terminal_predicted_gain",
+                "terminal_fallback_count",
+            }
+            if not required.issubset(result):
+                raise RuntimeError(f"contextual-replay row {index} lacks terminal provenance")
+            buffer[index] = {
+                "tokens": list(tokens), "gold_tags": list(gold_tags),
+                "pred_tags": list(result["pred_tags"]),
+                "terminal_anchor_tags": list(result["terminal_anchor_tags"]),
+                "terminal_model_hash": result["terminal_model_hash"],
+                "terminal_used_anchor": result["terminal_used_anchor"],
+                "terminal_predicted_gain": result["terminal_predicted_gain"],
+                "terminal_fallback_count": result["terminal_fallback_count"],
+                "provider_cache_sha256": cache_sha256,
+                "provider_metadata": cached["provider_metadata"],
+                "fallback_used": False,
+            }
+
+    tasks = [asyncio.create_task(process(index, source, cached))
+             for index, (source, cached) in enumerate(zip(source_rows, cached_rows))]
+    try:
+        await asyncio.gather(*tasks)
+        if any(record is None for record in buffer):
+            raise RuntimeError("contextual-replay cell produced an incomplete result buffer")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for record in buffer:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _validate_contextual_replay_prediction(tmp_path, dataset, noise, cache_sha256)
+        tmp_path.replace(pred_path)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return pred_path
 
 
 async def _run_one_cell(config_name: str, config: dict,
@@ -1334,8 +1674,10 @@ def _parse_args(argv=None):
                     help="Sentence failure behavior; dirty is legacy opt-in only.")
     ap.add_argument("--request-timeout", type=float, default=None,
                     help="Outer per-sentence timeout in seconds.")
-    ap.add_argument("--phase", choices=("end-to-end", "provider-cache"), default="end-to-end")
+    ap.add_argument("--phase", choices=("end-to-end", "provider-cache", CONTEXTUAL_REPLAY_PHASE), default="end-to-end")
     ap.add_argument("--provider-cache-root", type=Path, default=PROVIDER_CACHE_DIR)
+    ap.add_argument("--provider-cache-tag", default=None,
+                    help="Immutable provider-cache namespace for staged runs.")
     ap.add_argument("--bundle-hash", help="Pinned 64-hex contextual lattice bundle hash.")
     args = ap.parse_args(argv)
     args.failure_policy = args.failure_policy or "abort"
@@ -1348,9 +1690,66 @@ def _parse_args(argv=None):
     return args
 
 
+def _run_contextual_replay_phase(args) -> None:
+    """Run the complete local Stage B without constructing a provider adapter."""
+    global BACKBONE_TAG
+    _validate_contextual_replay_launch(
+        args.configs, size=args.size, ratios=args.ratios,
+        max_concurrency=args.max_concurrency, failure_policy=args.failure_policy,
+        dummy=args.dummy, datasets=args.datasets, noise_types=args.noise,
+        seeds=args.seeds,
+    )
+    if not isinstance(args.bundle_hash, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", args.bundle_hash):
+        raise ValueError("contextual-replay requires --bundle-hash with 64 hexadecimal characters")
+    tag = str(args.provider_cache_tag or BACKBONE_TAG).strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+        raise ValueError("contextual-replay requires a valid --provider-cache-tag")
+    BACKBONE_TAG = tag
+    git_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    ).stdout.strip()
+    old_bundle = os.environ.get("CONTEXTUAL_LATTICE_BUNDLE")
+    old_embedding = os.environ.get("CONTEXTUAL_LATTICE_ENCODER_CACHE")
+    try:
+        with _offline_contextual_replay_environment():
+            bundle_path, embedding_path = _validate_contextual_replay_bundle(args.bundle_hash)
+            os.environ["CONTEXTUAL_LATTICE_BUNDLE"] = str(bundle_path)
+            os.environ["CONTEXTUAL_LATTICE_ENCODER_CACHE"] = str(embedding_path)
+            from multi_agent_v2 import (
+                _load_contextual_lattice_terminal,
+                run_contextual_lattice_replay,
+            )
+            terminal = _load_contextual_lattice_terminal()
+            for dataset in args.datasets:
+                for noise in args.noise:
+                    for seed in args.seeds:
+                        asyncio.run(_run_contextual_replay_cell(
+                            dataset, noise, seed, args.size,
+                            cache_root=args.provider_cache_root,
+                            cache_tag=tag, bundle_hash=args.bundle_hash,
+                            git_sha=git_sha, replay_fn=run_contextual_lattice_replay,
+                            terminal=terminal, max_concurrency=args.max_concurrency,
+                        ))
+    finally:
+        if old_bundle is None:
+            os.environ.pop("CONTEXTUAL_LATTICE_BUNDLE", None)
+        else:
+            os.environ["CONTEXTUAL_LATTICE_BUNDLE"] = old_bundle
+        if old_embedding is None:
+            os.environ.pop("CONTEXTUAL_LATTICE_ENCODER_CACHE", None)
+        else:
+            os.environ["CONTEXTUAL_LATTICE_ENCODER_CACHE"] = old_embedding
+
+
 def main(argv=None):
     global BACKBONE_TAG
     args = _parse_args(argv)
+
+    if args.phase == CONTEXTUAL_REPLAY_PHASE:
+        _run_contextual_replay_phase(args)
+        return
 
     if args.phase == "provider-cache":
         if not args.official:

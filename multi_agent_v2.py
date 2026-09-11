@@ -960,6 +960,9 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
                            for entity_type in valid_types for prefix in ("B", "I")}
     result_model_hash = getattr(result, "model_hash", None)
     terminal_model_hash = getattr(terminal, "model_hash", None)
+    result_used_anchor = getattr(result, "used_anchor", None)
+    result_predicted_gain = getattr(result, "predicted_gain", None)
+    terminal_fallback_count = getattr(terminal, "fallback_count", None)
     invalid = (
         not isinstance(result_model_hash, str)
         or not re.fullmatch(r"[0-9a-fA-F]{64}", result_model_hash)
@@ -967,6 +970,13 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
         or len(tags) != len(tokens)
         or any(tag not in valid_tags for tag in tags)
         or not _is_legal_tag_sequence(tags)
+        or not isinstance(result_used_anchor, bool)
+        or isinstance(result_predicted_gain, bool)
+        or not isinstance(result_predicted_gain, (int, float))
+        or not math.isfinite(float(result_predicted_gain))
+        or isinstance(terminal_fallback_count, bool)
+        or not isinstance(terminal_fallback_count, int)
+        or terminal_fallback_count < 0
     )
     if invalid and state.get("official", False):
         raise ContextualLatticeError("Contextual lattice terminal result is invalid")
@@ -976,10 +986,92 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
         "current_tags": tags,
         "terminal_anchor_tags": anchor_tags,
         "terminal_model_hash": result_model_hash,
-        "terminal_used_anchor": bool(result.used_anchor),
-        "terminal_predicted_gain": float(result.predicted_gain),
-        "terminal_fallback_count": int(terminal.fallback_count),
+        "terminal_used_anchor": result_used_anchor,
+        "terminal_predicted_gain": float(result_predicted_gain),
+        "terminal_fallback_count": terminal_fallback_count,
     }
+
+
+def run_contextual_lattice_replay(
+    *, tokens: Sequence[str], dirty_tags: Sequence[str],
+    provider_record: Mapping[str, Any], dataset_name: str,
+    terminal: Any = None,
+) -> dict[str, Any]:
+    """Decode one frozen provider-cache row without reopening the provider graph.
+
+    The replay boundary is intentionally narrow: only the seven allow-listed
+    terminal inputs are copied into the terminal state.  Cache provenance and
+    provider evidence stay in the runner and are never model-facing inputs.
+    """
+    if dataset_name not in DATASET_ENTITY_TYPES:
+        raise ContextualLatticeError(f"unknown replay dataset ontology: {dataset_name!r}")
+    if not isinstance(provider_record, Mapping):
+        raise ContextualLatticeError("contextual replay provider row must be a mapping")
+    forbidden = {"gold_tags", "ner_tags", "gold_labels"}
+
+    def contains_forbidden(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return any(
+                (isinstance(key, str) and key.lower() in forbidden)
+                or contains_forbidden(nested)
+                for key, nested in value.items()
+            )
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return any(contains_forbidden(nested) for nested in value)
+        return False
+
+    if contains_forbidden(provider_record):
+        raise ContextualLatticeError("contextual replay provider row contains gold labels")
+    if (not isinstance(tokens, Sequence) or isinstance(tokens, (str, bytes))
+            or not all(isinstance(token, str) for token in tokens)):
+        raise ContextualLatticeError("contextual replay tokens must be a string sequence")
+    if (not isinstance(dirty_tags, Sequence) or isinstance(dirty_tags, (str, bytes))
+            or len(dirty_tags) != len(tokens)
+            or not all(isinstance(tag, str) for tag in dirty_tags)):
+        raise ContextualLatticeError("contextual replay dirty_tags are not aligned")
+
+    valid_tags = {"O"} | {
+        f"{prefix}-{entity_type}"
+        for entity_type in DATASET_ENTITY_TYPES[dataset_name]
+        for prefix in ("B", "I")
+    }
+
+    def checked_tags(value: Any, field: str) -> list[str]:
+        if (not isinstance(value, list) or len(value) != len(tokens)
+                or not all(isinstance(tag, str) and tag in valid_tags for tag in value)
+                or not _is_legal_tag_sequence(value)):
+            raise ContextualLatticeError(f"contextual replay {field} is invalid")
+        return list(value)
+
+    anchor_tags = checked_tags(provider_record.get("anchor_tags"), "anchor_tags")
+    candidate_paths = provider_record.get("candidate_paths")
+    reviewer_weights = provider_record.get("rag_weights")
+    if not isinstance(candidate_paths, list) or not isinstance(reviewer_weights, list):
+        raise ContextualLatticeError("contextual replay candidate evidence is malformed")
+    if len(reviewer_weights) not in {0, len(candidate_paths)}:
+        raise ContextualLatticeError("contextual replay reviewer weights are not aligned")
+    checked_paths: list[list[str]] = []
+    for path in candidate_paths:
+        checked_paths.append(checked_tags(path, "candidate_paths"))
+    checked_weights: list[float] = []
+    for weight in reviewer_weights:
+        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                or not math.isfinite(float(weight))):
+            raise ContextualLatticeError("contextual replay reviewer weights are invalid")
+        checked_weights.append(float(weight))
+    if terminal is None:
+        terminal = _load_contextual_lattice_terminal()
+    state = {
+        "tokens": list(tokens),
+        "dirty_tags": list(dirty_tags),
+        "current_tags": anchor_tags,
+        "candidate_paths": checked_paths,
+        "rag_weights": checked_weights,
+        "dataset_name": dataset_name,
+        "official": True,
+    }
+    result = _apply_contextual_lattice_terminal(state, terminal)
+    return {"pred_tags": result["current_tags"], **result}
 
 
 def _init_deer(dataset_name: str = "conll2003"):

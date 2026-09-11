@@ -124,3 +124,41 @@ def test_contextual_terminal_persists_anchor_and_rejects_invalid_terminal_result
             "current_tags": ["B-ORG", "O"], "candidate_paths": [["B-ORG", "O"]],
             "rag_weights": [1.0], "dataset_name": "conll2003", "official": True,
         }, terminal)
+
+
+def test_contextual_replay_passes_only_the_locked_terminal_allowlist():
+    captured = {}
+
+    class Terminal:
+        model_hash = MODEL_HASH
+        fallback_count = 0
+
+        def sentence_deer_stats(self, tokens):
+            return {"entity": 0.2, "type": 0.3, "semantic": 0.25, "oov": 0.1}
+
+        def decode(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                tags=["B-ORG", "O"], model_hash=MODEL_HASH,
+                used_anchor=True, predicted_gain=0.1,
+            )
+
+    result = multi_agent_v2.run_contextual_lattice_replay(
+        tokens=["Acme", "arrived"],
+        dirty_tags=["B-ORG", "O"],
+        provider_record={
+            "anchor_tags": ["B-ORG", "O"],
+            "candidate_paths": [["B-ORG", "O"]],
+            "rag_weights": [1.0],
+        },
+        dataset_name="conll2003",
+        terminal=Terminal(),
+    )
+
+    assert set(captured) == {
+        "tokens", "dirty_tags", "anchor_tags", "candidate_paths",
+        "reviewer_weights", "valid_types", "deer_stats",
+    }
+    assert "gold_tags" not in captured
+    assert result["terminal_model_hash"] == MODEL_HASH
+    assert result["terminal_fallback_count"] == 0
