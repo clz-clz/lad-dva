@@ -145,6 +145,14 @@ def test_write_rejects_gold_labels_nested_in_provider_evidence(tmp_path):
         official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], _manifest(record))
 
 
+def test_write_rejects_gold_labels_key_nested_in_candidate_paths(tmp_path):
+    record = _record()
+    record["candidate_paths"] = [{"details": {"gold_labels": ["B-PER", "O"]}}]
+
+    with pytest.raises(ValueError, match="gold labels"):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], _manifest(record))
+
+
 @pytest.mark.parametrize("identity_field", ["git_sha", "model_revision", "bundle_hash", "configuration"])
 def test_write_requires_replay_identity_fields(tmp_path, identity_field):
     record = _record()

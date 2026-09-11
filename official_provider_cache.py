@@ -21,7 +21,7 @@ _RECORD_FIELDS = frozenset({
     "rag_weights", "confidence", "provider_metadata", "fallback_used",
 })
 _STAGES = frozenset({"coder", "reviewer", "verifier"})
-_FORBIDDEN_GOLD_FIELDS = frozenset({"gold_tags", "ner_tags"})
+_FORBIDDEN_GOLD_FIELDS = frozenset({"gold_tags", "ner_tags", "gold_labels"})
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
