@@ -39,7 +39,9 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 from official_contract import official_manifest_decoder_constants
-from official_provider_cache import PROVIDER_CACHE_SCHEMA
+from official_provider_cache import (
+    PROVIDER_CACHE_SCHEMA, QWEN_MODEL, QWEN_REVISION, QWEN_SERVED_MODEL,
+)
 
 # Silence telemetry noise from chroma / langchain
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -70,6 +72,7 @@ OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v2"
 # introduced in later tasks; legacy/end-to-end execution remains unchanged.
 OFFICIAL_PROVIDER_CACHE_SCHEMA = PROVIDER_CACHE_SCHEMA
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
+_OFFICIAL_CONTEXTUAL_STAGES = frozenset({"coder", "reviewer", "verifier"})
 DATASET_ENTITY_TYPES = {
     "msra": ["PER", "LOC", "ORG"],
     "conll2003": ["PER", "LOC", "ORG", "MISC"],
@@ -256,11 +259,20 @@ def _official_settings_from_env(config_names: list[str], environment: Mapping[st
     return settings, tag
 
 
+def _official_profile(config: Mapping[str, Any]) -> str:
+    if config.get("terminal_graph") == "lad-rg":
+        return "lad-rg"
+    if config.get("terminal_decoder") == "contextual-lattice-v1":
+        return "contextual-lattice"
+    raise ValueError("official mode requires a LAD-RG or contextual-lattice config")
+
+
 def _validate_official_settings_for_configs(settings, config_names: Sequence[str]) -> None:
     for config_name in config_names:
         config = CONFIGURATIONS.get(config_name)
-        if config is None or config.get("terminal_graph") != "lad-rg":
-            raise ValueError(f"official mode requires LAD-RG config, got {config_name!r}")
+        if config is None:
+            raise ValueError(f"official mode requires a known config, got {config_name!r}")
+        _official_profile(config)
     if settings.provider == "vllm" and settings.model != OFFICIAL_QWEN_MODEL:
         raise ValueError(f"vLLM official runs require BACKBONE_MODEL={OFFICIAL_QWEN_MODEL}")
     if settings.provider == "deepseek" and any(
@@ -268,6 +280,12 @@ def _validate_official_settings_for_configs(settings, config_names: Sequence[str
         for name in config_names
     ):
         raise ValueError("DeepSeek official runs reject GASD-R/Both; use vllm/Qwen")
+    if any(_official_profile(CONFIGURATIONS[name]) == "contextual-lattice"
+           for name in config_names):
+        if (settings.provider != "vllm" or settings.model != QWEN_MODEL
+                or settings.revision != QWEN_REVISION
+                or settings.served_model != QWEN_SERVED_MODEL):
+            raise ValueError("official contextual runs require the pinned Qwen served identity")
 
 
 def _configure_official_request_model(settings) -> str:
@@ -357,6 +375,7 @@ def _validate_official_prediction(
     if len(rows) != expected_count:
         raise RuntimeError(f"official prediction has {len(rows)} records, expected {expected_count}: {path.name}")
     config = CONFIGURATIONS[config_name]
+    profile = _official_profile(config)
     expected_variant = str(config.get("gasd_variant", "g")).lower()
     expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
     valid = _valid_tags(dataset)
@@ -367,6 +386,24 @@ def _validate_official_prediction(
                 or not len(tokens) == len(gold) == len(pred)
                 or any(tag not in valid for tag in gold + pred) or not _is_legal_iob2(pred)):
             raise RuntimeError(f"official prediction row {index} is structurally incompatible: {path.name}")
+        if profile == "contextual-lattice":
+            anchor = row.get("terminal_anchor_tags")
+            model_hash = row.get("terminal_model_hash")
+            if (not isinstance(anchor, list)
+                    or len(anchor) != len(tokens)
+                    or any(tag not in valid for tag in anchor)
+                    or not _is_legal_iob2(anchor)
+                    or not isinstance(model_hash, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{64}", model_hash)
+                    or row.get("fallback_used") is not False
+                    or not isinstance(row.get("provider_metadata"), dict)):
+                raise RuntimeError(f"official contextual row {index} lacks valid terminal evidence: {path.name}")
+            if provider_identity is not None:
+                _validate_official_provider_evidence(
+                    config, row["provider_metadata"], provider_identity,
+                    None, noise_type=noise_type,
+                )
+            continue
         if (row.get("ror_reasoning_source") not in {"not_triggered", "live", "disabled"}
                 or row.get("gasd_variant_requested") != expected_variant
                 or row.get("gasd_variant_used") != expected_used
@@ -387,6 +424,9 @@ def _validate_official_provider_evidence(
     """Require justified stage statuses and immutable provider identity."""
     if not isinstance(evidence, Mapping):
         raise RuntimeError("official provider evidence must be stage-separated")
+    if _official_profile(config) == "contextual-lattice":
+        _validate_contextual_provider_evidence(evidence, identity, noise_type)
+        return
     if set(evidence) != {"coder", "reviewer", "ror", "gasd"}:
         raise RuntimeError("official provider evidence must contain exactly four stages")
     expected_identity = {
@@ -487,6 +527,60 @@ def _validate_official_provider_evidence(
     elif (len(gasd) != 1 or gasd[0].get("stage") != "gasd"
           or gasd[0].get("status") != expected_gasd_status):
         raise RuntimeError("official GASD status is inconsistent with configuration")
+
+
+def _validate_contextual_provider_evidence(
+    evidence: Mapping[str, Any], identity: Mapping[str, Any], noise_type: str,
+) -> None:
+    """Validate the immutable three-stage Contextual Lattice provider contract."""
+    if set(evidence) != _OFFICIAL_CONTEXTUAL_STAGES:
+        raise RuntimeError("official contextual evidence must contain exactly coder, reviewer, and verifier")
+    expected_identity = {
+        "provider": "vllm", "model": QWEN_MODEL,
+        "served_model": QWEN_SERVED_MODEL, "revision": QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+    }
+    if any(identity.get(key) != value for key, value in expected_identity.items()):
+        raise RuntimeError("official contextual provider identity is not pinned Qwen")
+
+    def records(stage: str) -> list[Mapping[str, Any]]:
+        value = evidence.get(stage)
+        if (not isinstance(value, list) or not value
+                or not all(isinstance(record, Mapping) for record in value)):
+            raise RuntimeError(f"official contextual evidence is missing {stage}")
+        for record in value:
+            if record.get("stage") != stage:
+                raise RuntimeError(f"official contextual evidence has an invalid {stage} record")
+            if any(record.get(key) != expected for key, expected in expected_identity.items()):
+                raise RuntimeError(f"official contextual evidence identity mismatch for {stage}")
+            if record.get("status") == "live":
+                if (record.get("response_model") != QWEN_SERVED_MODEL
+                        or record.get("response_status") != "completed"
+                        or record.get("finish_reason") != "stop"
+                        or not isinstance(record.get("usage"), Mapping)
+                        or not record["usage"]):
+                    raise RuntimeError(f"official contextual {stage} live evidence is incomplete")
+            elif (record.get("response_model") is not None
+                  or record.get("response_status") is not None
+                  or record.get("finish_reason") is not None):
+                raise RuntimeError(f"official contextual {stage} skipped evidence claims a response")
+        return value
+
+    expected_coder_count = {"BT": 3, "IF": 3, "ATF": 5}.get(noise_type)
+    if expected_coder_count is None:
+        raise RuntimeError(f"unsupported official noise type: {noise_type!r}")
+    coder = records("coder")
+    if len(coder) != expected_coder_count or any(record.get("status") != "live" for record in coder):
+        raise RuntimeError("official contextual Coder evidence must be live")
+
+    reviewer = records("reviewer")
+    if (len(reviewer) != 1 or reviewer[0].get("status")
+            not in {"live", "skipped_identical"}):
+        raise RuntimeError("official contextual Reviewer evidence status is unjustified")
+    verifier = records("verifier")
+    if (len(verifier) != 1 or verifier[0].get("status")
+            not in {"live", "skipped_uncontested", "skipped_identical"}):
+        raise RuntimeError("official contextual Verifier evidence status is unjustified")
 
 
 # ---------------------------------------------------------------------------
@@ -750,6 +844,7 @@ async def _run_one_cell_impl(config_name: str, config: dict,
         raise ValueError("failure_policy must be 'abort' or 'dirty'")
     is_paid_smoke = paid_smoke_size is not None
     launch_strict = official or is_paid_smoke
+    official_profile = _official_profile(config) if official else None
     if official and is_paid_smoke:
         raise ValueError("official publication and paid smoke modes are mutually exclusive")
     if official and prediction_path is not None:
@@ -774,8 +869,6 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             raise ValueError("official mode cannot use --dummy")
         if failure_policy != "abort":
             raise ValueError("official mode requires failure_policy='abort'")
-        if config.get("terminal_graph") != "lad-rg":
-            raise ValueError("official mode requires a LAD-RG configuration")
         if size != OFFICIAL_SAMPLE_SIZE or abs(ratio - OFFICIAL_NOISE_RATIO) >= 1e-12:
             raise ValueError("official cells require size 200 and noise ratio 0.15")
 
@@ -893,30 +986,44 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             if isinstance(pred, dict):
                 extra = {k: pred[k] for k in
                          ("candidate_paths", "rag_weights", "confidence",
-                          "terminal_model_hash", "terminal_used_anchor",
+                          "terminal_anchor_tags", "terminal_model_hash", "terminal_used_anchor",
                           "terminal_predicted_gain", "terminal_fallback_count",
                           "ror_reasoning_source", "gasd_variant_requested",
                           "gasd_variant_used", "provider_metadata", "fallback_used")
                          if k in pred}
                 pred = pred.get("pred_tags", list(dirty))
             if launch_strict:
-                expected_variant = str(config.get("gasd_variant", "g")).lower()
-                expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
                 _validate_official_provider_evidence(
                     config, extra.get("provider_metadata"), provider_identity,
                     str(extra.get("ror_reasoning_source")), noise_type=noise,
                 )
-                if (
+                common_invalid = (
                     not isinstance(pred, list)
                     or len(pred) != len(gold)
                     or any(tag not in _valid_tags(dataset) for tag in pred)
                     or not _is_legal_iob2(pred)
-                    or extra.get("ror_reasoning_source") not in {"not_triggered", "live", "disabled"}
-                    or extra.get("gasd_variant_requested") != expected_variant
-                    or extra.get("gasd_variant_used") != expected_used
                     or extra.get("fallback_used") is not False
                     or not isinstance(extra.get("provider_metadata"), dict)
-                ):
+                )
+                if official_profile == "contextual-lattice":
+                    anchor = extra.get("terminal_anchor_tags")
+                    model_hash = extra.get("terminal_model_hash")
+                    profile_invalid = (
+                        not isinstance(anchor, list) or len(anchor) != len(gold)
+                        or any(tag not in _valid_tags(dataset) for tag in anchor)
+                        or not _is_legal_iob2(anchor)
+                        or not isinstance(model_hash, str)
+                        or not re.fullmatch(r"[0-9a-fA-F]{64}", model_hash)
+                    )
+                else:
+                    expected_variant = str(config.get("gasd_variant", "g")).lower()
+                    expected_used = "disabled" if not config.get("use_gasd", True) else expected_variant
+                    profile_invalid = (
+                        extra.get("ror_reasoning_source") not in {"not_triggered", "live", "disabled"}
+                        or extra.get("gasd_variant_requested") != expected_variant
+                        or extra.get("gasd_variant_used") != expected_used
+                    )
+                if common_invalid or profile_invalid:
                     raise RuntimeError(f"official sentence {i} lacks valid launch evidence")
             # Length alignment (defensive)
             if not isinstance(pred, list):

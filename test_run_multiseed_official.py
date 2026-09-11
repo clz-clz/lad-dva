@@ -12,6 +12,9 @@ import run_multiseed
 from live_backbone import LiveBackboneResult, LiveBackboneSettings
 
 
+CONTEXTUAL_REVISION = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
+
+
 def _env(provider="vllm"):
     values = {
         "BACKBONE_PROVIDER": provider,
@@ -80,6 +83,122 @@ def _full_evidence(*, ror_status="not_triggered", gasd_status="live",
         "gasd": ([_live_record("gasd_r")] if gasd_status == "live"
                  else [_status_record("gasd", gasd_status)]),
     }
+
+
+def _contextual_identity():
+    return {
+        "provider": "vllm",
+        "model": "Qwen/Qwen3-32B-AWQ",
+        "served_model": f"Qwen/Qwen3-32B-AWQ@{CONTEXTUAL_REVISION}",
+        "revision": CONTEXTUAL_REVISION,
+        "structured_api": "chat-completions-json-schema",
+    }
+
+
+def _contextual_live_record(stage):
+    identity = _contextual_identity()
+    return {
+        "stage": stage, "status": "live", **identity,
+        "response_model": identity["served_model"],
+        "response_status": "completed", "finish_reason": "stop",
+        "incomplete_reason": None, "system_fingerprint": "fp-contextual",
+        "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+    }
+
+
+def _contextual_skipped_record(stage, status):
+    return {
+        "stage": stage, "status": status, **_contextual_identity(),
+        "response_model": None, "response_status": None, "finish_reason": None,
+        "incomplete_reason": None, "system_fingerprint": None, "usage": {},
+    }
+
+
+def test_official_contextual_profile_accepts_three_stage_prediction_and_anchor(tmp_path):
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+        revision=CONTEXTUAL_REVISION,
+    )
+    run_multiseed._validate_official_settings_for_configs(
+        settings, ["selectdenoise_contextual_lattice"]
+    )
+    evidence = {
+        "coder": [_contextual_live_record("coder") for _ in range(3)],
+        "reviewer": [_contextual_skipped_record("reviewer", "skipped_identical")],
+        "verifier": [_contextual_skipped_record("verifier", "skipped_uncontested")],
+    }
+    row = {
+        "tokens": ["Alice", "works"], "gold_tags": ["B-PER", "O"],
+        "pred_tags": ["B-PER", "O"], "terminal_anchor_tags": ["B-PER", "O"],
+        "terminal_model_hash": "a" * 64, "provider_metadata": evidence,
+        "fallback_used": False,
+    }
+    path = tmp_path / "contextual.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for _ in range(200)), encoding="utf-8")
+
+    run_multiseed._validate_official_prediction(
+        path, "conll2003", "selectdenoise_contextual_lattice", "BT",
+        provider_identity=_contextual_identity(),
+    )
+
+
+@pytest.mark.parametrize(
+    "stage, status",
+    [("coder", "skipped"), ("reviewer", "failed"), ("verifier", "local")],
+)
+def test_official_contextual_evidence_rejects_undocumented_nonlive_status(stage, status):
+    evidence = {
+        "coder": [_contextual_live_record("coder") for _ in range(3)],
+        "reviewer": [_contextual_skipped_record("reviewer", "skipped_identical")],
+        "verifier": [_contextual_skipped_record("verifier", "skipped_uncontested")],
+    }
+    evidence[stage] = [_contextual_skipped_record(stage, status)]
+
+    with pytest.raises(RuntimeError, match="[Cc]oder|[Rr]eviewer|[Vv]erifier"):
+        run_multiseed._validate_official_provider_evidence(
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            evidence, _contextual_identity(), None, noise_type="BT",
+        )
+
+
+def test_official_contextual_runner_persists_terminal_anchor_evidence(tmp_path, monkeypatch):
+    noisy_dir, pred_dir = tmp_path / "noisy", tmp_path / "pred"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
+    monkeypatch.setattr(run_multiseed, "BACKBONE_TAG", "contextual-offline")
+    _write_noisy(noisy_dir / "noisy_seed13__BT__conll2003__N200.jsonl", count=200)
+    evidence = {
+        "coder": [_contextual_live_record("coder") for _ in range(3)],
+        "reviewer": [_contextual_skipped_record("reviewer", "skipped_identical")],
+        "verifier": [_contextual_skipped_record("verifier", "skipped_uncontested")],
+    }
+
+    class Adapter:
+        provider_metadata = staticmethod(_contextual_identity)
+        structured_requester = staticmethod(lambda *_args: (_ for _ in ()).throw(
+            AssertionError("fake pipeline must not invoke a provider")
+        ))
+
+    async def pipeline(tokens, dirty, _config, **_kwargs):
+        return {
+            "pred_tags": ["B-PER", "O"], "candidate_paths": [["B-PER", "O"]],
+            "rag_weights": [1.0], "confidence": [1.0, 1.0],
+            "terminal_anchor_tags": ["B-PER", "O"], "terminal_model_hash": "a" * 64,
+            "provider_metadata": evidence, "fallback_used": False,
+        }
+
+    asyncio.run(run_multiseed._run_one_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "conll2003", "BT", 13, 200, (pipeline, {}), max_concurrency=8,
+        dummy=False, official=True, failure_policy="abort", request_timeout=10.0,
+        adapter_factory=Adapter,
+    ))
+
+    output = next(pred_dir.glob("*.jsonl"))
+    first = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
+    assert first["terminal_anchor_tags"] == ["B-PER", "O"]
 
 
 def _write_noisy(path: Path, count=1):

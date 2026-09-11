@@ -83,6 +83,20 @@ def test_official_contextual_evidence_rejects_live_records_without_usage():
         multi_agent_v2._validate_contextual_official_evidence(evidence)
 
 
+@pytest.mark.parametrize(
+    "stage, status",
+    [("coder", "skipped"), ("reviewer", "failed"), ("verifier", "local")],
+)
+def test_official_contextual_evidence_rejects_undocumented_nonlive_status(stage, status):
+    evidence = {stage_name: [_record(stage_name)] for stage_name in ("coder", "reviewer", "verifier")}
+    record = _record(stage, status)
+    record.update({"response_model": None, "response_status": None, "finish_reason": None, "usage": {}})
+    evidence[stage] = [record]
+
+    with pytest.raises(RuntimeError, match="status"):
+        multi_agent_v2._validate_contextual_official_evidence(evidence)
+
+
 def test_contextual_terminal_persists_anchor_and_rejects_invalid_terminal_result():
     terminal = SimpleNamespace(
         model_hash=MODEL_HASH,

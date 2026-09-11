@@ -298,10 +298,17 @@ def _validate_contextual_official_evidence(evidence: Mapping[str, Any]) -> None:
                         or not isinstance(record.get("usage"), Mapping)
                         or not record["usage"]):
                     raise RuntimeError("official contextual live evidence is incomplete")
-            elif (record.get("response_model") is not None
-                  or record.get("response_status") is not None
-                  or record.get("finish_reason") is not None):
-                raise RuntimeError("official contextual skipped evidence claims a response")
+            else:
+                allowed_skips = {
+                    "reviewer": {"skipped_identical"},
+                    "verifier": {"skipped_uncontested", "skipped_identical"},
+                }.get(stage, set())
+                if record.get("status") not in allowed_skips:
+                    raise RuntimeError(f"official contextual {stage} evidence status is unjustified")
+                if (record.get("response_model") is not None
+                        or record.get("response_status") is not None
+                        or record.get("finish_reason") is not None):
+                    raise RuntimeError("official contextual skipped evidence claims a response")
 
 
 def _official_tag_path(content: Any, expected_length: int,
