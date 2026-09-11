@@ -41,3 +41,39 @@ def test_docs_make_readiness_evidence_boundary_explicit():
     assert "implementation readiness" in boundary.lower()
     assert "not completed B3/B4 evidence" in boundary
     assert "no real provider or gpu run" in boundary.lower()
+
+
+def test_qwen_contextual_launch_guide_pins_service_and_cost_gates():
+    guide = (ROOT / "docs" / "QWEN_CONTEXTUAL_LATTICE_LAUNCH.md").read_text(encoding="utf-8")
+
+    for value in (
+        "Qwen/Qwen3-32B-AWQ",
+        "0499c3ac83fdef8810b907a23894ba91e95eddd8",
+        "vllm==0.28.0",
+        "accelerate==1.14.0",
+        "python -m pip check",
+        "--host 127.0.0.1 --port 8000",
+        "--quantization awq --dtype half",
+        "--reasoning-parser qwen3",
+        "--structured-outputs-config.enable_in_reasoning=True",
+        "--max-model-len 32768",
+        "--gpu-memory-utilization 0.90",
+        "--max-num-seqs 32",
+        "/v1/models",
+        "ssh -N -L",
+        "model file hashes",
+        "CUDA",
+        "GPU name",
+        "GPU memory",
+        "provider-cache",
+        "contextual-replay",
+        "45 cells",
+        "9,000 rows",
+        "1.25",
+        "explicit rental budget",
+        "no provider call",
+    ):
+        assert value in guide
+    assert "Qwen/Qwen3-32B-AWQ@0499c3ac83fdef8810b907a23894ba91e95eddd8" in guide
+    assert "stop vllm" in guide.lower()
+    assert "historical" in guide.lower()
