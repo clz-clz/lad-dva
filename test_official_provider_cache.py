@@ -8,6 +8,21 @@ import official_provider_cache
 import run_multiseed
 
 
+_MODEL = "Qwen/Qwen3-32B-AWQ"
+_REVISION = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
+_SERVED_MODEL = f"{_MODEL}@{_REVISION}"
+
+
+def _evidence(stage, status):
+    return {
+        "stage": stage,
+        "status": status,
+        "model": _MODEL,
+        "served_model": _SERVED_MODEL,
+        "revision": _REVISION,
+    }
+
+
 def _record(index=0, digest=None):
     return {
         "row_index": index,
@@ -17,9 +32,9 @@ def _record(index=0, digest=None):
         "rag_weights": [1.0],
         "confidence": [1.0, 1.0],
         "provider_metadata": {
-            "coder": [{"stage": "coder_path_1", "status": "live"}],
-            "reviewer": [{"stage": "reviewer", "status": "skipped"}],
-            "verifier": [{"stage": "verifier", "status": "skipped"}],
+            "coder": [_evidence("coder", "live")],
+            "reviewer": [_evidence("reviewer", "skipped")],
+            "verifier": [_evidence("verifier", "skipped")],
         },
         "fallback_used": False,
     }
@@ -30,7 +45,7 @@ def _manifest(*records):
         "schema": "selectdenoise-contextual-provider-cache-v1",
         "source_digests": {str(row["row_index"]): row["input_digest"] for row in records},
         "git_sha": "a" * 40,
-        "model_revision": "0499c3ac83fdef8810b907a23894ba91e95eddd8",
+        "model_revision": _REVISION,
         "bundle_hash": "b" * 64,
         "configuration": {"terminal_decoder": "contextual-lattice-v1"},
     }
@@ -101,6 +116,68 @@ def test_write_rejects_source_digest_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="source digest"):
         official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], manifest)
+
+
+def test_write_rejects_gold_labels_nested_in_candidate_paths(tmp_path):
+    record = _record()
+    record["candidate_paths"] = [{"gold_tags": ["B-PER", "O"]}]
+
+    with pytest.raises(ValueError, match="gold labels"):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], _manifest(record))
+
+
+def test_write_rejects_gold_labels_nested_in_manifest(tmp_path):
+    record = _record()
+    manifest = _manifest(record)
+    manifest["launch"] = {"provider_evidence": [{"ner_tags": ["B-PER", "O"]}]}
+
+    with pytest.raises(ValueError, match="gold labels"):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], manifest)
+
+
+def test_write_rejects_gold_labels_nested_in_provider_evidence(tmp_path):
+    record = _record()
+    record["provider_metadata"]["coder"][0]["details"] = {
+        "response": {"gold_tags": ["B-PER", "O"]}
+    }
+
+    with pytest.raises(ValueError, match="gold labels"):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], _manifest(record))
+
+
+@pytest.mark.parametrize("identity_field", ["git_sha", "model_revision", "bundle_hash", "configuration"])
+def test_write_requires_replay_identity_fields(tmp_path, identity_field):
+    record = _record()
+    manifest = _manifest(record)
+    del manifest[identity_field]
+
+    with pytest.raises(ValueError, match=identity_field):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], manifest)
+
+
+def test_write_rejects_noncanonical_replay_identity_values(tmp_path):
+    record = _record()
+    manifest = _manifest(record)
+    manifest["git_sha"] = "not-a-sha"
+
+    with pytest.raises(ValueError, match="git_sha"):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], manifest)
+
+
+@pytest.mark.parametrize(
+    ("stage", "field", "value", "match"),
+    [
+        ("coder", "stage", "reviewer", "stage"),
+        ("reviewer", "served_model", "other@revision", "served identity"),
+        ("verifier", "revision", "a" * 40, "served identity"),
+    ],
+)
+def test_write_rejects_unbound_or_unpinned_provider_evidence(tmp_path, stage, field, value, match):
+    record = _record()
+    record["provider_metadata"][stage][0][field] = value
+
+    with pytest.raises(ValueError, match=match):
+        official_provider_cache.write_provider_cell(tmp_path / "provider.jsonl", [record], _manifest(record))
 
 
 def test_write_rejects_malformed_provider_metadata(tmp_path):

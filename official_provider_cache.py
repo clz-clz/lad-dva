@@ -13,6 +13,9 @@ from typing import Any, Mapping, Sequence
 
 
 PROVIDER_CACHE_SCHEMA = "selectdenoise-contextual-provider-cache-v1"
+QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
+QWEN_REVISION = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
+QWEN_SERVED_MODEL = f"{QWEN_MODEL}@{QWEN_REVISION}"
 _RECORD_FIELDS = frozenset({
     "row_index", "input_digest", "anchor_tags", "candidate_paths",
     "rag_weights", "confidence", "provider_metadata", "fallback_used",
@@ -39,9 +42,32 @@ def _require_sha256(value: Any, description: str) -> str:
     return value.lower()
 
 
+def _require_git_sha(value: Any) -> str:
+    if not isinstance(value, str) or len(value) != 40:
+        raise ValueError("git_sha must be a 40-character hexadecimal Git SHA")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ValueError("git_sha must be a 40-character hexadecimal Git SHA") from exc
+    return value.lower()
+
+
+def _reject_gold_fields(value: Any) -> None:
+    """Fail closed if provider cache data contains gold-label-bearing keys."""
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if isinstance(key, str) and key.lower() in _FORBIDDEN_GOLD_FIELDS:
+                raise ValueError("provider-cache data must not contain gold labels")
+            _reject_gold_fields(nested)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for nested in value:
+            _reject_gold_fields(nested)
+
+
 def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(manifest, Mapping):
         raise ValueError("provider-cache manifest must be a mapping")
+    _reject_gold_fields(manifest)
     normalized = dict(manifest)
     if normalized.get("schema") != PROVIDER_CACHE_SCHEMA:
         raise ValueError(f"provider-cache manifest schema must be {PROVIDER_CACHE_SCHEMA!r}")
@@ -52,6 +78,14 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         str(index): _require_sha256(digest, f"source digest for row {index}")
         for index, digest in source_digests.items()
     }
+    normalized["git_sha"] = _require_git_sha(normalized.get("git_sha"))
+    if normalized.get("model_revision") != QWEN_REVISION:
+        raise ValueError(f"model_revision must be the pinned Qwen revision {QWEN_REVISION}")
+    normalized["bundle_hash"] = _require_sha256(normalized.get("bundle_hash"), "bundle_hash")
+    configuration = normalized.get("configuration")
+    if not isinstance(configuration, Mapping) or not configuration:
+        raise ValueError("configuration must be a non-empty mapping")
+    normalized["configuration"] = dict(configuration)
     return normalized
 
 
@@ -65,6 +99,14 @@ def _validate_provider_metadata(metadata: Any) -> None:
         for record in evidence:
             if not isinstance(record, Mapping) or record.get("stage") is None or record.get("status") is None:
                 raise ValueError(f"provider_metadata.{stage} contains malformed stage evidence")
+            if record["stage"] != stage:
+                raise ValueError(f"provider_metadata.{stage} contains evidence for a different stage")
+            if (
+                record.get("model") != QWEN_MODEL
+                or record.get("served_model") != QWEN_SERVED_MODEL
+                or record.get("revision") != QWEN_REVISION
+            ):
+                raise ValueError(f"provider_metadata.{stage} lacks the pinned Qwen served identity")
 
 
 def _validate_records(records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -76,8 +118,7 @@ def _validate_records(records: Sequence[Mapping[str, Any]], manifest: Mapping[st
     for record in records:
         if not isinstance(record, Mapping):
             raise ValueError("provider-cache record must be a mapping")
-        if _FORBIDDEN_GOLD_FIELDS.intersection(record):
-            raise ValueError("provider-cache records must not contain gold labels")
+        _reject_gold_fields(record)
         if set(record) != _RECORD_FIELDS:
             raise ValueError("provider-cache record has an invalid field set")
         index = record["row_index"]
