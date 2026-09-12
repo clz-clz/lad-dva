@@ -859,6 +859,14 @@ _DEER_CACHED_TRAIN_FILES = {
     "fewnerd": ("DFKI-SLT___few-nerd", "few-nerd-train.arrow"),
     "ontonotes5": ("tner___ontonotes5", "ontonotes5-train.arrow"),
 }
+_deer_init_locks = {
+    dataset_name: threading.Lock() for dataset_name in _DEER_CACHED_TRAIN_FILES
+}
+_deer_fallback_init_lock = threading.Lock()
+
+
+def _deer_ready(dataset_name: str) -> bool:
+    return dataset_name in _deer_stats and dataset_name in _deer_retriever
 
 
 def _load_cached_deer_training_split(dataset_name: str):
@@ -1104,10 +1112,10 @@ def run_contextual_lattice_replay(
     return {"pred_tags": result["current_tags"], **result}
 
 
-def _init_deer(dataset_name: str = "conll2003", *, cache_only: bool = False):
+def _build_deer(dataset_name: str = "conll2003", *, cache_only: bool = False):
     """Lazy-init DEER statistics and retriever for a given dataset."""
     global _deer_stats, _deer_retriever
-    if dataset_name in _deer_stats:
+    if _deer_ready(dataset_name):
         return
 
     from deer_retriever import DEERStatistics, DEERRetriever
@@ -1227,6 +1235,17 @@ def _init_deer(dataset_name: str = "conll2003", *, cache_only: bool = False):
     _deer_stats[dataset_name] = stats
     _deer_retriever[dataset_name] = retriever
     print(f"[DEER] Ready for {dataset_name}: {len(train_data)} training sentences indexed")
+
+
+def _init_deer(dataset_name: str = "conll2003", *, cache_only: bool = False):
+    """Initialize one dataset once, including under concurrent sentence runs."""
+    if _deer_ready(dataset_name):
+        return
+    init_lock = _deer_init_locks.get(dataset_name, _deer_fallback_init_lock)
+    with init_lock:
+        if _deer_ready(dataset_name):
+            return
+        _build_deer(dataset_name, cache_only=cache_only)
 
 
 def _get_deer_examples(query_tokens: List[str], top_k: int = 3,

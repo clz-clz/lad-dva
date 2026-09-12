@@ -694,6 +694,53 @@ def test_official_coder_retrieves_deer_examples_without_hub_access(monkeypatch):
     assert "conll2003" in multi_agent_v2._deer_stats
 
 
+def test_cache_only_deer_initialization_is_thread_safe(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+    import time
+
+    load_calls = []
+    start = threading.Barrier(4)
+    monkeypatch.setattr(multi_agent_v2, "_deer_stats", {})
+    monkeypatch.setattr(multi_agent_v2, "_deer_retriever", {})
+
+    def slow_cached_split(dataset_name):
+        load_calls.append(dataset_name)
+        time.sleep(0.05)
+        return [{"tokens": ["Alice"], "ner_tags": [1]}]
+
+    monkeypatch.setattr(
+        multi_agent_v2, "_load_cached_deer_training_split", slow_cached_split
+    )
+
+    def retrieve(_):
+        start.wait()
+        return multi_agent_v2._get_deer_examples(
+            ["Alice"], dataset_name="conll2003", cache_only=True
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(retrieve, range(4)))
+
+    assert load_calls == ["conll2003"]
+    assert all(result and result[0]["tokens"] == ["Alice"] for result in results)
+
+
+def test_partial_deer_cache_is_not_considered_initialized(monkeypatch):
+    build_calls = []
+    monkeypatch.setattr(multi_agent_v2, "_deer_stats", {"conll2003": object()})
+    monkeypatch.setattr(multi_agent_v2, "_deer_retriever", {})
+
+    def rebuild(dataset_name, *, cache_only=False):
+        build_calls.append((dataset_name, cache_only))
+        multi_agent_v2._deer_retriever[dataset_name] = object()
+
+    monkeypatch.setattr(multi_agent_v2, "_build_deer", rebuild)
+    multi_agent_v2._init_deer("conll2003", cache_only=True)
+
+    assert build_calls == [("conll2003", True)]
+
+
 def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monkeypatch):
     def structured_requester(stage, payload):
         return {"tags": ["O"]}
