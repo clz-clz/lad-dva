@@ -468,10 +468,24 @@ class OpenAICompatibleLADRGAdapter:
         usage = _mapping_value(raw_usage)
         if not usage:
             raise LiveBackboneError("official response is missing usage metadata")
-        if not all(isinstance(key, str) and type(value) in (int, float)
-                   for key, value in usage.items()):
+        detail_keys = {
+            "completion_tokens_details", "prompt_tokens_details",
+            "input_tokens_details", "output_tokens_details",
+        }
+        numeric_usage: dict[str, Any] = {}
+        for key, value in usage.items():
+            if not isinstance(key, str):
+                raise LiveBackboneError("official response has invalid usage metadata")
+            if key in detail_keys:
+                if value is None or isinstance(value, Mapping):
+                    continue
+                raise LiveBackboneError("official response has invalid usage metadata")
+            if type(value) not in (int, float):
+                raise LiveBackboneError("official response has invalid usage metadata")
+            numeric_usage[key] = value
+        if not numeric_usage:
             raise LiveBackboneError("official response has invalid usage metadata")
-        return usage
+        return numeric_usage
 
     def _responses_request(
         self,

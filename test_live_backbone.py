@@ -530,6 +530,37 @@ def test_deepseek_structured_request_uses_responses_json_schema_with_exact_69_it
     assert result.provider_metadata["response_model"] == "deepseek-v4-flash"
 
 
+def test_deepseek_usage_accepts_responses_details_and_retains_numeric_counts():
+    response = _responses_response({"tags": ["O"]})
+    response["usage"].update({
+        "input_tokens_details": {"cached_tokens": 3},
+        "output_tokens_details": {"reasoning_tokens": 5},
+    })
+    adapter = OpenAICompatibleLADRGAdapter(
+        _deepseek_settings(), transport=_RecordingTransport([response])
+    )
+
+    result = adapter.structured_requester("verifier", {
+        "name": "selectdenoise_verifier",
+        "schema": {
+            "type": "object", "additionalProperties": False,
+            "required": ["tags"],
+            "properties": {"tags": {
+                "type": "array", "minItems": 1, "maxItems": 1,
+                "items": {"type": "string", "enum": ["O"]},
+            }},
+        },
+        "messages": [{"role": "user", "content": "label"}],
+        "temperature": 0.0, "enable_thinking": True,
+    })
+
+    assert result.provider_metadata["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+    }
+
+
 @pytest.mark.parametrize(
     "response, match",
     [
@@ -727,6 +758,85 @@ def test_vllm_non_thinking_request_rejects_reasoning_only_json():
             },
             "messages": [{"role": "user", "content": "label"}],
             "temperature": 0.0, "enable_thinking": False,
+        })
+
+
+def test_vllm_usage_accepts_standard_details_and_retains_numeric_counts():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    response = _response(
+        {"tags": ["O"]},
+        model=served_model,
+        usage={
+            "completion_tokens": 336,
+            "prompt_tokens": 32,
+            "total_tokens": 368,
+            "completion_tokens_details": {
+                "accepted_prediction_tokens": None,
+                "audio_tokens": None,
+                "reasoning_tokens": 335,
+                "rejected_prediction_tokens": None,
+            },
+            "prompt_tokens_details": None,
+        },
+    )
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=_RecordingTransport([response]),
+    )
+
+    result = adapter.structured_requester("verifier", {
+        "name": "selectdenoise_verifier",
+        "schema": {
+            "type": "object", "additionalProperties": False,
+            "required": ["tags"],
+            "properties": {"tags": {
+                "type": "array", "minItems": 1, "maxItems": 1,
+                "items": {"type": "string", "enum": ["O"]},
+            }},
+        },
+        "messages": [{"role": "user", "content": "label"}],
+        "temperature": 0.0, "enable_thinking": True,
+    })
+
+    assert result.provider_metadata["usage"] == {
+        "completion_tokens": 336,
+        "prompt_tokens": 32,
+        "total_tokens": 368,
+    }
+
+
+def test_vllm_usage_rejects_unknown_non_numeric_metadata():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    response = _response(
+        {"tags": ["O"]}, model=served_model,
+        usage={"prompt_tokens": 2, "vendor_blob": {"opaque": True}},
+    )
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=_RecordingTransport([response]),
+    )
+
+    with pytest.raises(LiveBackboneError, match="invalid usage metadata"):
+        adapter.structured_requester("verifier", {
+            "name": "selectdenoise_verifier",
+            "schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["tags"],
+                "properties": {"tags": {
+                    "type": "array", "minItems": 1, "maxItems": 1,
+                    "items": {"type": "string", "enum": ["O"]},
+                }},
+            },
+            "messages": [{"role": "user", "content": "label"}],
+            "temperature": 0.0, "enable_thinking": True,
         })
 
 
