@@ -1,6 +1,10 @@
 import hashlib
 import json
 from pathlib import Path
+import asyncio
+import concurrent.futures
+import threading
+import time
 
 import pytest
 
@@ -390,3 +394,180 @@ def test_provider_cache_phase_is_a_distinct_runner_phase():
     args = run_multiseed._parse_args(["--phase", "provider-cache"])
 
     assert args.phase == "provider-cache"
+
+
+def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypatch):
+    """Three Coder paths per sentence must still honor the 20-request cap."""
+    from multi_agent_v2 import _invoke_structured_requester
+
+    noisy_dir = tmp_path / "noisy"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    noisy_dir.mkdir()
+    row = {
+        "tokens": ["Alice"],
+        "ner_tags": ["B-PER"],
+        "dirty_tags": ["B-PER"],
+    }
+    run_multiseed._noisy_path("msra", "BT", 13, 200, 0.15).write_text(
+        "".join(json.dumps(row) + "\n" for _ in range(200)), encoding="utf-8"
+    )
+
+    class PeakTrackingAdapter:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.active = 0
+            self.peak = 0
+            self.stages = []
+
+        def provider_metadata(self):
+            return {
+                "provider": "vllm",
+                "model": _MODEL,
+                "served_model": _SERVED_MODEL,
+                "revision": _REVISION,
+                "structured_api": "chat-completions-json-schema",
+            }
+
+        def structured_requester(self, stage, payload):
+            with self.lock:
+                self.stages.append(stage)
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                time.sleep(0.05)
+                return {}
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    adapter = PeakTrackingAdapter()
+
+    async def three_path_pipeline(tokens, dirty_tags, config, dataset_name=None):
+        requester = config["structured_requester"]
+        await asyncio.gather(*[
+            _invoke_structured_requester(requester, "coder", {}) for _ in range(3)
+        ])
+        await _invoke_structured_requester(requester, "reviewer", {})
+        await _invoke_structured_requester(requester, "verifier", {})
+        return {
+            "pred_tags": list(dirty_tags),
+            "candidate_paths": [list(dirty_tags)] * 3,
+            "rag_weights": [1.0, 1.0, 1.0],
+            "confidence": [1.0],
+            "provider_metadata": {
+                "coder": [_evidence("coder", "live") for _ in range(3)],
+                "reviewer": [_evidence("reviewer", "live")],
+                "verifier": [_evidence("verifier", "live")],
+            },
+            "fallback_used": False,
+        }
+
+    async def run_cell():
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=64)
+        )
+        await run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (three_path_pipeline, {}),
+            cache_root=tmp_path / "cache", cache_tag="request-cap-test",
+            max_concurrency=20, request_timeout=10,
+            adapter_factory=lambda: adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64,
+        )
+
+    asyncio.run(run_cell())
+
+    assert adapter.peak <= 20
+    assert set(adapter.stages) == {"coder", "reviewer", "verifier"}
+
+
+@pytest.mark.filterwarnings(
+    "ignore:The loop argument is deprecated.*:DeprecationWarning"
+)
+def test_provider_cache_abort_does_not_start_waiting_provider_requests(
+    tmp_path, monkeypatch
+):
+    """A failed live call must cancel queued calls before another one starts."""
+    from multi_agent_v2 import _invoke_structured_requester
+
+    noisy_dir = tmp_path / "noisy"
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    noisy_dir.mkdir()
+    row = {
+        "tokens": ["Alice"],
+        "ner_tags": ["B-PER"],
+        "dirty_tags": ["B-PER"],
+    }
+    run_multiseed._noisy_path("msra", "BT", 13, 200, 0.15).write_text(
+        "".join(json.dumps(row) + "\n" for _ in range(200)), encoding="utf-8"
+    )
+
+    class FailingAdapter:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.started = 0
+            self.first_wave = threading.Barrier(20)
+            self.failure_raised = threading.Event()
+            self.release = threading.Event()
+
+        def provider_metadata(self):
+            return {
+                "provider": "vllm",
+                "model": _MODEL,
+                "served_model": _SERVED_MODEL,
+                "revision": _REVISION,
+                "structured_api": "chat-completions-json-schema",
+            }
+
+        def structured_requester(self, stage, payload):
+            with self.lock:
+                self.started += 1
+                call_number = self.started
+            if call_number <= 20:
+                self.first_wave.wait(timeout=5)
+            if call_number == 20:
+                self.failure_raised.set()
+                raise RuntimeError("provider failed")
+            self.release.wait(timeout=5)
+            return {}
+
+    adapter = FailingAdapter()
+
+    async def failing_pipeline(tokens, dirty_tags, config, dataset_name=None):
+        requester = config["structured_requester"]
+        await asyncio.gather(*[
+            _invoke_structured_requester(requester, "coder", {})
+            for _ in range(3)
+        ])
+
+    def release_started_calls():
+        adapter.failure_raised.wait(timeout=5)
+        time.sleep(0.1)
+        adapter.release.set()
+
+    controller = threading.Thread(target=release_started_calls, daemon=True)
+    controller.start()
+
+    async def run_cell():
+        asyncio.get_running_loop().set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(max_workers=64)
+        )
+        await run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (failing_pipeline, {}),
+            cache_root=tmp_path / "cache", cache_tag="abort-request-cap-test",
+            max_concurrency=20, request_timeout=10,
+            adapter_factory=lambda: adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64,
+        )
+
+    try:
+        with pytest.raises(RuntimeError, match="provider failed"):
+            asyncio.run(run_cell())
+    finally:
+        adapter.release.set()
+        controller.join(timeout=5)
+
+    assert adapter.started == 20

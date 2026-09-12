@@ -27,6 +27,7 @@ import concurrent.futures
 import contextlib
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import logging
 import math
@@ -36,6 +37,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -1175,6 +1177,38 @@ async def _run_provider_cache_cell(
 
     default_fn, _baseline_fns = pipelines
     sem = asyncio.Semaphore(max_concurrency)
+    provider_sem = threading.BoundedSemaphore(max_concurrency)
+    provider_requester = getattr(adapter, "structured_requester", None)
+    if not callable(provider_requester):
+        raise RuntimeError("provider-cache adapter has no structured requester")
+    if inspect.iscoroutinefunction(provider_requester):
+        raise RuntimeError("provider-cache structured requester must be synchronous")
+    provider_aborted = threading.Event()
+
+    def limited_provider_requester(stage: str, payload: Mapping[str, Any]) -> Any:
+        while not provider_aborted.is_set():
+            if provider_sem.acquire(timeout=0.05):
+                break
+        else:
+            raise RuntimeError("provider-cache requests are aborted")
+        try:
+            if provider_aborted.is_set():
+                raise RuntimeError("provider-cache requests are aborted")
+            result = provider_requester(stage, payload)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError(
+                    "provider-cache structured requester must be synchronous"
+                )
+            return result
+        except BaseException:
+            provider_aborted.set()
+            raise
+        finally:
+            provider_sem.release()
+
     cached: list[Optional[dict[str, Any]]] = [None] * len(rows)
     provider_config = dict(config)
     provider_config["preterminal_only"] = True
@@ -1185,7 +1219,7 @@ async def _run_provider_cache_cell(
             runtime_config = dict(provider_config)
             runtime_config.update({"__dataset__": dataset, "__noise_type__": noise,
                                    "official": True, "__return_candidates__": True,
-                                   "structured_requester": getattr(adapter, "structured_requester", None),
+                                   "structured_requester": limited_provider_requester,
                                    "provider_metadata": dict(identity)})
             result = await asyncio.wait_for(
                 default_fn(tokens, dirty, runtime_config, dataset_name=dataset), timeout=request_timeout)
@@ -1208,6 +1242,7 @@ async def _run_provider_cache_cell(
             raise RuntimeError("provider-cache cell has an incomplete result buffer")
         digest = write_provider_cell(cell_path, [record for record in cached if record is not None], manifest)
     except BaseException:
+        provider_aborted.set()
         for task in tasks:
             if not task.done():
                 task.cancel()
