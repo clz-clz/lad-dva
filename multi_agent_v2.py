@@ -542,7 +542,9 @@ async def coder_node(state: State):
     sentence_initial_guidance = _format_sentence_initial_guidance(dataset_name)
 
     # DEER examples: same calibration data the Reviewer sees
-    deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=dataset_name)
+    deer_examples = _get_deer_examples(
+        tokens, top_k=3, dataset_name=dataset_name, cache_only=official
+    )
 
     # ---- Noise-type-specific policies and per-path strategies ----
     if noise_type == "BT":
@@ -1228,9 +1230,13 @@ def _init_deer(dataset_name: str = "conll2003", *, cache_only: bool = False):
 
 
 def _get_deer_examples(query_tokens: List[str], top_k: int = 3,
-                       dataset_name: str = "conll2003") -> List[dict]:
+                       dataset_name: str = "conll2003", *,
+                       cache_only: bool = False) -> List[dict]:
     """Retrieve top-k training sentences via DEER label-guided scoring."""
-    _init_deer(dataset_name)
+    if cache_only:
+        _init_deer(dataset_name, cache_only=True)
+    else:
+        _init_deer(dataset_name)
     retriever = _deer_retriever.get(dataset_name)
     if retriever is None:
         return []
@@ -1291,7 +1297,9 @@ async def reviewer_node(state: State):
         }
 
     # DEER retrieval: use label statistics to find similar training sentences
-    deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=ds_name)
+    deer_examples = _get_deer_examples(
+        tokens, top_k=3, dataset_name=ds_name, cache_only=official
+    )
     if official:
         reviewer_output_instruction = f"""
     Output ONLY a JSON object whose only key is "weights".
@@ -2336,7 +2344,9 @@ async def verifier_node(state: State):
     if len(distinct) < 2:                       # nothing to choose between
         return skipped("skipped_identical", base)
 
-    deer_examples = _get_deer_examples(tokens, top_k=3, dataset_name=ds)
+    deer_examples = _get_deer_examples(
+        tokens, top_k=3, dataset_name=ds, cache_only=official
+    )
     cand_block = "\n".join(
         f"  Candidate {idx+1} (score {w:.2f}): {json.dumps(p, ensure_ascii=False)}\n"
         f"      entities: {_spans_str(tokens, p)}"

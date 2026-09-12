@@ -36,6 +36,7 @@ def _record(stage, status="live"):
 
 def test_official_contextual_verifier_uses_structured_requester_and_records_live_evidence(monkeypatch):
     calls = []
+    deer_cache_modes = []
 
     def requester(stage, payload):
         calls.append((stage, payload))
@@ -46,7 +47,11 @@ def test_official_contextual_verifier_uses_structured_requester_and_records_live
             raise AssertionError("official Verifier must not use global ChatOpenAI")
 
     monkeypatch.setattr(multi_agent_v2, "llm", ForbiddenLLM())
-    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_args, **_kwargs: [])
+    def deer_examples(*_args, **kwargs):
+        deer_cache_modes.append(kwargs.get("cache_only"))
+        return []
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", deer_examples)
     result = asyncio.run(multi_agent_v2.verifier_node({
         "official": True, "tokens": ["Acme", "arrived"],
         "dirty_tags": ["B-ORG", "O"], "candidate_paths": [["B-ORG", "O"], ["B-PER", "O"]],
@@ -59,6 +64,7 @@ def test_official_contextual_verifier_uses_structured_requester_and_records_live
     assert [stage for stage, _payload in calls] == ["verifier"]
     assert calls[0][1]["name"] == "selectdenoise_verifier"
     assert calls[0][1]["schema"]["properties"]["tags"]["minItems"] == 2
+    assert deer_cache_modes == [True]
     assert result["current_tags"] == ["B-ORG", "O"]
     assert result["provider_metadata"]["verifier"] == [_record("verifier")]
 

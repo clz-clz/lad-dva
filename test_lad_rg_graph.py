@@ -592,6 +592,12 @@ def test_official_candidate_evidence_exposes_stage_separated_launch_fields(monke
 
 
 def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(monkeypatch):
+    deer_cache_modes = []
+
+    def deer_examples(*_args, **kwargs):
+        deer_cache_modes.append(kwargs.get("cache_only"))
+        return []
+
     def structured_requester(stage, payload):
         return LiveBackboneResult(
             {"tags": ["O", "O"]}
@@ -614,7 +620,7 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
             },
         )
 
-    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *args, **kwargs: [])
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", deer_examples)
     coded = asyncio.run(
         multi_agent_v2.coder_node(
             _state(
@@ -649,6 +655,43 @@ def test_coder_and_reviewer_capture_response_metadata_in_separate_stage_records(
         "prompt_tokens": 5,
         "completion_tokens": 2,
     }
+    assert deer_cache_modes == [True, True]
+
+
+def test_official_coder_retrieves_deer_examples_without_hub_access(monkeypatch):
+    import datasets
+
+    monkeypatch.setattr(multi_agent_v2, "_deer_stats", {})
+    monkeypatch.setattr(multi_agent_v2, "_deer_retriever", {})
+    monkeypatch.setattr(
+        multi_agent_v2,
+        "_load_cached_deer_training_split",
+        lambda dataset_name: [{"tokens": ["Alice"], "ner_tags": [1]}],
+    )
+
+    def forbidden_hub_load(*_args, **_kwargs):
+        raise AssertionError("official DEER initialization must not access the Hub")
+
+    monkeypatch.setattr(datasets, "load_dataset", forbidden_hub_load)
+
+    def structured_requester(_stage, _payload):
+        return {"tags": ["B-PER"]}
+
+    result = asyncio.run(
+        multi_agent_v2.coder_node(
+            _state(
+                official=True,
+                noise_type="OTHER",
+                tokens=["Alice"],
+                dirty_tags=["O"],
+                candidate_paths=[],
+                structured_requester=structured_requester,
+            )
+        )
+    )
+
+    assert result["candidate_paths"] == [["B-PER"]] * 3
+    assert "conll2003" in multi_agent_v2._deer_stats
 
 
 def test_official_coder_preserves_valid_all_o_live_output_without_fallback(monkeypatch):
