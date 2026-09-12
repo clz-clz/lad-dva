@@ -123,6 +123,7 @@ class State(TypedDict):
     tokens: List[str]
     dirty_tags: List[str]
     candidate_paths: List[List[str]]
+    terminal_candidate_paths: List[List[str]]
     rag_weights: List[float]
     current_tags: List[str]
     errors: List[str]
@@ -709,6 +710,10 @@ PATH {pidx} STRATEGY — your ONLY task:
             path = extract_json_list(response.content, fallback_length=len(tokens))
         candidate_paths.append(path)
 
+    raw_contextual_paths = (
+        [list(path) for path in candidate_paths] if contextual_official else []
+    )
+
     coder_records = [
         (
             _callback_stage_record(
@@ -724,10 +729,10 @@ PATH {pidx} STRATEGY — your ONLY task:
         for (strategy_key, _prompt, _kwargs), response in zip(requests, responses)
     ]
 
-    if official:
+    if official and not contextual_official:
         if any(not _is_legal_tag_sequence(path) for path in candidate_paths):
             raise ValueError("official Coder response contains an illegal IOB2 transition")
-    else:
+    elif not official:
         # Legacy behavior retains its defensive length and DFA normalization.
         candidate_paths = [
             p[:len(tokens)] + ["O"] * max(0, len(tokens) - len(p))
@@ -830,12 +835,22 @@ PATH {pidx} STRATEGY — your ONLY task:
             print(f" [Coder] All {len(candidate_paths)} paths identical "
                   f"({n_diff} diffs vs dirty) — LLM consensus, skipping diversity")
 
-    return {
+    terminal_candidate_paths = []
+    if contextual_official:
+        terminal_candidate_paths = [
+            list(raw_path) if not _is_legal_tag_sequence(raw_path) else list(processed_path)
+            for raw_path, processed_path in zip(raw_contextual_paths, candidate_paths)
+        ]
+
+    result = {
         "candidate_paths": candidate_paths,
         "iterations": state.get("iterations", 0) + 1,
         "provider_metadata": _with_stage_records(state, "coder", coder_records),
         "fallback_used": fallback_used,
     }
+    if contextual_official:
+        result["terminal_candidate_paths"] = terminal_candidate_paths
+    return result
 
 def _all_paths_identical(paths: List[List[str]]) -> bool:
     """Check if all candidate paths are identical."""
@@ -977,7 +992,9 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
     tokens = list(state.get("tokens", []))
     dirty_tags = list(state.get("dirty_tags", []))
     anchor_tags = list(state.get("current_tags", [])) or list(dirty_tags)
-    candidate_paths = state.get("candidate_paths", []) or []
+    candidate_paths = (
+        state.get("terminal_candidate_paths") or state.get("candidate_paths", []) or []
+    )
     reviewer_weights = state.get("rag_weights", []) or []
     dataset_name = state.get("dataset_name", "conll2003")
     valid_types = frozenset(DATASET_ENTITY_TYPES.get(dataset_name, DATASET_ENTITY_TYPES["conll2003"]))
@@ -1074,10 +1091,10 @@ def run_contextual_lattice_replay(
         for prefix in ("B", "I")
     }
 
-    def checked_tags(value: Any, field: str) -> list[str]:
+    def checked_tags(value: Any, field: str, *, require_legal: bool = True) -> list[str]:
         if (not isinstance(value, list) or len(value) != len(tokens)
                 or not all(isinstance(tag, str) and tag in valid_tags for tag in value)
-                or not _is_legal_tag_sequence(value)):
+                or (require_legal and not _is_legal_tag_sequence(value))):
             raise ContextualLatticeError(f"contextual replay {field} is invalid")
         return list(value)
 
@@ -1090,7 +1107,9 @@ def run_contextual_lattice_replay(
         raise ContextualLatticeError("contextual replay reviewer weights are not aligned")
     checked_paths: list[list[str]] = []
     for path in candidate_paths:
-        checked_paths.append(checked_tags(path, "candidate_paths"))
+        # Candidate legality is a lattice concern: malformed IOB2 paths are
+        # excluded by build_lattice, while shape and ontology remain strict.
+        checked_paths.append(checked_tags(path, "candidate_paths", require_legal=False))
     checked_weights: list[float] = []
     for weight in reviewer_weights:
         if (isinstance(weight, bool) or not isinstance(weight, (int, float))
@@ -2614,7 +2633,10 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
             if official:
                 raise ValueError("official pipeline returned the wrong tag sequence length")
             predicted_tags = dirty_tags
-        cand = final_state.get("candidate_paths", []) or []
+        cand = (
+            final_state.get("terminal_candidate_paths")
+            if contextual_official else None
+        ) or final_state.get("candidate_paths", []) or []
         weights = final_state.get("rag_weights", []) or [1.0] * len(cand)
         if terminal is not None:
             terminal_metadata = _apply_contextual_lattice_terminal(final_state, terminal)

@@ -270,6 +270,41 @@ def test_runtime_excludes_invalid_candidate_paths_but_hard_fails_invalid_anchor(
         )
 
 
+def test_host_terminal_excludes_raw_candidate_that_coder_postprocessing_legalized():
+    from multi_agent_v2 import _apply_contextual_lattice_terminal
+
+    class _CaptureDecoder:
+        model_hash = "capture"
+
+        def decode(self, value):
+            lattice = build_lattice(value)
+            assert tuple(candidate.span for candidate in lattice) == (
+                Span(0, 1, "PER"), Span(0, 2, "PER"),
+            )
+            assert all(candidate.path_support == 0 for candidate in lattice)
+            return type("Result", (), {
+                "tags": value.anchor_tags,
+                "raw_lattice_tags": value.anchor_tags,
+                "used_anchor": True,
+                "predicted_gain": 0.0,
+                "selected_spans": (),
+                "model_hash": self.model_hash,
+            })()
+
+    terminal = ContextualLatticeTerminal(_CaptureDecoder())
+    with pytest.warns(RuntimeWarning, match="Excluding invalid candidate path"):
+        result = _apply_contextual_lattice_terminal({
+            "tokens": ["Stefano", "Bordon"],
+            "dirty_tags": ["B-PER", "O"],
+            "current_tags": ["B-PER", "I-PER"],
+            "candidate_paths": [["B-PER", "I-PER"]],
+            "terminal_candidate_paths": [["O", "I-PER"]],
+            "rag_weights": [1.0],
+            "dataset_name": "conll2003",
+        }, terminal)
+    assert result["current_tags"] == ["B-PER", "I-PER"]
+
+
 def test_bundle_directory_is_non_overwriting(tmp_path: Path):
     decoder, gate = _fitted_components()
     target = tmp_path / "bundle"

@@ -34,6 +34,113 @@ def _record(stage, status="live"):
     }
 
 
+def test_official_contextual_coder_preserves_illegal_candidate_for_lattice_filtering(monkeypatch):
+    def requester(stage, _payload):
+        return LiveBackboneResult({"tags": ["O", "I-PER"]}, _record(stage))
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_args, **_kwargs: [])
+    result = asyncio.run(multi_agent_v2.coder_node({
+        "official": True,
+        "tokens": ["Stefano", "Bordon"],
+        "dirty_tags": ["B-PER", "O"],
+        "dataset_name": "conll2003",
+        "noise_type": "BT",
+        "structured_requester": requester,
+        "provider_settings": _settings(),
+        "provider_metadata": {stage: [] for stage in ("coder", "reviewer", "verifier")},
+    }))
+
+    assert result["candidate_paths"] == [["B-PER", "I-PER"]] * 3
+    assert result["terminal_candidate_paths"] == [["O", "I-PER"]] * 3
+    assert result["fallback_used"] is False
+
+
+def test_official_contextual_preterminal_returns_terminal_candidate_view(monkeypatch):
+    class Graph:
+        async def ainvoke(self, _state):
+            return {
+                "current_tags": ["B-PER", "O"],
+                "candidate_paths": [["B-PER", "O"]],
+                "terminal_candidate_paths": [["O", "I-PER"]],
+                "rag_weights": [1.0],
+                "provider_metadata": {
+                    stage: [_record(stage)] for stage in ("coder", "reviewer", "verifier")
+                },
+                "fallback_used": False,
+            }
+
+    monkeypatch.setattr(multi_agent_v2, "_select_pipeline_graph", lambda _config: Graph())
+    result = asyncio.run(multi_agent_v2.run_agent_pipeline(
+        ["Stefano", "Bordon"],
+        ["B-PER", "O"],
+        {
+            "official": True,
+            "terminal_decoder": "contextual-lattice-v1",
+            "preterminal_only": True,
+            "__return_candidates__": True,
+        },
+        dataset_name="conll2003",
+    ))
+
+    assert result["candidate_paths"] == [["O", "I-PER"]]
+
+
+def test_contextual_terminal_receives_terminal_candidate_view():
+    captured = {}
+    terminal = SimpleNamespace(
+        model_hash=MODEL_HASH,
+        fallback_count=0,
+        sentence_deer_stats=lambda _tokens: {},
+        decode=lambda **kwargs: (
+            captured.update(kwargs)
+            or SimpleNamespace(
+                tags=("B-PER", "O"), model_hash=MODEL_HASH,
+                used_anchor=True, predicted_gain=0.0,
+            )
+        ),
+    )
+
+    multi_agent_v2._apply_contextual_lattice_terminal({
+        "tokens": ["Stefano", "Bordon"],
+        "dirty_tags": ["B-PER", "O"],
+        "current_tags": ["B-PER", "O"],
+        "candidate_paths": [["B-PER", "O"]],
+        "terminal_candidate_paths": [["O", "I-PER"]],
+        "rag_weights": [1.0],
+        "dataset_name": "conll2003",
+    }, terminal)
+
+    assert captured["candidate_paths"] == [["O", "I-PER"]]
+
+
+def test_contextual_terminal_falls_back_from_empty_terminal_candidate_view():
+    captured = {}
+    terminal = SimpleNamespace(
+        model_hash=MODEL_HASH,
+        fallback_count=0,
+        sentence_deer_stats=lambda _tokens: {},
+        decode=lambda **kwargs: (
+            captured.update(kwargs)
+            or SimpleNamespace(
+                tags=("B-PER", "O"), model_hash=MODEL_HASH,
+                used_anchor=True, predicted_gain=0.0,
+            )
+        ),
+    )
+
+    multi_agent_v2._apply_contextual_lattice_terminal({
+        "tokens": ["Stefano", "Bordon"],
+        "dirty_tags": ["B-PER", "O"],
+        "current_tags": ["B-PER", "O"],
+        "candidate_paths": [["B-PER", "O"]],
+        "terminal_candidate_paths": [],
+        "rag_weights": [1.0],
+        "dataset_name": "conll2003",
+    }, terminal)
+
+    assert captured["candidate_paths"] == [["B-PER", "O"]]
+
+
 def test_official_contextual_verifier_uses_structured_requester_and_records_live_evidence(monkeypatch):
     calls = []
     deer_cache_modes = []
@@ -168,3 +275,51 @@ def test_contextual_replay_passes_only_the_locked_terminal_allowlist():
     assert "gold_tags" not in captured
     assert result["terminal_model_hash"] == MODEL_HASH
     assert result["terminal_fallback_count"] == 0
+
+
+def test_contextual_replay_preserves_illegal_candidate_for_lattice_filtering():
+    captured = {}
+
+    class Terminal:
+        model_hash = MODEL_HASH
+        fallback_count = 0
+
+        def sentence_deer_stats(self, _tokens):
+            return {}
+
+        def decode(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                tags=("B-PER", "O"), model_hash=MODEL_HASH,
+                used_anchor=True, predicted_gain=0.0,
+            )
+
+    multi_agent_v2.run_contextual_lattice_replay(
+        tokens=["Stefano", "Bordon"],
+        dirty_tags=["O", "I-PER"],
+        provider_record={
+            "anchor_tags": ["B-PER", "O"],
+            "candidate_paths": [["O", "I-PER"]],
+            "rag_weights": [1.0],
+        },
+        dataset_name="conll2003",
+        terminal=Terminal(),
+    )
+
+    assert captured["candidate_paths"] == [["O", "I-PER"]]
+
+
+@pytest.mark.parametrize("candidate", [["O"], ["O", "B-DATE"]])
+def test_contextual_replay_still_rejects_candidate_shape_and_ontology(candidate):
+    with pytest.raises(multi_agent_v2.ContextualLatticeError, match="candidate_paths"):
+        multi_agent_v2.run_contextual_lattice_replay(
+            tokens=["Stefano", "Bordon"],
+            dirty_tags=["O", "I-PER"],
+            provider_record={
+                "anchor_tags": ["B-PER", "O"],
+                "candidate_paths": [candidate],
+                "rag_weights": [1.0],
+            },
+            dataset_name="conll2003",
+            terminal=object(),
+        )

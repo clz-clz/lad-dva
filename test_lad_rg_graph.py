@@ -1155,3 +1155,24 @@ def test_official_coder_rejects_68_69_length_mismatch_without_normalization(monk
                 )
             )
         )
+
+
+def test_non_contextual_official_coder_rejects_illegal_iob2_candidate(monkeypatch):
+    def structured_requester(_stage, _payload):
+        return {"tags": ["O", "I-PER"]}
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_args, **_kwargs: [])
+
+    with pytest.raises(ValueError, match="illegal IOB2 transition"):
+        asyncio.run(
+            multi_agent_v2.coder_node(
+                _state(
+                    official=True,
+                    tokens=["Stefano", "Bordon"],
+                    dirty_tags=["O", "I-PER"],
+                    noise_type="ATF",
+                    candidate_paths=[],
+                    structured_requester=structured_requester,
+                )
+            )
+        )
