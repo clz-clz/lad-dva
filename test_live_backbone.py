@@ -632,6 +632,104 @@ def test_vllm_structured_request_keeps_chat_completions_strict_schema_route():
     assert result.provider_metadata["structured_api"] == "chat-completions-json-schema"
 
 
+def test_vllm_thinking_structured_request_accepts_69_tag_schema_json_from_reasoning_field():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    expected_tags = ["O"] * 69
+    response = _response({"tags": expected_tags}, model=served_model)
+    response["choices"][0]["message"] = {
+        "content": None,
+        "reasoning": json.dumps({"tags": expected_tags}),
+    }
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=_RecordingTransport([response]),
+    )
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["tags"],
+        "properties": {"tags": {
+            "type": "array", "minItems": 69, "maxItems": 69,
+            "items": {"type": "string", "enum": ["O", "B-PER"]},
+        }},
+    }
+
+    result = adapter.structured_requester("capability_probe_69", {
+        "name": "contextual_capability_probe_69", "schema": schema,
+        "messages": [{"role": "user", "content": "label"}],
+        "temperature": 0.0, "enable_thinking": True,
+    })
+
+    assert result == {"tags": expected_tags}
+
+
+def test_vllm_thinking_reasoning_json_still_enforces_schema_length():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    response = _response({"tags": ["O"] * 68}, model=served_model)
+    response["choices"][0]["message"] = {
+        "content": None,
+        "reasoning": json.dumps({"tags": ["O"] * 68}),
+    }
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=_RecordingTransport([response]),
+    )
+
+    with pytest.raises(LiveBackboneError, match="exactly 69 items; received 68"):
+        adapter.structured_requester("capability_probe_69", {
+            "name": "contextual_capability_probe_69",
+            "schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["tags"],
+                "properties": {"tags": {
+                    "type": "array", "minItems": 69, "maxItems": 69,
+                    "items": {"type": "string", "enum": ["O", "B-PER"]},
+                }},
+            },
+            "messages": [{"role": "user", "content": "label"}],
+            "temperature": 0.0, "enable_thinking": True,
+        })
+
+
+def test_vllm_non_thinking_request_rejects_reasoning_only_json():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    response = _response({"tags": ["O"]}, model=served_model)
+    response["choices"][0]["message"] = {
+        "content": None,
+        "reasoning": json.dumps({"tags": ["O"]}),
+    }
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION,
+        ),
+        transport=_RecordingTransport([response]),
+    )
+
+    with pytest.raises(LiveBackboneError, match="content is not a JSON string"):
+        adapter.structured_requester("coder_path_1", {
+            "name": "lad_rg_coder_path_1",
+            "schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["tags"],
+                "properties": {"tags": {
+                    "type": "array", "minItems": 1, "maxItems": 1,
+                    "items": {"type": "string", "enum": ["O"]},
+                }},
+            },
+            "messages": [{"role": "user", "content": "label"}],
+            "temperature": 0.0, "enable_thinking": False,
+        })
+
+
 @pytest.mark.parametrize(
     "response, match",
     [

@@ -573,7 +573,7 @@ class OpenAICompatibleLADRGAdapter:
                 raise LiveBackboneError(
                     f"official chat response has unsupported finish_reason {finish_reason!r}"
                 )
-            return _json_response(raw), {
+            return _json_response(raw, allow_reasoning=enable_thinking), {
                 "model": response_model,
                 "system_fingerprint": _get(raw, "system_fingerprint"),
                 "usage": _mapping_value(_get(raw, "usage")),
@@ -632,11 +632,16 @@ def _valid_tags(payload: Mapping[str, Any]) -> set[str]:
     return set(tags)
 
 
-def _json_response(raw: Any) -> dict[str, Any]:
+def _json_response(raw: Any, *, allow_reasoning: bool = False) -> dict[str, Any]:
     choices = _get(raw, "choices")
     if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
         raise LiveBackboneError("official response has no completion choice")
-    content = _get(_get(choices[0], "message"), "content")
+    message = _get(choices[0], "message")
+    content = _get(message, "content")
+    if content is None and allow_reasoning:
+        reasoning = _get(message, "reasoning")
+        if isinstance(reasoning, str):
+            return _json_text(reasoning, "official response reasoning")
     if not isinstance(content, str):
         raise LiveBackboneError("official response content is not a JSON string")
     return _json_text(content, "official response")
