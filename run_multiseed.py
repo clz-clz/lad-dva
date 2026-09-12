@@ -999,8 +999,10 @@ def _validate_contextual_replay_bundle(bundle_hash: str) -> tuple[Path, Path]:
     if not checkpoint_path.is_absolute():
         candidates = [Path.cwd() / checkpoint_path,
                       bundle_path.parents[2] / checkpoint_path]
-        checkpoint_path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
-    if not checkpoint_path.is_file() or _sha256_file(checkpoint_path) != LOCKED_CHECKPOINT_HASH:
+        checkpoint_path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+    checkpoint_file = (checkpoint_path / "model.safetensors"
+                       if checkpoint_path.is_dir() else checkpoint_path)
+    if not checkpoint_file.is_file() or _sha256_file(checkpoint_file) != LOCKED_CHECKPOINT_HASH:
         raise ValueError("contextual replay checkpoint hash mismatch")
     embedding_text = os.environ.get("CONTEXTUAL_LATTICE_ENCODER_CACHE", "").strip()
     embedding_path = (Path(embedding_text).expanduser().resolve()

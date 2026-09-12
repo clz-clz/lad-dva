@@ -251,6 +251,59 @@ def test_contextual_replay_phase_parses_an_explicit_cache_tag_and_root(tmp_path)
     assert args.provider_cache_tag == "qwen-replay-v1"
 
 
+def test_contextual_replay_bundle_accepts_snapshot_directory_checkpoint(
+    tmp_path, monkeypatch
+):
+    import contextual_lattice_runtime as runtime
+
+    checkpoint = tmp_path / "snapshot"
+    checkpoint.mkdir()
+    model_file = checkpoint / "model.safetensors"
+    model_file.write_bytes(b"locked checkpoint")
+    checkpoint_hash = hashlib.sha256(model_file.read_bytes()).hexdigest()
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    decoder = bundle / "decoder.pt"
+    gate = bundle / "gate.joblib"
+    decoder.write_bytes(b"decoder")
+    gate.write_bytes(b"gate")
+    decoder_hash = hashlib.sha256(decoder.read_bytes()).hexdigest()
+    gate_hash = hashlib.sha256(gate.read_bytes()).hexdigest()
+    split_hash = "1" * 64
+    decoder_model_hash = "2" * 64
+    manifest = bundle / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_hash": checkpoint_hash,
+                "split_hash": split_hash,
+                "decoder_model_hash": decoder_model_hash,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    manifest_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    embedding_cache = tmp_path / "embedding_cache"
+    embedding_cache.mkdir()
+
+    monkeypatch.setattr(runtime, "LOCKED_CHECKPOINT_HASH", checkpoint_hash)
+    monkeypatch.setattr(runtime, "LOCKED_SPLIT_HASH", split_hash)
+    monkeypatch.setattr(runtime, "LOCKED_BUNDLE_MANIFEST_HASH", manifest_hash)
+    monkeypatch.setattr(runtime, "LOCKED_DECODER_FILE_HASH", decoder_hash)
+    monkeypatch.setattr(runtime, "LOCKED_GATE_FILE_HASH", gate_hash)
+    monkeypatch.setattr(runtime, "LOCKED_DECODER_MODEL_HASH", decoder_model_hash)
+    monkeypatch.setenv("CONTEXTUAL_LATTICE_BUNDLE", str(bundle))
+    monkeypatch.setenv("CONTEXTUAL_LATTICE_ENCODER_CACHE", str(embedding_cache))
+
+    assert run_multiseed._validate_contextual_replay_bundle(manifest_hash) == (
+        bundle.resolve(),
+        embedding_cache.resolve(),
+    )
+
+
 def test_contextual_replay_cell_rechecks_source_rows_and_persists_cache_provenance(tmp_path, monkeypatch):
     import asyncio
 
