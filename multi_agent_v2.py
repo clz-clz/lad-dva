@@ -198,6 +198,34 @@ def _plain_mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _official_enable_thinking(state: Mapping[str, Any]) -> bool:
+    """Return the effective mode for an official stage request.
+
+    The contextual Qwen graph historically requested thinking explicitly.  A
+    fixed-Qwen setting may override that request; all other providers retain
+    the request supplied by their existing caller.
+    """
+    settings = _plain_mapping(state.get("provider_settings"))
+    configured = settings.get("enable_thinking")
+    if (settings.get("provider") == "vllm"
+            and settings.get("model") == _QWEN_OFFICIAL_MODEL
+            and type(configured) is bool):
+        return configured
+    return True
+
+
+def _stage_thinking_metadata(settings: Mapping[str, Any]) -> tuple[Optional[bool], str]:
+    configured = settings.get("enable_thinking")
+    if type(configured) is bool:
+        return configured, "thinking" if configured else "nothink"
+    # Official Qwen stages historically request thinking unless explicitly
+    # overridden.  This makes skipped-stage evidence auditable too.
+    if (settings.get("provider") == "vllm"
+            and settings.get("model") == _QWEN_OFFICIAL_MODEL):
+        return True, "thinking"
+    return None, "request-controlled"
+
+
 def _response_stage_record(response: Any, stage: str,
                            provider_settings: Any = None) -> dict[str, Any]:
     settings = _plain_mapping(provider_settings)
@@ -207,6 +235,7 @@ def _response_stage_record(response: Any, stage: str,
         usage = _plain_mapping(response_metadata.get("token_usage"))
     response_model = (response_metadata.get("model_name")
                       or response_metadata.get("model"))
+    configured_thinking, configured_mode = _stage_thinking_metadata(settings)
     return {
         "stage": stage,
         "status": "live",
@@ -221,11 +250,19 @@ def _response_stage_record(response: Any, stage: str,
         "response_status": response_metadata.get("response_status"),
         "finish_reason": response_metadata.get("finish_reason"),
         "incomplete_reason": response_metadata.get("incomplete_reason"),
+        "enable_thinking": response_metadata.get(
+            "enable_thinking", configured_thinking
+        ),
+        "thinking_mode": response_metadata.get(
+            "thinking_mode", configured_mode
+        ),
     }
 
 
 def _callback_stage_record(result: Any, stage: str,
                            provider_settings: Any = None) -> dict[str, Any]:
+    settings = _plain_mapping(provider_settings)
+    configured_thinking, configured_mode = _stage_thinking_metadata(settings)
     callback_metadata = getattr(result, "provider_metadata", None)
     if isinstance(callback_metadata, Mapping):
         record = dict(callback_metadata)
@@ -241,6 +278,8 @@ def _callback_stage_record(result: Any, stage: str,
         record.setdefault("response_status", None)
         record.setdefault("finish_reason", None)
         record.setdefault("incomplete_reason", None)
+        record.setdefault("enable_thinking", configured_thinking)
+        record.setdefault("thinking_mode", configured_mode)
         record["usage"] = _plain_mapping(record.get("usage"))
         return record
     return _response_stage_record(None, stage, provider_settings)
@@ -249,6 +288,7 @@ def _callback_stage_record(result: Any, stage: str,
 def _stage_status_record(stage: str, status: str,
                          provider_settings: Any = None) -> dict[str, Any]:
     settings = _plain_mapping(provider_settings)
+    configured_thinking, configured_mode = _stage_thinking_metadata(settings)
     return {
         "stage": stage,
         "status": status,
@@ -263,6 +303,8 @@ def _stage_status_record(stage: str, status: str,
         "response_status": None,
         "finish_reason": None,
         "incomplete_reason": None,
+        "enable_thinking": configured_thinking,
+        "thinking_mode": configured_mode,
     }
 
 
@@ -292,6 +334,11 @@ def _validate_contextual_official_evidence(evidence: Mapping[str, Any]) -> None:
                     )
                     or record.get("structured_api") != "chat-completions-json-schema"):
                 raise RuntimeError("official contextual evidence lacks pinned Qwen identity")
+            if (type(record.get("enable_thinking")) is not bool
+                    or record.get("thinking_mode") != (
+                        "thinking" if record.get("enable_thinking") else "nothink"
+                    )):
+                raise RuntimeError("official contextual evidence lacks thinking-mode identity")
             if record.get("status") == "live":
                 if (record.get("response_model") != record.get("served_model")
                         or record.get("response_status") != "completed"
@@ -596,6 +643,18 @@ async def coder_node(state: State):
             5: "DEFAULT REPAIR: Comprehensive repair including false-positive cleanup.",
         }
 
+    diagnostic_path = state.get("__diagnostic_coder_path__")
+    if diagnostic_path is not None:
+        if (isinstance(diagnostic_path, bool)
+                or not isinstance(diagnostic_path, int)
+                or diagnostic_path not in path_strategies):
+            raise ValueError(
+                "diagnostic coder path must be one of the paths enabled for this noise type"
+            )
+        # This opt-in key is used only by the credential-free diagnostic probe;
+        # normal official cells never set it and retain the complete path pool.
+        path_strategies = {diagnostic_path: path_strategies[diagnostic_path]}
+
     # Shared prompt prefix (identical for all paths). Under Lever 1 de-anchoring
     # the dirty TYPES are masked so the model cannot anchor on them.
     if deanchor_atf:
@@ -688,7 +747,7 @@ PATH {pidx} STRATEGY — your ONLY task:
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 1.0,
-                    "enable_thinking": True,
+                    "enable_thinking": _official_enable_thinking(state),
                 },
             )
             for strategy_key, prompt, _response_kwargs in requests
@@ -915,6 +974,24 @@ class ContextualLatticeError(RuntimeError):
     """A terminal configuration/input error that must not become dirty output."""
 
 
+def _resolve_contextual_checkpoint_path(checkpoint: str, bundle_path: Path) -> Path:
+    """Resolve a frozen-manifest checkpoint relative to its workspace root."""
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.is_absolute():
+        # The frozen manifest records paths relative to the workspace root.
+        # The official runner executes from its worktree, so try that location
+        # and then the shared workspace root implied by the bundle path.
+        candidates = (
+            Path.cwd() / checkpoint_path,
+            Path(bundle_path).parents[2] / checkpoint_path,
+        )
+        checkpoint_path = next(
+            (candidate for candidate in candidates if candidate.exists()),
+            candidates[0],
+        )
+    return checkpoint_path.resolve()
+
+
 def _load_contextual_lattice_terminal():
     """Load the frozen, gold-free terminal bundle exactly once."""
     global _contextual_lattice_terminal, _contextual_lattice_bundle_path
@@ -950,6 +1027,7 @@ def _load_contextual_lattice_terminal():
                 raise ValueError("Contextual lattice bundle is missing checkpoint provenance")
             if checkpoint_hash != LOCKED_CHECKPOINT_HASH or manifest.get("split_hash") != LOCKED_SPLIT_HASH:
                 raise ValueError("Contextual lattice bundle provenance does not match locked v1")
+            checkpoint = str(_resolve_contextual_checkpoint_path(checkpoint, bundle_path))
             from selectdenoise_contextual_lattice import GLiNERContextEncoder
 
             device = os.environ.get("CONTEXTUAL_LATTICE_DEVICE", "cuda")
@@ -1429,7 +1507,7 @@ async def reviewer_node(state: State):
                     {"role": "user", "content": reviewer_prompt},
                 ],
                 "temperature": 0.7,
-                "enable_thinking": True,
+                "enable_thinking": _official_enable_thinking(state),
             },
         )
         rag_weights = _official_reviewer_weights(response, len(candidate_paths))
@@ -2426,7 +2504,8 @@ contain exactly {n} IOB2 tags in token order. No markdown or explanation."""
                 {"role": "system", "content": "You are a strict SelectDenoise Verifier. Return only the requested JSON object."},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.0, "enable_thinking": True,
+            "temperature": 0.0,
+            "enable_thinking": _official_enable_thinking(state),
         })
         picked = _official_tag_path(response, n, valid_tags)
         if not _is_legal_tag_sequence(picked):
@@ -2605,6 +2684,7 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "ror_reasoner": config.get("ror_reasoner"),
         "gasd_reason_decoder": config.get("gasd_reason_decoder"),
         "structured_requester": config.get("structured_requester"),
+        "__diagnostic_coder_path__": config.get("__diagnostic_coder_path__"),
         "official": official,
         "provider_settings": (dict(config.get("provider_metadata", {}))
                               if isinstance(config.get("provider_metadata"), Mapping)

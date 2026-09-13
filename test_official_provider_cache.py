@@ -26,6 +26,8 @@ def _evidence(stage, status):
         "served_model": _SERVED_MODEL,
         "revision": _REVISION,
         "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False,
+        "thinking_mode": "nothink",
     }
     if status == "live":
         evidence.update({
@@ -61,7 +63,11 @@ def _manifest(*records):
         "git_sha": "a" * 40,
         "model_revision": _REVISION,
         "bundle_hash": "b" * 64,
-        "configuration": {"terminal_decoder": "contextual-lattice-v1"},
+        "configuration": {
+            "terminal_decoder": "contextual-lattice-v1",
+            "enable_thinking": False,
+            "thinking_mode": "nothink",
+        },
     }
 
 
@@ -243,6 +249,17 @@ def test_contextual_replay_rejects_provider_cache_identity_mismatches(identity_f
         run_multiseed._validate_replay_cache_identity(cached, expected)
 
 
+def test_contextual_cache_thinking_modes_are_not_interchangeable():
+    record = _record()
+    expected = _manifest(record)
+    actual = json.loads(json.dumps(expected))
+    actual["configuration"]["enable_thinking"] = True
+    actual["configuration"]["thinking_mode"] = "thinking"
+
+    with pytest.raises(ValueError, match="configuration"):
+        run_multiseed._validate_replay_cache_identity(actual, expected)
+
+
 def test_contextual_replay_phase_parses_an_explicit_cache_tag_and_root(tmp_path):
     args = run_multiseed._parse_args([
         "--phase", "contextual-replay",
@@ -325,11 +342,11 @@ def test_contextual_replay_cell_rechecks_source_rows_and_persists_cache_provenan
         "".join(json.dumps(row) + "\n" for row in source_rows), encoding="utf-8"
     )
     cache_root = tmp_path / "cache"
-    tag = "qwen-replay-v1"
+    tag = "qwen-replay-nothink-v1"
     config = run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"]
     manifest = run_multiseed._provider_cache_manifest(
         source_rows, config, dataset="conll2003", noise="BT", seed=13,
-        git_sha="a" * 40, bundle_hash="b" * 64,
+        git_sha="a" * 40, bundle_hash="b" * 64, enable_thinking=False,
     )
     records = []
     for index, row in enumerate(source_rows):
@@ -370,6 +387,7 @@ def test_contextual_replay_cell_rechecks_source_rows_and_persists_cache_provenan
         "conll2003", "BT", 13, 200, cache_root=cache_root, cache_tag=tag,
         bundle_hash="b" * 64, git_sha="a" * 40, replay_fn=replay_fn,
         terminal=object(), max_concurrency=4, prediction_path=prediction_path,
+        enable_thinking=False,
     ))
     rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 200
@@ -418,14 +436,18 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
             self.active = 0
             self.peak = 0
             self.stages = []
+            self.timeout_seconds = 120
 
         def provider_metadata(self):
             return {
+                "timeout_seconds": self.timeout_seconds,
                 "provider": "vllm",
                 "model": _MODEL,
                 "served_model": _SERVED_MODEL,
                 "revision": _REVISION,
                 "structured_api": "chat-completions-json-schema",
+                "enable_thinking": False,
+                "thinking_mode": "nothink",
             }
 
         def structured_requester(self, stage, payload):
@@ -462,7 +484,7 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
             "fallback_used": False,
         }
 
-    async def run_cell():
+    async def run_cell(runner_timeout=10):
         asyncio.get_running_loop().set_default_executor(
             concurrent.futures.ThreadPoolExecutor(max_workers=64)
         )
@@ -470,8 +492,8 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
             "selectdenoise_contextual_lattice",
             run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
             "msra", "BT", 13, 200, (three_path_pipeline, {}),
-            cache_root=tmp_path / "cache", cache_tag="request-cap-test",
-            max_concurrency=20, request_timeout=10,
+                cache_root=tmp_path / "cache", cache_tag="request-cap-nothink-test",
+            max_concurrency=20, request_timeout=runner_timeout,
             adapter_factory=lambda: adapter, git_sha="a" * 40,
             bundle_hash="b" * 64,
         )
@@ -480,6 +502,11 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
 
     assert adapter.peak <= 20
     assert set(adapter.stages) == {"coder", "reviewer", "verifier"}
+    with pytest.raises(ValueError, match="manifest identity mismatch"):
+        asyncio.run(run_cell(runner_timeout=11))
+    adapter.timeout_seconds = 300
+    with pytest.raises(ValueError, match="index identity mismatch"):
+        asyncio.run(run_cell())
 
 
 @pytest.mark.filterwarnings(
@@ -571,3 +598,4 @@ def test_provider_cache_abort_does_not_start_waiting_provider_requests(
         controller.join(timeout=5)
 
     assert adapter.started == 20
+    assert not list((tmp_path / "cache").rglob("*.jsonl"))

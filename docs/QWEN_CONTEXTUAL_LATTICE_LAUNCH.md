@@ -16,6 +16,15 @@ served name:  Qwen/Qwen3-32B-AWQ@0499c3ac83fdef8810b907a23894ba91e95eddd8
 route:        chat-completions-json-schema
 ```
 
+The formal Stage A profile is an independent no-thinking namespace. Set
+`QWEN_ENABLE_THINKING=false` for the fixed Qwen model. The client sends
+`chat_template_kwargs.enable_thinking=false` explicitly on every Coder,
+Reviewer, Verifier, and preflight request, and the effective value is recorded
+in request evidence, manifests, and provider-cache identity. The tag must
+contain `nothink`; never resume or copy a thinking-mode cache. If the variable
+is unset, historical caller-controlled behavior remains unchanged. The flag is
+ignored for DeepSeek.
+
 Resolve the model at that immutable revision and record a SHA-256 hash for
 every model file in the launch manifest. Do not use a moving branch, a
 different served name, or an unpinned download. The contextual bundle must
@@ -121,12 +130,64 @@ request. The full protocol is five datasets × three noise types × three seeds
 
 ## Staged execution and evidence boundary
 
+### Timeout recovery on a replacement host
+
+Use an independently verified SSH identity and a distinct local tunnel port
+when moving to a cloned instance. Verify the service key against `/v1/models`;
+an SSH password change does not imply a service-key change. Do not run the
+same experiment concurrently on the old and replacement instances.
+
+For the formal no-thinking Qwen run, use
+`QWEN_PROVIDER_TIMEOUT_SECONDS=300` and `--request-timeout 3600`. Retain the
+20-request provider cap and at most two SDK retries. Provider timeout, runner
+timeout, and effective thinking mode are recorded in the cache manifest;
+different identities cannot resume the same cache. The runner's budget
+executor uses one shared ledger across diagnosis, smoke, and reruns, so a
+later phase cannot reacquire the full budget.
+
+Set `QWEN_DIAGNOSTICS_DIR` to a **local Git-ignored directory** for opt-in
+evidence. Each logical request gets a UUID and SHA-256 payload digest; JSONL
+events record dataset/noise/seed/original zero-based row, stage/path, queue
+wait, SDK attempt index, timing, exception-type chain, and available usage.
+Unknown timeout usage is not estimated. Allowlisted model-facing request
+bodies are captured separately without credentials or target gold labels.
+Do not publish these bodies. A diagnostic sink error must not replace the
+provider exception or cause another HTTP attempt.
+
+Run the no-thinking diagnostic for zero-based row 193, Coder Path 5, then row
+2, in separate request namespaces with SDK retries disabled. Select evidence
+by the exact diagnostic directory and full request ID. A streaming observation
+may run for at most 600 seconds and is diagnostic only, never a formal
+prediction; chunks are persisted incrementally so content before a cutoff is
+available. Do not truncate outputs, skip samples, relax validation, add DFA,
+or mutate limits during a run. Preserve the first provider exception when
+aborting.
+
+Before restoring Stage A, require the real failing request, the fixed
+47-row smoke, and one complete 200-row cell to pass. Commit and push the
+verified code and choose a fresh formal tag; never copy diagnostic cells into
+the formal cache. Confirm cumulative cost and the replacement host's hourly
+rate against the approved total budget, or label a conservative estimate
+explicitly. The executor must enforce a hard deadline derived from remaining
+budget, including diagnosis and reruns. Stopping requests does not itself
+stop instance rental billing.
+
 Stage A is the only paid phase. After the smoke and budget approval, set a
-fresh tag and run only `selectdenoise_contextual_lattice` with size 200,
+fresh tag containing `nothink`, set the independent no-thinking profile, and
+run only `selectdenoise_contextual_lattice` with size 200,
 ratio 0.15, max client concurrency 20, and failure policy `abort`:
 
 ```powershell
-D:/py/Anaconda3/python.exe run_multiseed.py `
+$env:QWEN_ENABLE_THINKING = "false"
+$env:QWEN_PROVIDER_TIMEOUT_SECONDS = "300"
+$env:BACKBONE_TAG = "qwen32b-contextual-nothink-v1"
+
+D:/py/Anaconda3/python.exe qwen_budget_executor.py `
+  --total-yuan 110 --spent-yuan $env:SPENT_YUAN `
+  --hourly-rate-yuan $env:HOURLY_RATE_YUAN `
+  --billing-basis $env:BILLING_BASIS `
+  --ledger "$env:QWEN_DIAGNOSTICS_DIR/budget-ledger.json" `
+  --report "$env:QWEN_DIAGNOSTICS_DIR/budget-launch.json" -- `
   --official --phase provider-cache `
   --configs selectdenoise_contextual_lattice `
   --size 200 --ratios 0.15 --max-concurrency 20 `

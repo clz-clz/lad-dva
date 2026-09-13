@@ -93,6 +93,8 @@ def _contextual_identity():
         "served_model": f"Qwen/Qwen3-32B-AWQ@{CONTEXTUAL_REVISION}",
         "revision": CONTEXTUAL_REVISION,
         "structured_api": "chat-completions-json-schema",
+        "enable_thinking": True,
+        "thinking_mode": "thinking",
     }
 
 
@@ -163,7 +165,8 @@ def test_official_contextual_evidence_rejects_undocumented_nonlive_status(stage,
         )
 
 
-def test_official_contextual_runner_persists_terminal_anchor_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize('smoke_indices', [None, [2, 17]])
+def test_official_contextual_runner_persists_terminal_anchor_evidence(tmp_path, monkeypatch, smoke_indices):
     noisy_dir, pred_dir = tmp_path / "noisy", tmp_path / "pred"
     monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
     monkeypatch.setattr(run_multiseed, "PRED_DIR", pred_dir)
@@ -181,7 +184,10 @@ def test_official_contextual_runner_persists_terminal_anchor_evidence(tmp_path, 
             AssertionError("fake pipeline must not invoke a provider")
         ))
 
+    observed_contexts = []
     async def pipeline(tokens, dirty, _config, **_kwargs):
+        from request_diagnostics import _sentence
+        observed_contexts.append(await asyncio.to_thread(_sentence.get))
         return {
             "pred_tags": ["B-PER", "O"], "candidate_paths": [["B-PER", "O"]],
             "rag_weights": [1.0], "confidence": [1.0, 1.0],
@@ -193,13 +199,19 @@ def test_official_contextual_runner_persists_terminal_anchor_evidence(tmp_path, 
         "selectdenoise_contextual_lattice",
         run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
         "conll2003", "BT", 13, 200, (pipeline, {}), max_concurrency=8,
-        dummy=False, official=True, failure_policy="abort", request_timeout=10.0,
+        dummy=False, official=smoke_indices is None, failure_policy="abort", request_timeout=10.0,
         adapter_factory=Adapter,
+        paid_smoke_size=len(smoke_indices) if smoke_indices else None,
+        row_indices=smoke_indices,
+        prediction_path=pred_dir / 'smoke.jsonl' if smoke_indices else None,
     ))
 
     output = next(pred_dir.glob("*.jsonl"))
     first = json.loads(output.read_text(encoding="utf-8").splitlines()[0])
     assert first["terminal_anchor_tags"] == ["B-PER", "O"]
+    assert {c['row_index'] for c in observed_contexts} == set(smoke_indices or range(200))
+    assert all(c['dataset'] == 'conll2003' and c['noise'] == 'BT' and c['seed'] == 13
+               for c in observed_contexts)
 
 
 def test_provider_cache_cell_runs_preterminal_graph_once_and_is_exactly_resumable(tmp_path, monkeypatch):
@@ -641,7 +653,7 @@ def test_cli_defaults_abort_and_require_explicit_legacy_dirty():
     legacy = run_multiseed._parse_args([])
     explicit_dirty = run_multiseed._parse_args(["--failure-policy", "dirty"])
 
-    assert (official.failure_policy, official.request_timeout) == ("abort", 600.0)
+    assert (official.failure_policy, official.request_timeout) == ("abort", 3600.0)
     assert (legacy.failure_policy, legacy.request_timeout) == ("abort", 180.0)
     assert explicit_dirty.failure_policy == "dirty"
 
@@ -746,6 +758,30 @@ def test_official_environment_is_explicit_and_rejects_deepseek_gasd_r():
         run_multiseed._official_settings_from_env(["lad_rg_full"], {})
     with pytest.raises(ValueError, match="GASD-R/Both"):
         run_multiseed._official_settings_from_env(["lad_rg_gasd_r"], _env("deepseek"))
+
+
+def test_qwen_nothink_environment_is_bound_to_manifest_and_requires_fresh_tag():
+    environment = _env()
+    environment.update({
+        "QWEN_ENABLE_THINKING": "false",
+        "BACKBONE_TAG": "qwen32b-contextual-nothink",
+        "BACKBONE_REVISION": CONTEXTUAL_REVISION,
+    })
+    settings, tag = run_multiseed._official_settings_from_env(
+        ["selectdenoise_contextual_lattice"], environment,
+    )
+    assert settings.enable_thinking is False
+    assert settings.thinking_mode == "nothink"
+    manifest = run_multiseed._build_official_manifest(settings, tag, "1" * 40, 3600.0)
+    assert manifest["backbone"]["enable_thinking"] is False
+    assert manifest["backbone"]["thinking_mode"] == "nothink"
+    assert "nothink" in manifest["backbone"]["tag"]
+
+    environment["BACKBONE_TAG"] = "qwen32b-contextual-thinking"
+    with pytest.raises(ValueError, match="nothink"):
+        run_multiseed._official_settings_from_env(
+            ["selectdenoise_contextual_lattice"], environment,
+        )
 
 
 def test_manifest_is_canonical_sanitized_and_required_for_resume(tmp_path):

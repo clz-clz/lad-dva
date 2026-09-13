@@ -257,6 +257,40 @@ def test_tagged_artifact_scan_keeps_dotted_tag_exact_and_ignores_longer_tag(tmp_
     assert longer_tag.name not in rejected["files"]
 
 
+def test_contextual_tagged_artifact_check_passes_structured_api_identity(tmp_path, monkeypatch):
+    revision = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision=revision, enable_thinking=False,
+    )
+    tag = "qwen32b-contextual-nothink"
+    pred = tmp_path / "pred"
+    pred.mkdir()
+    expected_sha = "a" * 40
+    manifest = official_preflight._build_official_manifest(settings, tag, expected_sha, 3600.0)
+    (pred / f"run_manifest__{tag}.json").write_text(
+        official_preflight._canonical_json(manifest) + "\n", encoding="utf-8"
+    )
+    (pred / f"pred_seed13__selectdenoise_contextual_lattice__msra__BT__{tag}.jsonl").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    captured = {}
+    monkeypatch.setattr(
+        official_preflight, "_validate_official_prediction",
+        lambda *args, **kwargs: captured.update(kwargs),
+    )
+
+    blockers = []
+    official_preflight._check_tagged_artifacts(
+        pred, settings, tag, expected_sha, 3600.0, blockers,
+        ["selectdenoise_contextual_lattice"],
+    )
+
+    assert blockers == []
+    assert captured["provider_identity"]["structured_api"] == "chat-completions-json-schema"
+
+
 def _response(payload, fingerprint="fp-test"):
     return {
         "model": QWEN_SERVED_MODEL,
@@ -610,6 +644,52 @@ def test_contextual_qwen_live_preflight_rejects_invalid_verifier_ontology_tag():
 
     assert report["ok"] is False
     assert "ontology" in report["blockers"][0]["message"]
+
+
+def test_contextual_qwen_live_preflight_sends_explicit_nothink(monkeypatch):
+    settings = LiveBackboneSettings(
+        provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+        base_url="http://127.0.0.1:8000/v1", api_key="test",
+        revision="0499c3ac83fdef8810b907a23894ba91e95eddd8",
+        enable_thinking=False,
+    )
+    calls = []
+    identity = {
+        "provider": "vllm", "model": settings.model,
+        "served_model": settings.served_model, "revision": settings.revision,
+        "structured_api": settings.structured_api,
+        "enable_thinking": False, "thinking_mode": "nothink",
+    }
+
+    class Adapter:
+        def __init__(self, configured):
+            assert configured is settings
+
+        def provider_metadata(self):
+            return dict(identity)
+
+        def structured_requester(self, stage, payload):
+            calls.append((stage, payload))
+            count = payload["schema"]["properties"]["tags"]["maxItems"]
+            return LiveBackboneResult({"tags": ["O"] * count}, {
+                **identity, "stage": stage, "status": "live",
+                "response_model": settings.served_model, "response_status": "completed",
+                "finish_reason": "stop", "incomplete_reason": None,
+                "system_fingerprint": "fp-contextual", "usage": {"total_tokens": 1},
+            })
+
+        def close(self):
+            pass
+
+    report = official_preflight.run_live_preflight(
+        settings=settings, config_names=["selectdenoise_contextual_lattice"],
+        models_fetcher=lambda _: [{"id": settings.served_model}], adapter_factory=Adapter,
+    )
+
+    assert report["ok"] is True, report
+    assert [(stage, payload["enable_thinking"]) for stage, payload in calls] == [
+        ("capability_probe_69", False), ("capability_probe_372", False), ("verifier", False),
+    ]
 
 
 def test_static_cli_converts_internal_failure_to_json_only(capsys, monkeypatch, tmp_path):

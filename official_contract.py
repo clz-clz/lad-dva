@@ -25,12 +25,13 @@ OFFICIAL_DECODER_CONSTANTS: dict[str, Any] = {
 
 
 def official_manifest_decoder_constants(
-    request_timeout: float, *, structured_api: str | None = None
+    request_timeout: float, *, structured_api: str | None = None,
+    provider_timeout: float = OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     constants = {
         "contract_version": OFFICIAL_DECODER_CONSTANTS["contract_version"],
         "hard_constraint": OFFICIAL_DECODER_CONSTANTS["hard_constraint"],
-        "provider_timeout_seconds": OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
+        "provider_timeout_seconds": float(provider_timeout),
         "sdk_max_retries": OFFICIAL_SDK_MAX_RETRIES,
         "runner_request_timeout_seconds": float(request_timeout),
         **{

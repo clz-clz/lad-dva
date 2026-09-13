@@ -220,6 +220,18 @@ def _check_tagged_artifacts(
             files=[path.name for path in temp_outputs],
         )
     if compatible_manifest:
+        provider_identity = {
+            "provider": settings.provider,
+            "model": settings.model,
+            "served_model": settings.served_model,
+            "revision": settings.revision,
+            "structured_api": settings.structured_api,
+        }
+        if settings.configured_enable_thinking is not None:
+            provider_identity.update({
+                "enable_thinking": settings.configured_enable_thinking,
+                "thinking_mode": settings.thinking_mode,
+            })
         for path in outputs:
             parts = path.stem.split("__")
             if len(parts) < 5:
@@ -229,12 +241,7 @@ def _check_tagged_artifacts(
             try:
                 _validate_official_prediction(
                     path, dataset, config_name, noise_type,
-                    provider_identity={
-                        "provider": settings.provider,
-                        "model": settings.model,
-                        "served_model": settings.served_model,
-                        "revision": settings.revision,
-                    },
+                    provider_identity=provider_identity,
                 )
             except Exception as exc:  # noqa: BLE001 - report all blockers as JSON
                 _block(blockers, "incompatible_prediction", str(exc), file=path.name)
@@ -251,7 +258,7 @@ def run_static_preflight(
     *, repo_root: Path, expected_sha: str, noisy_dir: Path, pred_dir: Path,
     environment: Mapping[str, str] = os.environ, deer_timeout: float = 300.0,
     deer_checker: Callable[[Sequence[str], float], Mapping[str, Mapping[str, Any]]] | None = None,
-    request_timeout: float = 600.0, config_names: Sequence[str] = ("lad_rg_full",),
+    request_timeout: float = 3600.0, config_names: Sequence[str] = ("lad_rg_full",),
 ) -> dict[str, Any]:
     """Run cache-only static checks without creating prediction artifacts."""
     repo_root, noisy_dir, pred_dir = map(Path, (repo_root, noisy_dir, pred_dir))
@@ -364,11 +371,24 @@ def run_live_preflight(
             "revision": settings.revision,
             "structured_api": settings.structured_api,
         }
+        if settings.configured_enable_thinking is not None:
+            expected_identity.update({
+                "enable_thinking": settings.configured_enable_thinking,
+                "thinking_mode": settings.thinking_mode,
+            })
         adapter_identity = adapter.provider_metadata()
         if (not isinstance(adapter_identity, Mapping)
                 or any(adapter_identity.get(key) != value
                        for key, value in expected_identity.items())):
             raise ValueError("live adapter identity does not match official settings")
+        checks["thinking_mode"] = {
+            "enable_thinking": adapter_identity.get(
+                "enable_thinking", settings.enable_thinking
+            ),
+            "thinking_mode": adapter_identity.get(
+                "thinking_mode", settings.thinking_mode
+            ),
+        }
         tokens = ["Alice", "met", "Paris"]
         valid_types = ["PER", "LOC", "ORG", "MISC"]
         evidence = []
@@ -390,11 +410,21 @@ def run_live_preflight(
                                     "items": {"type": "string", "enum": valid_tags}}}},
                      "messages": [{"role": "system", "content": "Return only the requested exact-length JSON object."},
                                   {"role": "user", "content": f"Emit exactly {count} ontology-valid tags."}],
-                     "temperature": 0.0, "enable_thinking": True},
+                     "temperature": 0.0,
+                     "enable_thinking": settings.effective_enable_thinking(True)},
                 )
                 tags = probe.get("tags") if isinstance(probe, Mapping) else None
                 if not isinstance(tags, list) or len(tags) != count or any(tag not in valid_tags for tag in tags):
                     raise ValueError(f"Contextual Qwen {count}-item probe did not return exactly {count} ontology tags")
+                if settings.configured_enable_thinking is not None:
+                    probe_metadata = getattr(probe, "provider_metadata", {})
+                    if (not isinstance(probe_metadata, Mapping)
+                            or probe_metadata.get("enable_thinking")
+                            != settings.configured_enable_thinking
+                            or probe_metadata.get("thinking_mode") != settings.thinking_mode):
+                        raise ValueError(
+                            f"Contextual Qwen {count}-item probe thinking-mode evidence mismatched"
+                        )
                 evidence.append((probe, f"capability_probe_{count}"))
             verifier = structured_requester(
                 "verifier",
@@ -405,7 +435,8 @@ def run_live_preflight(
                                 "items": {"type": "string", "enum": valid_tags}}}},
                  "messages": [{"role": "system", "content": "Return only the requested JSON object."},
                               {"role": "user", "content": "Verify three ontology-valid tags."}],
-                 "temperature": 0.0, "enable_thinking": True},
+                 "temperature": 0.0,
+                 "enable_thinking": settings.effective_enable_thinking(True)},
             )
             verifier_tags = verifier.get("tags") if isinstance(verifier, Mapping) else None
             if (not isinstance(verifier_tags, list) or len(verifier_tags) != len(tokens)
@@ -413,6 +444,13 @@ def run_live_preflight(
                 raise ValueError(
                     "Contextual Qwen Verifier probe returned an invalid ontology tag sequence"
                 )
+            if settings.configured_enable_thinking is not None:
+                verifier_metadata = getattr(verifier, "provider_metadata", {})
+                if (not isinstance(verifier_metadata, Mapping)
+                        or verifier_metadata.get("enable_thinking")
+                        != settings.configured_enable_thinking
+                        or verifier_metadata.get("thinking_mode") != settings.thinking_mode):
+                    raise ValueError("Contextual Qwen Verifier thinking-mode evidence mismatched")
             evidence.append((verifier, "verifier"))
         if not contextual_profile and settings.provider == "deepseek":
             structured_requester = getattr(adapter, "structured_requester", None)
@@ -533,7 +571,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--noisy-root", type=Path, default=Path("results_multiseed"))
     parser.add_argument("--predictions-root", type=Path, default=Path("predictions_multiseed"))
     parser.add_argument("--deer-timeout", type=float, default=300.0)
-    parser.add_argument("--request-timeout", type=float, default=600.0,
+    parser.add_argument("--request-timeout", type=float, default=3600.0,
                         help="Runner timeout expected in the exact manifest.")
     parser.add_argument("--configs", nargs="+", default=["lad_rg_full"],
                         help="Official LAD-RG configurations intended for this launch.")

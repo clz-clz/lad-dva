@@ -45,10 +45,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
 from official_contract import official_manifest_decoder_constants
+from request_diagnostics import sentence_context, queue_context, safe_emit as emit
 from official_provider_cache import (
     PROVIDER_CACHE_SCHEMA, QWEN_MODEL, QWEN_REVISION, QWEN_SERVED_MODEL,
     read_provider_cell, write_provider_cell,
 )
+from live_backbone import qwen_enable_thinking_from_environment
 
 # Silence telemetry noise from chroma / langchain
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -69,7 +71,7 @@ SEEDS       = [13, 42, 2024]
 SAMPLE_SIZE = None  # None = full dataset
 MAX_CONCURRENCY = 200     # high throughput for LLM API calls
 PER_REQUEST_TIMEOUT = 180  # legacy outer deadline; failure policy controls the outcome
-OFFICIAL_REQUEST_TIMEOUT = 600.0
+OFFICIAL_REQUEST_TIMEOUT = 3600.0
 OFFICIAL_SAMPLE_SIZE = 200
 PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
@@ -261,15 +263,24 @@ def _official_settings_from_env(config_names: list[str], environment: Mapping[st
         if not revision:
             raise ValueError("Qwen official runs require immutable BACKBONE_REVISION")
     from live_backbone import LiveBackboneSettings
+    enable_thinking = qwen_enable_thinking_from_environment(environment)
     settings = LiveBackboneSettings(
         provider=provider,
         model=model,
         base_url=str(environment["BACKBONE_BASE_URL"]).strip(),
         api_key=key,
         revision=revision,
+        timeout_seconds=(float(environment.get("QWEN_PROVIDER_TIMEOUT_SECONDS", "300"))
+                         if provider == 'vllm' else 120.0),
+        enable_thinking=enable_thinking,
     )
     _endpoint_origin(settings.base_url)
     _validate_official_settings_for_configs(settings, config_names)
+    if (settings.enable_thinking is False
+            and any(_official_profile(CONFIGURATIONS[name]) == "contextual-lattice"
+                    for name in config_names)
+            and "nothink" not in tag.lower()):
+        raise ValueError("QWEN_ENABLE_THINKING=false requires a fresh BACKBONE_TAG containing 'nothink'")
     return settings, tag
 
 
@@ -320,6 +331,8 @@ def _build_official_manifest(settings, tag: str, git_sha: str,
             "served_model": settings.served_model,
             "revision": settings.revision,
             "structured_api": settings.structured_api,
+            "enable_thinking": settings.configured_enable_thinking,
+            "thinking_mode": settings.thinking_mode,
             "immutable_revision": settings.revision or settings.model,
             "endpoint_origin": _endpoint_origin(settings.base_url),
             "tag": tag,
@@ -334,7 +347,8 @@ def _build_official_manifest(settings, tag: str, git_sha: str,
         },
         "dependencies": _dependency_versions(),
         "decoder_constants": official_manifest_decoder_constants(
-            request_timeout, structured_api=settings.structured_api
+            request_timeout, structured_api=settings.structured_api,
+            provider_timeout=settings.timeout_seconds
         ),
     }
 
@@ -556,6 +570,9 @@ def _validate_contextual_provider_evidence(
     }
     if any(identity.get(key) != value for key, value in expected_identity.items()):
         raise RuntimeError("official contextual provider identity is not pinned Qwen")
+    expected_thinking = identity.get("enable_thinking")
+    enforce_thinking_identity = type(expected_thinking) is bool
+    expected_mode = "thinking" if expected_thinking else "nothink"
 
     def records(stage: str) -> list[Mapping[str, Any]]:
         value = evidence.get(stage)
@@ -567,6 +584,11 @@ def _validate_contextual_provider_evidence(
                 raise RuntimeError(f"official contextual evidence has an invalid {stage} record")
             if any(record.get(key) != expected for key, expected in expected_identity.items()):
                 raise RuntimeError(f"official contextual evidence identity mismatch for {stage}")
+            if enforce_thinking_identity and (
+                    type(record.get("enable_thinking")) is not bool
+                    or record.get("enable_thinking") != expected_thinking
+                    or record.get("thinking_mode") != expected_mode):
+                raise RuntimeError(f"official contextual {stage} thinking-mode identity mismatch")
             if record.get("status") == "live":
                 if (record.get("response_model") != QWEN_SERVED_MODEL
                         or record.get("response_status") != "completed"
@@ -835,14 +857,19 @@ def _provider_input_digest(row: Mapping[str, Any]) -> str:
 
 def _provider_cache_manifest(rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any], *,
                              dataset: str, noise: str, seed: int, git_sha: str,
-                             bundle_hash: str) -> dict[str, Any]:
+                             bundle_hash: str,
+                             enable_thinking: bool = True) -> dict[str, Any]:
+    if type(enable_thinking) is not bool:
+        raise ValueError("provider-cache thinking identity must be boolean")
     return {
         "schema": PROVIDER_CACHE_SCHEMA,
         "source_digests": {str(index): _provider_input_digest(row) for index, row in enumerate(rows)},
         "git_sha": git_sha, "model_revision": QWEN_REVISION, "bundle_hash": bundle_hash,
         "configuration": {"config": "selectdenoise_contextual_lattice",
                           "terminal_decoder": config.get("terminal_decoder"),
-                          "dataset": dataset, "noise": noise, "seed": seed},
+                          "dataset": dataset, "noise": noise, "seed": seed,
+                          "enable_thinking": enable_thinking,
+                          "thinking_mode": "thinking" if enable_thinking else "nothink"},
     }
 
 
@@ -1027,6 +1054,7 @@ def _offline_contextual_replay_environment():
     offline_keys = credential_keys + (
         "BACKBONE_PROVIDER", "BACKBONE_MODEL", "BACKBONE_BASE_URL",
         "BACKBONE_SERVED_MODEL", "BACKBONE_REVISION", "LAD_RG_OFFICIAL_REQUESTS",
+        "QWEN_ENABLE_THINKING",
         "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE",
     )
     saved = {key: os.environ.get(key) for key in offline_keys}
@@ -1068,7 +1096,7 @@ def _offline_contextual_replay_environment():
 
 def _validate_contextual_replay_prediction(
     path: Path, dataset: str, noise_type: str, expected_sha256: str,
-    expected_count: int = OFFICIAL_SAMPLE_SIZE,
+    expected_count: int = OFFICIAL_SAMPLE_SIZE, enable_thinking: bool = True,
 ) -> None:
     from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
 
@@ -1080,6 +1108,8 @@ def _validate_contextual_replay_prediction(
         "provider": "vllm", "model": QWEN_MODEL,
         "served_model": QWEN_SERVED_MODEL, "revision": QWEN_REVISION,
         "structured_api": "chat-completions-json-schema",
+        "enable_thinking": enable_thinking,
+        "thinking_mode": "thinking" if enable_thinking else "nothink",
     }
     for index, row in enumerate(rows):
         tokens, gold, pred = row.get("tokens"), row.get("gold_tags"), row.get("pred_tags")
@@ -1152,13 +1182,35 @@ async def _run_provider_cache_cell(
     rows = _load_noisy(noisy_path)
     if len(rows) != OFFICIAL_SAMPLE_SIZE:
         raise RuntimeError("provider-cache cells require exactly 200 noisy rows")
-    manifest = _provider_cache_manifest(rows, config, dataset=dataset, noise=noise, seed=seed,
-                                        git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower())
     cell_path = _provider_cache_cell_path(cache_root, cache_tag, config_name, dataset, noise, seed)
     key = _provider_cache_cell_key(config_name, dataset, noise, seed)
     adapter = adapter_factory()
     identity = adapter.provider_metadata()
+    if not isinstance(identity, Mapping):
+        raise RuntimeError("provider-cache adapter identity is malformed")
+    identity = dict(identity)
+    enable_thinking = identity.get("enable_thinking")
+    if type(enable_thinking) is not bool:
+        # Historical Qwen calls requested thinking when no explicit override
+        # was configured; retain that default while making it part of identity.
+        enable_thinking = True
+        identity["enable_thinking"] = True
+        identity["thinking_mode"] = "thinking"
+    elif identity.get("thinking_mode") != ("thinking" if enable_thinking else "nothink"):
+        raise RuntimeError("provider-cache adapter identity has an invalid thinking-mode binding")
+    if not enable_thinking and "nothink" not in cache_tag.lower():
+        raise ValueError("no-thinking provider caches require a fresh tag containing 'nothink'")
+    manifest = _provider_cache_manifest(
+        rows, config, dataset=dataset, noise=noise, seed=seed,
+        git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower(),
+        enable_thinking=enable_thinking,
+    )
     fingerprint = _sha256_json(identity)
+    manifest['request_limits'] = {
+        'provider_timeout_seconds': identity.get('timeout_seconds'),
+        'runner_timeout_seconds': request_timeout,
+        'max_concurrency': max_concurrency,
+    }
     if cell_path.exists():
         indexed = _read_provider_cache_index_cell(cache_root, cache_tag, key)
         if (indexed["path"] != str(cell_path) or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
@@ -1184,8 +1236,11 @@ async def _run_provider_cache_cell(
     if inspect.iscoroutinefunction(provider_requester):
         raise RuntimeError("provider-cache structured requester must be synchronous")
     provider_aborted = threading.Event()
+    first_provider_error = []
+    error_lock = threading.Lock()
 
     def limited_provider_requester(stage: str, payload: Mapping[str, Any]) -> Any:
+        queued_at = time.monotonic()
         while not provider_aborted.is_set():
             if provider_sem.acquire(timeout=0.05):
                 break
@@ -1194,7 +1249,11 @@ async def _run_provider_cache_cell(
         try:
             if provider_aborted.is_set():
                 raise RuntimeError("provider-cache requests are aborted")
-            result = provider_requester(stage, payload)
+            queue_seconds = time.monotonic() - queued_at
+            emit('provider_admitted', stage=stage, path_name=payload.get('name'),
+                 queue_seconds=queue_seconds)
+            with queue_context(queue_seconds):
+                result = provider_requester(stage, payload)
             if inspect.isawaitable(result):
                 close = getattr(result, "close", None)
                 if callable(close):
@@ -1203,7 +1262,10 @@ async def _run_provider_cache_cell(
                     "provider-cache structured requester must be synchronous"
                 )
             return result
-        except BaseException:
+        except BaseException as exc:
+            with error_lock:
+                if not first_provider_error and not provider_aborted.is_set():
+                    first_provider_error.append(exc)
             provider_aborted.set()
             raise
         finally:
@@ -1221,8 +1283,9 @@ async def _run_provider_cache_cell(
                                    "official": True, "__return_candidates__": True,
                                    "structured_requester": limited_provider_requester,
                                    "provider_metadata": dict(identity)})
-            result = await asyncio.wait_for(
-                default_fn(tokens, dirty, runtime_config, dataset_name=dataset), timeout=request_timeout)
+            with sentence_context(dataset=dataset, noise=noise, seed=seed, row_index=index):
+                result = await asyncio.wait_for(
+                    default_fn(tokens, dirty, runtime_config, dataset_name=dataset), timeout=request_timeout)
             if not isinstance(result, Mapping):
                 raise RuntimeError(f"provider-cache sentence {index} returned no stage evidence")
             anchor, evidence = result.get("pred_tags"), result.get("provider_metadata")
@@ -1248,6 +1311,8 @@ async def _run_provider_cache_cell(
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         cell_path.with_suffix(cell_path.suffix + ".tmp").unlink(missing_ok=True)
+        if first_provider_error:
+            raise first_provider_error[0]
         raise
     cell = {"path": str(cell_path), "sha256": digest, "row_count": len(cached),
             "git_sha": manifest["git_sha"], "model_revision": QWEN_REVISION,
@@ -1261,6 +1326,7 @@ async def _run_contextual_replay_cell(
     cache_root: Path, cache_tag: str, bundle_hash: str, git_sha: str,
     replay_fn: Callable[..., Mapping[str, Any]], terminal: Any,
     max_concurrency: int, prediction_path: Optional[Path] = None,
+    enable_thinking: bool = True,
 ) -> Path:
     """Decode one provider-cache cell locally with no provider adapter."""
     _validate_contextual_replay_launch(
@@ -1270,6 +1336,8 @@ async def _run_contextual_replay_cell(
     )
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cache_tag):
         raise ValueError("contextual-replay provider-cache tag is invalid")
+    if not enable_thinking and "nothink" not in cache_tag.lower():
+        raise ValueError("no-thinking replay caches require a fresh tag containing 'nothink'")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", git_sha):
         raise ValueError("contextual-replay requires a 40-hex Git SHA")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
@@ -1284,6 +1352,7 @@ async def _run_contextual_replay_cell(
     expected_manifest = _provider_cache_manifest(
         source_rows, config, dataset=dataset, noise=noise, seed=seed,
         git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower(),
+        enable_thinking=enable_thinking,
     )
     key = _provider_cache_cell_key("selectdenoise_contextual_lattice", dataset, noise, seed)
     indexed = _read_provider_cache_index_cell(cache_root, cache_tag, key)
@@ -1306,6 +1375,8 @@ async def _run_contextual_replay_cell(
         "provider": "vllm", "model": QWEN_MODEL,
         "served_model": QWEN_SERVED_MODEL, "revision": QWEN_REVISION,
         "structured_api": "chat-completions-json-schema",
+        "enable_thinking": enable_thinking,
+        "thinking_mode": "thinking" if enable_thinking else "nothink",
     }
     for cached in cached_rows:
         _validate_contextual_provider_evidence(
@@ -1316,7 +1387,10 @@ async def _run_contextual_replay_cell(
         "selectdenoise_contextual_lattice", dataset, noise, seed, OFFICIAL_NOISE_RATIO,
     )
     if pred_path.exists() and pred_path.stat().st_size > 0:
-        _validate_contextual_replay_prediction(pred_path, dataset, noise, cache_sha256)
+        _validate_contextual_replay_prediction(
+            pred_path, dataset, noise, cache_sha256,
+            enable_thinking=enable_thinking,
+        )
         return pred_path
 
     sem = asyncio.Semaphore(max_concurrency)
@@ -1373,7 +1447,10 @@ async def _run_contextual_replay_cell(
         with tmp_path.open("w", encoding="utf-8") as handle:
             for record in buffer:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        _validate_contextual_replay_prediction(tmp_path, dataset, noise, cache_sha256)
+        _validate_contextual_replay_prediction(
+            tmp_path, dataset, noise, cache_sha256,
+            enable_thinking=enable_thinking,
+        )
         tmp_path.replace(pred_path)
     except BaseException:
         for task in tasks:
@@ -1567,7 +1644,9 @@ async def _run_one_cell_impl(config_name: str, config: dict,
             try:
                 # Per-request timeout: a single straggler sentence (e.g. very long
                 # MSRA input) must not stall the whole cell's async gather.
-                pred = await asyncio.wait_for(_call(), timeout=request_timeout)
+                with sentence_context(dataset=dataset, noise=noise, seed=seed,
+                                      row_index=row_indices[i] if is_paid_smoke and row_indices is not None else i):
+                    pred = await asyncio.wait_for(_call(), timeout=request_timeout)
             except asyncio.TimeoutError:
                 if failure_policy == "abort" or config.get("terminal_decoder") == "contextual-lattice-v1":
                     raise RuntimeError(
@@ -1744,6 +1823,10 @@ def _run_contextual_replay_phase(args) -> None:
     tag = str(args.provider_cache_tag or BACKBONE_TAG).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
         raise ValueError("contextual-replay requires a valid --provider-cache-tag")
+    if qwen_enable_thinking_from_environment(os.environ) is not False:
+        raise ValueError("contextual-replay requires QWEN_ENABLE_THINKING=false")
+    if "nothink" not in tag.lower():
+        raise ValueError("contextual-replay requires a fresh tag containing 'nothink'")
     BACKBONE_TAG = tag
     git_sha = subprocess.run(
         ["git", "rev-parse", "HEAD"], check=True, text=True,
@@ -1770,6 +1853,7 @@ def _run_contextual_replay_phase(args) -> None:
                             cache_tag=tag, bundle_hash=args.bundle_hash,
                             git_sha=git_sha, replay_fn=run_contextual_lattice_replay,
                             terminal=terminal, max_concurrency=args.max_concurrency,
+                            enable_thinking=False,
                         ))
     finally:
         if old_bundle is None:

@@ -19,6 +19,7 @@ def _settings():
         "provider": "vllm", "model": "Qwen/Qwen3-32B-AWQ",
         "served_model": SERVED_MODEL, "revision": REVISION,
         "structured_api": "chat-completions-json-schema",
+        "enable_thinking": True, "thinking_mode": "thinking",
     }
 
 
@@ -53,6 +54,30 @@ def test_official_contextual_coder_preserves_illegal_candidate_for_lattice_filte
     assert result["candidate_paths"] == [["B-PER", "I-PER"]] * 3
     assert result["terminal_candidate_paths"] == [["O", "I-PER"]] * 3
     assert result["fallback_used"] is False
+
+
+def test_diagnostic_coder_path_filter_calls_only_the_requested_path(monkeypatch):
+    calls = []
+
+    def requester(stage, payload):
+        calls.append((stage, payload["name"]))
+        return LiveBackboneResult({"tags": ["B-PER", "O"]}, _record(stage))
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_args, **_kwargs: [])
+    result = asyncio.run(multi_agent_v2.coder_node({
+        "official": True,
+        "tokens": ["Stefano", "Bordon"],
+        "dirty_tags": ["B-PER", "O"],
+        "dataset_name": "conll2003",
+        "noise_type": "BT",
+        "structured_requester": requester,
+        "provider_settings": _settings(),
+        "provider_metadata": {stage: [] for stage in ("coder", "reviewer", "verifier")},
+        "__diagnostic_coder_path__": 5,
+    }))
+
+    assert calls == [("coder", "selectdenoise_coder_path_5")]
+    assert len(result["terminal_candidate_paths"]) == 1
 
 
 def test_official_contextual_preterminal_returns_terminal_candidate_view(monkeypatch):
@@ -111,6 +136,23 @@ def test_contextual_terminal_receives_terminal_candidate_view():
     }, terminal)
 
     assert captured["candidate_paths"] == [["O", "I-PER"]]
+
+
+def test_contextual_checkpoint_path_resolves_workspace_relative_manifest(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    bundle = workspace / "unified_experiment_20260816" / "locked" / "bundle"
+    checkpoint = workspace / "unified_experiment_20260816" / "hf_home" / "snapshot"
+    bundle.mkdir(parents=True)
+    checkpoint.mkdir(parents=True)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+
+    resolved = multi_agent_v2._resolve_contextual_checkpoint_path(
+        "unified_experiment_20260816/hf_home/snapshot", bundle
+    )
+
+    assert resolved == checkpoint.resolve()
 
 
 def test_contextual_terminal_falls_back_from_empty_terminal_candidate_view():
@@ -275,6 +317,59 @@ def test_contextual_replay_passes_only_the_locked_terminal_allowlist():
     assert "gold_tags" not in captured
     assert result["terminal_model_hash"] == MODEL_HASH
     assert result["terminal_fallback_count"] == 0
+
+
+def test_official_contextual_coder_reviewer_verifier_use_configured_nothink():
+    calls = []
+    settings = {
+        **_settings(), "enable_thinking": False, "thinking_mode": "nothink",
+    }
+
+    def record(stage):
+        value = _record(stage)
+        value.update({"enable_thinking": False, "thinking_mode": "nothink"})
+        return value
+
+    def requester(stage, payload):
+        calls.append((stage, payload))
+        if stage == "reviewer":
+            return LiveBackboneResult({"weights": [0.8, 0.2]}, record(stage))
+        return LiveBackboneResult({"tags": ["B-ORG", "O"]}, record(stage))
+
+    # The test must exercise the graph nodes themselves, not only the adapter.
+    import multi_agent_v2 as module
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "_get_deer_examples", lambda *_args, **_kwargs: [])
+    try:
+        asyncio.run(module.coder_node({
+            "official": True, "tokens": ["Acme", "arrived"],
+            "dirty_tags": ["B-ORG", "O"], "dataset_name": "conll2003",
+            "noise_type": "BT", "structured_requester": requester,
+            "provider_settings": settings,
+            "provider_metadata": {stage: [] for stage in ("coder", "reviewer", "verifier")},
+        }))
+        asyncio.run(module.reviewer_node({
+            "official": True, "tokens": ["Acme", "arrived"],
+            "dirty_tags": ["B-ORG", "O"],
+            "candidate_paths": [["B-ORG", "O"], ["B-PER", "O"]],
+            "dataset_name": "conll2003", "use_lads": True,
+            "structured_requester": requester, "provider_settings": settings,
+            "provider_metadata": {"coder": [record("coder")], "reviewer": [], "verifier": []},
+        }))
+        asyncio.run(module.verifier_node({
+            "official": True, "tokens": ["Acme", "arrived"],
+            "dirty_tags": ["B-ORG", "O"],
+            "candidate_paths": [["B-ORG", "O"], ["B-PER", "O"]],
+            "rag_weights": [0.5, 0.5], "dataset_name": "conll2003", "noise_type": "ATF",
+            "use_verifier": True, "verify_all": False, "verifier_topk": 4,
+            "structured_requester": requester, "provider_settings": settings,
+            "provider_metadata": {"coder": [record("coder")], "reviewer": [record("reviewer")], "verifier": []},
+        }))
+    finally:
+        monkeypatch.undo()
+
+    assert calls and all(payload["enable_thinking"] is False for _, payload in calls)
+    assert {stage for stage, _ in calls} == {"coder", "reviewer", "verifier"}
 
 
 def test_contextual_replay_preserves_illegal_candidate_for_lattice_filtering():

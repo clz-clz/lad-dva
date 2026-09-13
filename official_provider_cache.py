@@ -86,10 +86,15 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(configuration, Mapping) or not configuration:
         raise ValueError("configuration must be a non-empty mapping")
     normalized["configuration"] = dict(configuration)
+    enable_thinking = normalized["configuration"].get("enable_thinking")
+    thinking_mode = normalized["configuration"].get("thinking_mode")
+    if (type(enable_thinking) is not bool
+            or thinking_mode != ("thinking" if enable_thinking else "nothink")):
+        raise ValueError("configuration must bind the effective thinking mode")
     return normalized
 
 
-def _validate_provider_metadata(metadata: Any) -> None:
+def _validate_provider_metadata(metadata: Any, *, expected_enable_thinking: bool) -> None:
     if not isinstance(metadata, Mapping) or set(metadata) != _STAGES:
         raise ValueError("provider_metadata must contain exactly coder, reviewer, and verifier")
     for stage in _STAGES:
@@ -107,6 +112,14 @@ def _validate_provider_metadata(metadata: Any) -> None:
                 or record.get("revision") != QWEN_REVISION
             ):
                 raise ValueError(f"provider_metadata.{stage} lacks the pinned Qwen served identity")
+            if (type(record.get("enable_thinking")) is not bool
+                    or record.get("enable_thinking") != expected_enable_thinking
+                    or record.get("thinking_mode") != (
+                        "thinking" if expected_enable_thinking else "nothink"
+                    )):
+                raise ValueError(
+                    f"provider_metadata.{stage} lacks the effective thinking-mode identity"
+                )
 
 
 def _validate_records(records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -140,7 +153,10 @@ def _validate_records(records: Sequence[Mapping[str, Any]], manifest: Mapping[st
             raise ValueError("confidence must be a list")
         if record["fallback_used"] is not False:
             raise ValueError("provider-cache fallback_used must be false")
-        _validate_provider_metadata(record["provider_metadata"])
+        _validate_provider_metadata(
+            record["provider_metadata"],
+            expected_enable_thinking=manifest["configuration"]["enable_thinking"],
+        )
         normalized.append(dict(record))
     return normalized
 

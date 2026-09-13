@@ -16,6 +16,9 @@ __pycache__/
 # Experiment data (large)
 predictions_multiseed/
 results_multiseed/
+provider_cache/
+qwen_diagnostics/
+.qwen_diagnostics/
 
 # Paper artifacts (figures, tables, appendix)
 *.pdf

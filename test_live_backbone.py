@@ -872,3 +872,120 @@ def test_vllm_structured_request_requires_terminal_finish_reason_and_usage(respo
             "temperature": 0.0,
             "enable_thinking": True,
         })
+
+
+def test_qwen_enable_thinking_is_opt_in_and_deepseek_ignores_the_flag(monkeypatch):
+    for name in (
+        "BACKBONE_PROVIDER", "BACKBONE_MODEL", "BACKBONE_BASE_URL",
+        "BACKBONE_REVISION", "BACKBONE_API_KEY", "DEEPSEEK_API_KEY",
+        "QWEN_ENABLE_THINKING",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("BACKBONE_PROVIDER", "vllm")
+    monkeypatch.setenv("BACKBONE_MODEL", "Qwen/Qwen3-32B-AWQ")
+    monkeypatch.setenv("BACKBONE_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("BACKBONE_REVISION", PINNED_QWEN_REVISION)
+
+    historical = LiveBackboneSettings.from_env()
+    assert historical.enable_thinking is None
+    assert historical.thinking_mode == "request-controlled"
+
+    monkeypatch.setenv("QWEN_ENABLE_THINKING", "false")
+    disabled = LiveBackboneSettings.from_env()
+    assert disabled.enable_thinking is False
+    assert disabled.thinking_mode == "nothink"
+
+    monkeypatch.setenv("BACKBONE_PROVIDER", "deepseek")
+    monkeypatch.setenv("BACKBONE_MODEL", "deepseek-v4-flash")
+    monkeypatch.setenv("BACKBONE_BASE_URL", "https://api.deepseek.com/v1")
+    deepseek = LiveBackboneSettings.from_env()
+    assert deepseek.enable_thinking is None
+    assert deepseek.thinking_mode == "request-controlled"
+
+
+def test_qwen_nothink_setting_overrides_stage_request_and_uses_content_field():
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    transport = _RecordingTransport([_response({"tags": ["O"]}, model=served_model)])
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="offline-key",
+            revision=PINNED_QWEN_REVISION, enable_thinking=False,
+        ),
+        transport=transport,
+    )
+
+    result = adapter.structured_requester("verifier", {
+        "name": "selectdenoise_verifier",
+        "schema": {
+            "type": "object", "additionalProperties": False,
+            "required": ["tags"],
+            "properties": {"tags": {
+                "type": "array", "minItems": 1, "maxItems": 1,
+                "items": {"type": "string", "enum": ["O"]},
+            }},
+        },
+        "messages": [{"role": "user", "content": "label"}],
+        "temperature": 0.0,
+        # The configured Qwen mode must win even if an old caller requests true.
+        "enable_thinking": True,
+    })
+
+    assert result == {"tags": ["O"]}
+    request = transport.calls[0]
+    assert request["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert result.provider_metadata["enable_thinking"] is False
+    assert result.provider_metadata["thinking_mode"] == "nothink"
+
+
+def test_qwen_nothink_diagnostic_body_and_transport_record_same_effective_mode(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("QWEN_DIAGNOSTICS_DIR", str(tmp_path))
+    served_model = f"Qwen/Qwen3-32B-AWQ@{PINNED_QWEN_REVISION}"
+    transport = _RecordingTransport([_response({"tags": ["O"]}, model=served_model)])
+    adapter = OpenAICompatibleLADRGAdapter(
+        LiveBackboneSettings(
+            provider="vllm", model="Qwen/Qwen3-32B-AWQ",
+            base_url="http://127.0.0.1:8000/v1", api_key="private-key",
+            revision=PINNED_QWEN_REVISION, enable_thinking=False,
+        ),
+        transport=transport,
+    )
+
+    adapter.structured_requester("coder", {
+        "name": "selectdenoise_coder_path_1",
+        "schema": {"type": "object", "required": ["tags"]},
+        "messages": [{"role": "user", "content": "dirty tags only"}],
+        "temperature": 1.0,
+        "enable_thinking": True,
+    })
+
+    request_files = [path for path in tmp_path.glob("*.json")]
+    assert len(request_files) == 1
+    body = json.loads(request_files[0].read_text(encoding="utf-8"))
+    assert body["enable_thinking"] is False
+    assert body["thinking_mode"] == "nothink"
+    assert body["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False}
+    }
+    assert transport.calls[0]["extra_body"] == body["extra_body"]
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    request_events = [event for event in events if event["event"].startswith("request_")]
+    assert request_events
+    assert all(event["enable_thinking"] is False for event in request_events)
+    assert all(event["thinking_mode"] == "nothink" for event in request_events)
+    assert "private-key" not in (tmp_path / "events.jsonl").read_text()
+
+
+def test_invalid_qwen_enable_thinking_value_fails_closed(monkeypatch):
+    monkeypatch.setenv("BACKBONE_PROVIDER", "vllm")
+    monkeypatch.setenv("BACKBONE_MODEL", "Qwen/Qwen3-32B-AWQ")
+    monkeypatch.setenv("BACKBONE_BASE_URL", "http://127.0.0.1:8000/v1")
+    monkeypatch.setenv("BACKBONE_REVISION", PINNED_QWEN_REVISION)
+    monkeypatch.setenv("QWEN_ENABLE_THINKING", "sometimes")
+
+    with pytest.raises(ValueError, match="QWEN_ENABLE_THINKING"):
+        LiveBackboneSettings.from_env()

@@ -11,6 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from request_diagnostics import traced_request, diagnostic_http_client
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from official_contract import (
@@ -18,6 +19,47 @@ from official_contract import (
     OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
     OFFICIAL_SDK_MAX_RETRIES,
 )
+
+
+QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
+_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def qwen_enable_thinking_from_environment(
+    environment: Optional[Mapping[str, str]] = None,
+) -> Optional[bool]:
+    """Resolve the opt-in Qwen thinking override without affecting DeepSeek.
+
+    ``None`` is intentional: it preserves the historical caller-controlled
+    behavior when the environment does not opt into either mode.
+    """
+    env = os.environ if environment is None else environment
+    provider = str(env.get("BACKBONE_PROVIDER", "deepseek")).strip().lower()
+    if provider != "vllm":
+        return None
+    model = str(env.get("BACKBONE_MODEL", QWEN_MODEL)).strip()
+    if model != QWEN_MODEL:
+        return None
+    raw = env.get("QWEN_ENABLE_THINKING")
+    if raw is None or not str(raw).strip():
+        return None
+    normalized = str(raw).strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        "QWEN_ENABLE_THINKING must be one of true/false, 1/0, yes/no, or on/off"
+    )
+
+
+def _thinking_mode(enabled: Optional[bool]) -> str:
+    if enabled is True:
+        return "thinking"
+    if enabled is False:
+        return "nothink"
+    return "request-controlled"
 
 
 class LiveBackboneError(RuntimeError):
@@ -43,6 +85,7 @@ class LiveBackboneSettings:
     revision: Optional[str] = None
     timeout_seconds: float = OFFICIAL_PROVIDER_TIMEOUT_SECONDS
     max_retries: int = OFFICIAL_SDK_MAX_RETRIES
+    enable_thinking: Optional[bool] = None
 
     def __post_init__(self) -> None:
         provider = self.provider.lower()
@@ -59,10 +102,15 @@ class LiveBackboneSettings:
             or not re.fullmatch(r"[0-9a-fA-F]{40}", self.revision)
         ):
             raise ValueError("vLLM/Qwen requires an immutable 40-hex BACKBONE_REVISION")
-        if self.timeout_seconds != OFFICIAL_PROVIDER_TIMEOUT_SECONDS:
-            raise ValueError("live LAD-RG provider timeout must be 120 seconds")
+        allowed_timeouts = (120.0, 300.0, 600.0) if (
+            provider == "vllm" and self.model == "Qwen/Qwen3-32B-AWQ"
+        ) else (OFFICIAL_PROVIDER_TIMEOUT_SECONDS,)
+        if self.timeout_seconds not in allowed_timeouts:
+            raise ValueError("unsupported provider timeout; default is 120 seconds")
         if not 0 <= self.max_retries <= OFFICIAL_SDK_MAX_RETRIES:
             raise ValueError("live LAD-RG SDK retries must be between 0 and 2")
+        if self.enable_thinking is not None and type(self.enable_thinking) is not bool:
+            raise ValueError("enable_thinking must be boolean or None")
         object.__setattr__(self, "provider", provider)
 
     @property
@@ -81,23 +129,50 @@ class LiveBackboneSettings:
             else "chat-completions-json-schema"
         )
 
+    @property
+    def is_fixed_qwen(self) -> bool:
+        return self.provider == "vllm" and self.model == QWEN_MODEL
+
+    @property
+    def thinking_mode(self) -> str:
+        return _thinking_mode(self.enable_thinking if self.is_fixed_qwen else None)
+
+    @property
+    def configured_enable_thinking(self) -> Optional[bool]:
+        """Return the fixed-Qwen override, ignoring unrelated provider flags."""
+        return self.enable_thinking if self.is_fixed_qwen else None
+
+    def effective_enable_thinking(self, requested: bool) -> bool:
+        """Apply the configured fixed-Qwen override to one stage request."""
+        if type(requested) is not bool:
+            raise ValueError("requested enable_thinking must be boolean")
+        if self.is_fixed_qwen and type(self.enable_thinking) is bool:
+            return self.enable_thinking
+        return requested
+
     @classmethod
-    def from_env(cls) -> "LiveBackboneSettings":
-        provider = os.environ.get("BACKBONE_PROVIDER", "deepseek").lower()
+    def from_env(
+        cls, environment: Optional[Mapping[str, str]] = None
+    ) -> "LiveBackboneSettings":
+        env = os.environ if environment is None else environment
+        provider = str(env.get("BACKBONE_PROVIDER", "deepseek")).lower()
         is_deepseek = provider == "deepseek"
         return cls(
             provider=provider,
-            model=os.environ.get(
+            model=env.get(
                 "BACKBONE_MODEL",
-                "deepseek-v4-flash" if is_deepseek else "Qwen/Qwen3-32B-AWQ",
+                "deepseek-v4-flash" if is_deepseek else QWEN_MODEL,
             ),
-            base_url=os.environ.get(
+            base_url=env.get(
                 "BACKBONE_BASE_URL",
                 "https://api.deepseek.com/v1" if is_deepseek else "http://127.0.0.1:8000/v1",
             ),
-            api_key=os.environ.get("BACKBONE_API_KEY")
-            or (os.environ.get("DEEPSEEK_API_KEY") if is_deepseek else None),
-            revision=os.environ.get("BACKBONE_REVISION"),
+            api_key=env.get("BACKBONE_API_KEY")
+            or (env.get("DEEPSEEK_API_KEY") if is_deepseek else None),
+            revision=env.get("BACKBONE_REVISION"),
+            timeout_seconds=(float(env.get("QWEN_PROVIDER_TIMEOUT_SECONDS", "120"))
+                             if provider == 'vllm' else OFFICIAL_PROVIDER_TIMEOUT_SECONDS),
+            enable_thinking=qwen_enable_thinking_from_environment(env),
         )
 
 
@@ -259,7 +334,8 @@ class OpenAICompatibleLADRGAdapter:
                 from openai import OpenAI
 
                 client_factory = OpenAI
-            http_client = DefaultHttpxClient(trust_env=False)
+            http_client = (diagnostic_http_client() if os.environ.get('QWEN_DIAGNOSTICS_DIR')
+                           else DefaultHttpxClient(trust_env=False))
             try:
                 client = client_factory(
                     api_key=self.settings.api_key,
@@ -305,8 +381,11 @@ class OpenAICompatibleLADRGAdapter:
             "timeout_seconds": self.settings.timeout_seconds,
             "max_retries": self.settings.max_retries,
             "structured_api": self.settings.structured_api,
+            "enable_thinking": self.settings.configured_enable_thinking,
+            "thinking_mode": self.settings.thinking_mode,
         }
 
+    @traced_request
     def structured_requester(
         self, stage: str, payload: Mapping[str, Any]
     ) -> LiveBackboneResult:
@@ -326,7 +405,7 @@ class OpenAICompatibleLADRGAdapter:
         schema = payload.get("schema")
         messages = payload.get("messages")
         temperature = payload.get("temperature")
-        enable_thinking = payload.get("enable_thinking")
+        requested_enable_thinking = payload.get("enable_thinking")
         if not isinstance(name, str) or not name:
             raise LiveBackboneError("structured request name must be non-empty")
         if not isinstance(schema, Mapping):
@@ -336,8 +415,9 @@ class OpenAICompatibleLADRGAdapter:
             raise LiveBackboneError("structured request messages must be a list of mappings")
         if type(temperature) not in (int, float) or not 0.0 <= float(temperature) <= 2.0:
             raise LiveBackboneError("structured request temperature must be between 0 and 2")
-        if type(enable_thinking) is not bool:
+        if type(requested_enable_thinking) is not bool:
             raise LiveBackboneError("structured request enable_thinking must be boolean")
+        enable_thinking = self.settings.effective_enable_thinking(requested_enable_thinking)
         strict_stage = stage in {"reviewer", "verifier"} or stage.startswith("coder")
 
         try:
@@ -383,7 +463,7 @@ class OpenAICompatibleLADRGAdapter:
                         provider=self.settings.provider,
                     ),
                     "temperature": 0.7,
-                    "enable_thinking": True,
+                    "enable_thinking": self.settings.effective_enable_thinking(True),
                 },
             )
             return LiveBackboneResult(
@@ -402,7 +482,7 @@ class OpenAICompatibleLADRGAdapter:
                         provider=self.settings.provider,
                     ),
                     "temperature": 0.7,
-                    "enable_thinking": True,
+                    "enable_thinking": self.settings.effective_enable_thinking(True),
                 },
             )
             return LiveBackboneResult(
@@ -429,7 +509,9 @@ class OpenAICompatibleLADRGAdapter:
                 "schema": _gasd_schema(len(tokens), valid_tags),
                 "messages": _gasd_messages(payload, valid_tags),
                 "temperature": 0.0,
-                "enable_thinking": self.settings.provider == "vllm",
+                "enable_thinking": self.settings.effective_enable_thinking(
+                    self.settings.provider == "vllm"
+                ),
             },
         )
         reason, tags = _validate_gasd(result, len(tokens), valid_tags)
@@ -445,7 +527,7 @@ class OpenAICompatibleLADRGAdapter:
     def _stage_metadata(
         self, stage: str, response_metadata: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return {
+        metadata = {
             "stage": stage,
             "status": "live",
             "provider": self.settings.provider,
@@ -462,6 +544,17 @@ class OpenAICompatibleLADRGAdapter:
             "finish_reason": response_metadata.get("finish_reason"),
             "incomplete_reason": response_metadata.get("incomplete_reason"),
         }
+        # Keep non-Qwen legacy evidence byte-compatible; the formal fixed-Qwen
+        # contract is the path whose effective mode must be persisted.
+        if self.settings.is_fixed_qwen:
+            metadata.update({
+                "enable_thinking": response_metadata.get("enable_thinking"),
+                "thinking_mode": response_metadata.get(
+                    "thinking_mode",
+                    _thinking_mode(response_metadata.get("enable_thinking")),
+                ),
+            })
+        return metadata
 
     @staticmethod
     def _usage_metadata(raw_usage: Any) -> dict[str, Any]:
@@ -540,6 +633,8 @@ class OpenAICompatibleLADRGAdapter:
                 "response_status": response_status,
                 "finish_reason": None,
                 "incomplete_reason": incomplete_details.get("reason"),
+                "enable_thinking": enable_thinking,
+                "thinking_mode": _thinking_mode(enable_thinking),
             }
         except LiveBackboneError:
             raise
@@ -566,8 +661,9 @@ class OpenAICompatibleLADRGAdapter:
                 "json_schema": {"name": name, "strict": True, "schema": dict(schema)},
             },
         }
-        if enable_thinking:
-            request["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+        request["extra_body"] = {
+            "chat_template_kwargs": {"enable_thinking": enable_thinking}
+        }
         try:
             raw = self._chat_transport(**request)
             response_model = _get(raw, "model")
@@ -595,6 +691,8 @@ class OpenAICompatibleLADRGAdapter:
                 "response_status": "completed",
                 "finish_reason": finish_reason,
                 "incomplete_reason": None,
+                "enable_thinking": enable_thinking,
+                "thinking_mode": _thinking_mode(enable_thinking),
             }
         except LiveBackboneError:
             raise
