@@ -415,7 +415,7 @@ def test_provider_cache_phase_is_a_distinct_runner_phase():
 
 
 def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypatch):
-    """Three Coder paths per sentence must still honor the 20-request cap."""
+    """Three Coder paths per sentence must still honor the 32-request cap."""
     from multi_agent_v2 import _invoke_structured_requester
 
     noisy_dir = tmp_path / "noisy"
@@ -493,14 +493,14 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
             run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
             "msra", "BT", 13, 200, (three_path_pipeline, {}),
                 cache_root=tmp_path / "cache", cache_tag="request-cap-nothink-test",
-            max_concurrency=20, request_timeout=runner_timeout,
+            max_concurrency=32, request_timeout=runner_timeout,
             adapter_factory=lambda: adapter, git_sha="a" * 40,
             bundle_hash="b" * 64,
         )
 
     asyncio.run(run_cell())
 
-    assert adapter.peak <= 20
+    assert adapter.peak <= 32
     assert set(adapter.stages) == {"coder", "reviewer", "verifier"}
     with pytest.raises(ValueError, match="manifest identity mismatch"):
         asyncio.run(run_cell(runner_timeout=11))
@@ -534,7 +534,7 @@ def test_provider_cache_abort_does_not_start_waiting_provider_requests(
         def __init__(self):
             self.lock = threading.Lock()
             self.started = 0
-            self.first_wave = threading.Barrier(20)
+            self.first_wave = threading.Barrier(32)
             self.failure_raised = threading.Event()
             self.release = threading.Event()
 
@@ -551,9 +551,9 @@ def test_provider_cache_abort_does_not_start_waiting_provider_requests(
             with self.lock:
                 self.started += 1
                 call_number = self.started
-            if call_number <= 20:
+            if call_number <= 32:
                 self.first_wave.wait(timeout=5)
-            if call_number == 20:
+            if call_number == 32:
                 self.failure_raised.set()
                 raise RuntimeError("provider failed")
             self.release.wait(timeout=5)
@@ -585,7 +585,7 @@ def test_provider_cache_abort_does_not_start_waiting_provider_requests(
             run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
             "msra", "BT", 13, 200, (failing_pipeline, {}),
             cache_root=tmp_path / "cache", cache_tag="abort-request-cap-test",
-            max_concurrency=20, request_timeout=10,
+            max_concurrency=32, request_timeout=10,
             adapter_factory=lambda: adapter, git_sha="a" * 40,
             bundle_hash="b" * 64,
         )
@@ -597,5 +597,5 @@ def test_provider_cache_abort_does_not_start_waiting_provider_requests(
         adapter.release.set()
         controller.join(timeout=5)
 
-    assert adapter.started == 20
+    assert adapter.started == 32
     assert not list((tmp_path / "cache").rglob("*.jsonl"))

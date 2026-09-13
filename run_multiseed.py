@@ -75,6 +75,10 @@ OFFICIAL_REQUEST_TIMEOUT = 3600.0
 OFFICIAL_SAMPLE_SIZE = 200
 PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
+# The live provider cap for the confirmed Stage-A execution profile.  Keep
+# this separate from the legacy/general-purpose concurrency default above so
+# the provider-cache phase cannot silently drift to another launch contract.
+OFFICIAL_PROVIDER_MAX_CONCURRENCY = 32
 OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v2"
 # Staged Contextual Lattice runs use this immutable provider-evidence schema.
 # Provider-cache execution is deliberately isolated from the later offline
@@ -1148,8 +1152,11 @@ def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | 
         raise ValueError("provider-cache phase requires real requests and failure-policy abort")
     if size != OFFICIAL_SAMPLE_SIZE or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
         raise ValueError("provider-cache phase requires size 200 and ratio 0.15")
-    if max_concurrency != 20:
-        raise ValueError("provider-cache phase requires max-concurrency 20")
+    if max_concurrency != OFFICIAL_PROVIDER_MAX_CONCURRENCY:
+        raise ValueError(
+            "provider-cache phase requires "
+            f"max-concurrency {OFFICIAL_PROVIDER_MAX_CONCURRENCY}"
+        )
     if list(config_names) != ["selectdenoise_contextual_lattice"]:
         raise ValueError("provider-cache phase requires exactly the contextual-lattice config")
     for name, actual, expected in (

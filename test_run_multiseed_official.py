@@ -250,7 +250,7 @@ def test_provider_cache_cell_runs_preterminal_graph_once_and_is_exactly_resumabl
     first = asyncio.run(run_multiseed._run_provider_cache_cell(
         "selectdenoise_contextual_lattice", run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
         "msra", "BT", 13, 200, (pipeline, {}), cache_root=cache_root,
-        cache_tag="qwen-test", max_concurrency=20, request_timeout=10.0,
+        cache_tag="qwen-test", max_concurrency=32, request_timeout=10.0,
         adapter_factory=lambda: adapter, git_sha="a" * 40, bundle_hash="b" * 64,
     ))
 
@@ -265,7 +265,7 @@ def test_provider_cache_cell_runs_preterminal_graph_once_and_is_exactly_resumabl
     second = asyncio.run(run_multiseed._run_provider_cache_cell(
         "selectdenoise_contextual_lattice", run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
         "msra", "BT", 13, 200, (pipeline, {}), cache_root=cache_root,
-        cache_tag="qwen-test", max_concurrency=20, request_timeout=10.0,
+        cache_tag="qwen-test", max_concurrency=32, request_timeout=10.0,
         adapter_factory=lambda: adapter, git_sha="a" * 40, bundle_hash="b" * 64,
     ))
 
@@ -327,7 +327,7 @@ def test_provider_cache_phase_rejects_partial_canonical_matrix(field, value):
     with pytest.raises(ValueError, match=field):
         run_multiseed._validate_provider_cache_launch(
             ["selectdenoise_contextual_lattice"], size=200, ratios=[0.15],
-            max_concurrency=20, failure_policy="abort", dummy=False, **kwargs,
+            max_concurrency=32, failure_policy="abort", dummy=False, **kwargs,
         )
 
 
@@ -358,7 +358,7 @@ def test_provider_cache_does_not_create_historical_prediction_manifest(tmp_path,
 
     run_multiseed.main([
         "--phase", "provider-cache", "--official", "--size", "200",
-        "--max-concurrency", "20", "--bundle-hash", "b" * 64,
+        "--max-concurrency", "32", "--bundle-hash", "b" * 64,
         "--provider-cache-root", str(tmp_path / "cache"),
     ])
 
@@ -371,13 +371,13 @@ def test_provider_cache_phase_rejects_non_contextual_or_noncanonical_launches():
     assert args.phase == "provider-cache"
     with pytest.raises(ValueError, match="contextual-lattice"):
         run_multiseed._validate_provider_cache_launch(
-            ["lad_rg_full"], size=200, ratios=[0.15], max_concurrency=20,
+            ["lad_rg_full"], size=200, ratios=[0.15], max_concurrency=32,
             failure_policy="abort", dummy=False,
         )
-    with pytest.raises(ValueError, match="max-concurrency 20"):
+    with pytest.raises(ValueError, match="max-concurrency 32"):
         run_multiseed._validate_provider_cache_launch(
             ["selectdenoise_contextual_lattice"], size=200, ratios=[0.15],
-            max_concurrency=19, failure_policy="abort", dummy=False,
+            max_concurrency=31, failure_policy="abort", dummy=False,
         )
 
 

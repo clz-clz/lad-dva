@@ -139,7 +139,7 @@ same experiment concurrently on the old and replacement instances.
 
 For the formal no-thinking Qwen run, use
 `QWEN_PROVIDER_TIMEOUT_SECONDS=300` and `--request-timeout 3600`. Retain the
-20-request provider cap and at most two SDK retries. Provider timeout, runner
+32-request provider cap and at most two SDK retries. Provider timeout, runner
 timeout, and effective thinking mode are recorded in the cache manifest;
 different identities cannot resume the same cache. The runner's budget
 executor uses one shared ledger across diagnosis, smoke, and reruns, so a
@@ -175,7 +175,7 @@ stop instance rental billing.
 Stage A is the only paid phase. After the smoke and budget approval, set a
 fresh tag containing `nothink`, set the independent no-thinking profile, and
 run only `selectdenoise_contextual_lattice` with size 200,
-ratio 0.15, max client concurrency 20, and failure policy `abort`:
+ratio 0.15, max client concurrency 32, and failure policy `abort`:
 
 ```powershell
 $env:QWEN_ENABLE_THINKING = "false"
@@ -190,7 +190,7 @@ D:/py/Anaconda3/python.exe qwen_budget_executor.py `
   --report "$env:QWEN_DIAGNOSTICS_DIR/budget-launch.json" -- `
   --official --phase provider-cache `
   --configs selectdenoise_contextual_lattice `
-  --size 200 --ratios 0.15 --max-concurrency 20 `
+  --size 200 --ratios 0.15 --max-concurrency 32 `
   --bundle-hash $env:CONTEXTUAL_BUNDLE_HASH `
   --provider-cache-root provider_cache
 ```
