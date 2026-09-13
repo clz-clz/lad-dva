@@ -928,12 +928,24 @@ def _read_provider_cache_index_cell(root: Path, tag: str, key: str) -> Mapping[s
     return cell
 
 
-def _validate_replay_cache_identity(actual: Mapping[str, Any],
-                                    expected: Mapping[str, Any]) -> None:
-    """Bind replay to the exact provider-cache launch identity."""
+def _validate_replay_cache_identity(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    compatible_git_shas: Sequence[str] = (),
+) -> None:
+    """Bind replay to semantic identity while preserving producer provenance."""
     if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
         raise ValueError("provider-cache replay identity must be a mapping")
-    for field in ("schema", "git_sha", "model_revision", "bundle_hash", "configuration"):
+    allowed_git_shas = {str(expected.get("git_sha", "")).lower()}
+    for value in compatible_git_shas:
+        normalized = str(value).lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", normalized):
+            raise ValueError("provider-cache compatible git_sha is invalid")
+        allowed_git_shas.add(normalized)
+    if str(actual.get("git_sha", "")).lower() not in allowed_git_shas:
+        raise ValueError("provider-cache replay git_sha identity mismatch")
+    for field in ("schema", "model_revision", "bundle_hash", "configuration", "source_digests"):
         if actual.get(field) != expected.get(field):
             raise ValueError(f"provider-cache replay {field} identity mismatch")
 
@@ -1172,7 +1184,7 @@ async def _run_provider_cache_cell(
     config_name: str, config: Mapping[str, Any], dataset: str, noise: str, seed: int,
     size: int, pipelines, *, cache_root: Path, cache_tag: str, max_concurrency: int,
     request_timeout: float, adapter_factory: Callable[[], Any], git_sha: str,
-    bundle_hash: str,
+    bundle_hash: str, compatible_git_shas: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Execute only the provider graph and atomically publish one gold-free cell."""
     _validate_provider_cache_launch([config_name], size=size, ratios=[OFFICIAL_NOISE_RATIO],
@@ -1220,19 +1232,20 @@ async def _run_provider_cache_cell(
     }
     if cell_path.exists():
         indexed = _read_provider_cache_index_cell(cache_root, cache_tag, key)
+        cached_manifest = _read_provider_cache_manifest(cell_path)
+        _validate_replay_cache_identity(
+            cached_manifest,
+            manifest,
+            compatible_git_shas=compatible_git_shas,
+        )
         if (indexed["path"] != str(cell_path) or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
-                or indexed["git_sha"] != manifest["git_sha"]
-                or indexed["model_revision"] != QWEN_REVISION
-                or indexed["provider_fingerprint"] != fingerprint):
+                or indexed["git_sha"] != cached_manifest["git_sha"]
+                or indexed["model_revision"] != cached_manifest["model_revision"]):
             raise ValueError("provider-cache index identity mismatch; refusing resume")
         cached = read_provider_cell(cell_path, indexed["sha256"], OFFICIAL_SAMPLE_SIZE)
-        if _read_provider_cache_manifest(cell_path) != manifest:
-            raise ValueError("provider-cache manifest identity mismatch; refusing resume")
-        cell = {"path": str(cell_path), "sha256": indexed["sha256"], "row_count": len(cached),
-                "git_sha": manifest["git_sha"], "model_revision": QWEN_REVISION,
-                "provider_fingerprint": fingerprint}
-        _update_provider_cache_index(cache_root, cache_tag, key=key, cell=cell)
-        return cell
+        for record in cached:
+            _validate_contextual_provider_evidence(record["provider_metadata"], identity, noise)
+        return dict(indexed)
 
     default_fn, _baseline_fns = pipelines
     sem = asyncio.Semaphore(max_concurrency)
@@ -1333,7 +1346,7 @@ async def _run_contextual_replay_cell(
     cache_root: Path, cache_tag: str, bundle_hash: str, git_sha: str,
     replay_fn: Callable[..., Mapping[str, Any]], terminal: Any,
     max_concurrency: int, prediction_path: Optional[Path] = None,
-    enable_thinking: bool = True,
+    enable_thinking: bool = True, compatible_git_shas: Sequence[str] = (),
 ) -> Path:
     """Decode one provider-cache cell locally with no provider adapter."""
     _validate_contextual_replay_launch(
@@ -1368,15 +1381,20 @@ async def _run_contextual_replay_cell(
     )
     if (Path(str(indexed["path"])).resolve() != expected_cell_path.resolve()
             or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
-            or indexed["git_sha"] != expected_manifest["git_sha"]
-            or indexed["model_revision"] != QWEN_REVISION
             or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["sha256"]))
             or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["provider_fingerprint"]))):
         raise ValueError("contextual-replay cache index identity mismatch")
     cell_path = expected_cell_path
     cached_rows = read_provider_cell(cell_path, str(indexed["sha256"]), OFFICIAL_SAMPLE_SIZE)
     cached_manifest = _read_provider_cache_manifest(cell_path)
-    _validate_replay_cache_identity(cached_manifest, expected_manifest)
+    _validate_replay_cache_identity(
+        cached_manifest,
+        expected_manifest,
+        compatible_git_shas=compatible_git_shas,
+    )
+    if (indexed["git_sha"] != cached_manifest["git_sha"]
+            or indexed["model_revision"] != cached_manifest["model_revision"]):
+        raise ValueError("contextual-replay cache index identity mismatch")
     _validate_replay_source_rows(source_rows, cached_rows)
     provider_identity = {
         "provider": "vllm", "model": QWEN_MODEL,
@@ -1803,6 +1821,13 @@ def _parse_args(argv=None):
     ap.add_argument("--provider-cache-root", type=Path, default=PROVIDER_CACHE_DIR)
     ap.add_argument("--provider-cache-tag", default=None,
                     help="Immutable provider-cache namespace for staged runs.")
+    ap.add_argument(
+        "--compatible-provider-cache-git-sha",
+        action="append",
+        default=[],
+        help=("Explicitly allow a provider-cache producer commit whose semantic "
+              "pipeline identity has been independently verified as compatible."),
+    )
     ap.add_argument("--bundle-hash", help="Pinned 64-hex contextual lattice bundle hash.")
     args = ap.parse_args(argv)
     args.failure_policy = args.failure_policy or "abort"
@@ -1861,6 +1886,7 @@ def _run_contextual_replay_phase(args) -> None:
                             git_sha=git_sha, replay_fn=run_contextual_lattice_replay,
                             terminal=terminal, max_concurrency=args.max_concurrency,
                             enable_thinking=False,
+                            compatible_git_shas=args.compatible_provider_cache_git_sha,
                         ))
     finally:
         if old_bundle is None:
@@ -1953,6 +1979,7 @@ def main(argv=None):
                             request_timeout=args.request_timeout,
                             adapter_factory=adapter_factory, git_sha=git_sha,
                             bundle_hash=args.bundle_hash,
+                            compatible_git_shas=args.compatible_provider_cache_git_sha,
                         ))
                         n_done += 1
             return

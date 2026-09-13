@@ -260,6 +260,27 @@ def test_contextual_cache_thinking_modes_are_not_interchangeable():
         run_multiseed._validate_replay_cache_identity(actual, expected)
 
 
+def test_contextual_cache_allows_explicitly_compatible_producer_with_new_request_limits():
+    record = _record()
+    expected = _manifest(record)
+    expected["request_limits"] = {
+        "provider_timeout_seconds": 600.0,
+        "runner_timeout_seconds": 7200.0,
+        "max_concurrency": 32,
+    }
+    cached = json.loads(json.dumps(expected))
+    cached["git_sha"] = "b" * 40
+    cached["request_limits"] = {
+        "provider_timeout_seconds": 300.0,
+        "runner_timeout_seconds": 3600.0,
+        "max_concurrency": 20,
+    }
+
+    run_multiseed._validate_replay_cache_identity(
+        cached, expected, compatible_git_shas=["b" * 40]
+    )
+
+
 def test_contextual_replay_phase_parses_an_explicit_cache_tag_and_root(tmp_path):
     args = run_multiseed._parse_args([
         "--phase", "contextual-replay",
@@ -484,7 +505,7 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
             "fallback_used": False,
         }
 
-    async def run_cell(runner_timeout=10):
+    async def run_cell(runner_timeout=10, git_sha="a" * 40, compatible_git_shas=()):
         asyncio.get_running_loop().set_default_executor(
             concurrent.futures.ThreadPoolExecutor(max_workers=64)
         )
@@ -494,19 +515,23 @@ def test_provider_cache_caps_live_requests_not_only_sentences(tmp_path, monkeypa
             "msra", "BT", 13, 200, (three_path_pipeline, {}),
                 cache_root=tmp_path / "cache", cache_tag="request-cap-nothink-test",
             max_concurrency=32, request_timeout=runner_timeout,
-            adapter_factory=lambda: adapter, git_sha="a" * 40,
+            adapter_factory=lambda: adapter, git_sha=git_sha,
             bundle_hash="b" * 64,
+            compatible_git_shas=compatible_git_shas,
         )
 
     asyncio.run(run_cell())
 
     assert adapter.peak <= 32
     assert set(adapter.stages) == {"coder", "reviewer", "verifier"}
-    with pytest.raises(ValueError, match="manifest identity mismatch"):
-        asyncio.run(run_cell(runner_timeout=11))
+    stage_count = len(adapter.stages)
     adapter.timeout_seconds = 300
-    with pytest.raises(ValueError, match="index identity mismatch"):
-        asyncio.run(run_cell())
+    asyncio.run(run_cell(
+        runner_timeout=11,
+        git_sha="c" * 40,
+        compatible_git_shas=["a" * 40],
+    ))
+    assert len(adapter.stages) == stage_count
 
 
 @pytest.mark.filterwarnings(
