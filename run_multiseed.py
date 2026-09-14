@@ -1143,6 +1143,17 @@ def _offline_contextual_replay_environment():
                 os.environ[key] = value
 
 
+@contextlib.contextmanager
+def _offline_contextual_replay_loop():
+    """Create Windows asyncio IPC before provider network calls are blocked."""
+    loop = asyncio.new_event_loop()
+    try:
+        with _offline_contextual_replay_environment():
+            yield loop
+    finally:
+        loop.close()
+
+
 def _validate_contextual_replay_prediction(
     path: Path, dataset: str, noise_type: str, expected_sha256: str,
     expected_count: int = OFFICIAL_SAMPLE_SIZE, enable_thinking: bool = True,
@@ -2006,7 +2017,7 @@ def _run_contextual_replay_phase(args) -> None:
     old_bundle = os.environ.get("CONTEXTUAL_LATTICE_BUNDLE")
     old_embedding = os.environ.get("CONTEXTUAL_LATTICE_ENCODER_CACHE")
     try:
-        with _offline_contextual_replay_environment():
+        with _offline_contextual_replay_loop() as replay_loop:
             bundle_path, embedding_path = _validate_contextual_replay_bundle(args.bundle_hash)
             os.environ["CONTEXTUAL_LATTICE_BUNDLE"] = str(bundle_path)
             os.environ["CONTEXTUAL_LATTICE_ENCODER_CACHE"] = str(embedding_path)
@@ -2018,7 +2029,7 @@ def _run_contextual_replay_phase(args) -> None:
             for dataset in args.datasets:
                 for noise in args.noise:
                     for seed in args.seeds:
-                        asyncio.run(_run_contextual_replay_cell(
+                        replay_loop.run_until_complete(_run_contextual_replay_cell(
                             dataset, noise, seed, args.size,
                             cache_root=args.provider_cache_root,
                             cache_tag=tag, bundle_hash=args.bundle_hash,

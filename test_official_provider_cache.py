@@ -690,3 +690,10 @@ def test_provider_cache_abort_does_not_start_waiting_provider_requests(
 
     assert adapter.started == 32
     assert not list((tmp_path / "cache").rglob("*.jsonl"))
+
+
+def test_offline_replay_precreates_windows_event_loop_before_blocking_network():
+    with run_multiseed._offline_contextual_replay_loop() as loop:
+        assert loop.run_until_complete(asyncio.sleep(0, result="ok")) == "ok"
+        with pytest.raises(RuntimeError, match="network access is disabled"):
+            run_multiseed.socket.create_connection(("127.0.0.1", 9), timeout=0.01)
