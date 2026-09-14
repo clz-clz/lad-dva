@@ -281,6 +281,72 @@ def test_contextual_cache_allows_explicitly_compatible_producer_with_new_request
     )
 
 
+def test_reduced_profile_reuses_only_verified_prefix_of_complete_source_cell(tmp_path):
+    config = run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"]
+    source_rows = [
+        {"tokens": [f"token-{index}"], "dirty_tags": ["O"], "ner_tags": ["O"]}
+        for index in range(200)
+    ]
+    source_records = []
+    for index, row in enumerate(source_rows):
+        record = _record(index, run_multiseed._provider_input_digest(row))
+        record["provider_metadata"]["coder"] = [
+            _evidence("coder", "live") for _ in (1, 2, 5)
+        ]
+        source_records.append(record)
+    source_tag = "qwen32b-contextual-nothink-v1"
+    target_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    source_cell = run_multiseed._provider_cache_cell_path(
+        tmp_path, source_tag, "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    source_manifest = run_multiseed._provider_cache_manifest(
+        source_rows, config, dataset="msra", noise="BT", seed=13,
+        git_sha="d" * 40, bundle_hash="b" * 64, enable_thinking=False,
+    )
+    source_sha = official_provider_cache.write_provider_cell(
+        source_cell, source_records, source_manifest,
+    )
+    run_multiseed._update_provider_cache_index(
+        tmp_path, source_tag,
+        key=run_multiseed._provider_cache_cell_key(
+            "selectdenoise_contextual_lattice", "msra", "BT", 13,
+        ),
+        cell={"path": str(source_cell), "sha256": source_sha, "row_count": 200,
+              "git_sha": "d" * 40, "model_revision": _REVISION,
+              "provider_fingerprint": "e" * 64},
+    )
+    target_rows = source_rows[:100]
+    target_manifest = run_multiseed._provider_cache_manifest(
+        target_rows, config, dataset="msra", noise="BT", seed=13,
+        git_sha="f" * 40, bundle_hash="b" * 64, enable_thinking=False,
+    )
+    identity = {
+        "timeout_seconds": 600.0, "provider": "vllm", "model": _MODEL,
+        "served_model": _SERVED_MODEL, "revision": _REVISION,
+        "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False, "thinking_mode": "nothink",
+    }
+
+    cell = run_multiseed._reuse_provider_cache_prefix(
+        cache_root=tmp_path, source_tag=source_tag, target_tag=target_tag,
+        config_name="selectdenoise_contextual_lattice", dataset="msra", noise="BT",
+        seed=13, rows=target_rows, target_manifest=target_manifest,
+        provider_identity=identity,
+    )
+
+    assert cell["row_count"] == 100
+    target_path = Path(cell["path"])
+    assert official_provider_cache.read_provider_cell(target_path, cell["sha256"], 100)
+    derived_manifest = run_multiseed._read_provider_cache_manifest(target_path)
+    assert derived_manifest["derived_from"] == {
+        "cache_tag": source_tag,
+        "sha256": source_sha,
+        "source_row_count": 200,
+        "selected_rows": [0, 100],
+    }
+    assert official_provider_cache.read_provider_cell(source_cell, source_sha, 200)
+
+
 def test_contextual_replay_phase_parses_an_explicit_cache_tag_and_root(tmp_path):
     args = run_multiseed._parse_args([
         "--phase", "contextual-replay",

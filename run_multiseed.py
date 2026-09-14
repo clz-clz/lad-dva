@@ -73,6 +73,8 @@ MAX_CONCURRENCY = 200     # high throughput for LLM API calls
 PER_REQUEST_TIMEOUT = 180  # legacy outer deadline; failure policy controls the outcome
 OFFICIAL_REQUEST_TIMEOUT = 3600.0
 OFFICIAL_SAMPLE_SIZE = 200
+OFFICIAL_REDUCED_SAMPLE_SIZE = 100
+OFFICIAL_REDUCED_SEEDS = [13]
 PAID_SMOKE_SIZE = 20
 OFFICIAL_NOISE_RATIO = 0.15
 # The live provider cap for the confirmed Stage-A execution profile.  Keep
@@ -796,6 +798,30 @@ def _load_noisy(p: Path) -> List[dict]:
     return rows
 
 
+def _load_official_source_rows(dataset: str, noise: str, seed: int,
+                               size: int, ratio: float = OFFICIAL_NOISE_RATIO) -> List[dict]:
+    """Load an official cell, using the canonical N200 prefix for the reduced profile."""
+    if size == OFFICIAL_SAMPLE_SIZE:
+        source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, ratio)
+        rows = _load_noisy(source_path)
+        if len(rows) != OFFICIAL_SAMPLE_SIZE:
+            raise RuntimeError(
+                f"official noisy source must contain exactly {OFFICIAL_SAMPLE_SIZE} records: {source_path}"
+            )
+        return rows
+    if size == OFFICIAL_REDUCED_SAMPLE_SIZE:
+        source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, ratio)
+        rows = _load_noisy(source_path)
+        if len(rows) != OFFICIAL_SAMPLE_SIZE:
+            raise RuntimeError(
+                f"reduced official profile requires canonical N{OFFICIAL_SAMPLE_SIZE} source: {source_path}"
+            )
+        return rows[:OFFICIAL_REDUCED_SAMPLE_SIZE]
+    raise ValueError(
+        f"official source size must be {OFFICIAL_REDUCED_SAMPLE_SIZE} or {OFFICIAL_SAMPLE_SIZE}"
+    )
+
+
 def _supports_candidate_evidence(config_name: str, config: dict) -> bool:
     if config.get("terminal_graph") == "lad-rg":
         return True
@@ -971,16 +997,23 @@ def _validate_contextual_replay_launch(config_names: Sequence[str], *, size: int
                                       seeds: Sequence[int] | None = None) -> None:
     if dummy or failure_policy != "abort":
         raise ValueError("contextual-replay phase requires real offline replay and failure-policy abort")
-    if size != OFFICIAL_SAMPLE_SIZE or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
-        raise ValueError("contextual-replay phase requires size 200 and ratio 0.15")
+    if (size not in (OFFICIAL_REDUCED_SAMPLE_SIZE, OFFICIAL_SAMPLE_SIZE)
+            or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12):
+        raise ValueError(
+            f"contextual-replay phase requires size {OFFICIAL_REDUCED_SAMPLE_SIZE} or "
+            f"{OFFICIAL_SAMPLE_SIZE} and ratio 0.15"
+        )
     if list(config_names) != ["selectdenoise_contextual_lattice"]:
         raise ValueError("contextual-replay phase requires exactly the contextual-lattice config")
     if max_concurrency <= 0:
         raise ValueError("contextual-replay phase requires positive max-concurrency")
+    expected_seeds = (
+        OFFICIAL_REDUCED_SEEDS if size == OFFICIAL_REDUCED_SAMPLE_SIZE else SEEDS
+    )
     for name, actual, expected in (
         ("datasets", datasets, DATASETS),
         ("noise_types", noise_types, NOISE_TYPES),
-        ("seeds", seeds, SEEDS),
+        ("seeds", seeds, expected_seeds),
     ):
         if actual is not None and list(actual) != list(expected):
             raise ValueError(f"contextual-replay phase requires canonical {name}: {list(expected)}")
@@ -1162,8 +1195,12 @@ def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | 
                                     seeds: Sequence[int] | None = None) -> None:
     if dummy or failure_policy != "abort":
         raise ValueError("provider-cache phase requires real requests and failure-policy abort")
-    if size != OFFICIAL_SAMPLE_SIZE or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
-        raise ValueError("provider-cache phase requires size 200 and ratio 0.15")
+    if (size not in (OFFICIAL_REDUCED_SAMPLE_SIZE, OFFICIAL_SAMPLE_SIZE)
+            or len(ratios) != 1 or abs(ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12):
+        raise ValueError(
+            f"provider-cache phase requires size {OFFICIAL_REDUCED_SAMPLE_SIZE} or "
+            f"{OFFICIAL_SAMPLE_SIZE} and ratio 0.15"
+        )
     if max_concurrency != OFFICIAL_PROVIDER_MAX_CONCURRENCY:
         raise ValueError(
             "provider-cache phase requires "
@@ -1171,13 +1208,98 @@ def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | 
         )
     if list(config_names) != ["selectdenoise_contextual_lattice"]:
         raise ValueError("provider-cache phase requires exactly the contextual-lattice config")
+    expected_seeds = (
+        OFFICIAL_REDUCED_SEEDS if size == OFFICIAL_REDUCED_SAMPLE_SIZE else SEEDS
+    )
     for name, actual, expected in (
         ("datasets", datasets, DATASETS),
         ("noise_types", noise_types, NOISE_TYPES),
-        ("seeds", seeds, SEEDS),
+        ("seeds", seeds, expected_seeds),
     ):
         if actual is not None and list(actual) != list(expected):
             raise ValueError(f"provider-cache phase requires canonical {name}: {list(expected)}")
+
+
+def _reuse_provider_cache_prefix(
+    *,
+    cache_root: Path,
+    source_tag: str,
+    target_tag: str,
+    config_name: str,
+    dataset: str,
+    noise: str,
+    seed: int,
+    rows: Sequence[Mapping[str, Any]],
+    target_manifest: Mapping[str, Any],
+    provider_identity: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Materialize a verified prefix of a complete N200 provider cell."""
+    if source_tag == target_tag:
+        raise ValueError("provider-cache reuse source and target tags must differ")
+    source_path = _provider_cache_cell_path(
+        cache_root, source_tag, config_name, dataset, noise, seed,
+    )
+    if (not source_path.exists()
+            or not _provider_cache_index_path(cache_root, source_tag).exists()):
+        return None
+    source_index = _read_provider_cache_index_cell(
+        cache_root, source_tag, _provider_cache_cell_key(config_name, dataset, noise, seed),
+    )
+    if (Path(str(source_index["path"])).resolve() != source_path.resolve()
+            or source_index["row_count"] != OFFICIAL_SAMPLE_SIZE
+            or source_index["model_revision"] != QWEN_REVISION
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", str(source_index["git_sha"]))
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", str(source_index["provider_fingerprint"]))):
+        raise ValueError("provider-cache reuse source is not a complete N200 cell")
+    source_records = read_provider_cell(
+        source_path, str(source_index["sha256"]), OFFICIAL_SAMPLE_SIZE,
+    )
+    source_manifest = _read_provider_cache_manifest(source_path)
+    if (str(source_index["git_sha"]).lower() != str(source_manifest["git_sha"]).lower()
+            or source_index["model_revision"] != source_manifest["model_revision"]):
+        raise ValueError("provider-cache reuse source index provenance mismatch")
+    source_prefix = source_records[:len(rows)]
+    derived_manifest = dict(source_manifest)
+    derived_manifest["source_digests"] = {
+        str(index): _provider_input_digest(row)
+        for index, row in enumerate(rows)
+    }
+    derived_manifest["derived_from"] = {
+        "cache_tag": source_tag,
+        "sha256": str(source_index["sha256"]).lower(),
+        "source_row_count": OFFICIAL_SAMPLE_SIZE,
+        "selected_rows": [0, len(rows)],
+    }
+    _validate_replay_cache_identity(
+        derived_manifest,
+        target_manifest,
+        compatible_git_shas=[str(source_manifest["git_sha"])],
+    )
+    for index, (source_record, row) in enumerate(zip(source_prefix, rows)):
+        if (source_record.get("row_index") != index
+                or source_record.get("input_digest") != _provider_input_digest(row)):
+            raise ValueError(f"provider-cache reuse input mismatch at row {index}")
+        _validate_contextual_provider_evidence(
+            source_record["provider_metadata"], provider_identity, noise,
+        )
+    target_path = _provider_cache_cell_path(
+        cache_root, target_tag, config_name, dataset, noise, seed,
+    )
+    digest = write_provider_cell(target_path, source_prefix, derived_manifest)
+    cell = {
+        "path": str(target_path),
+        "sha256": digest,
+        "row_count": len(source_prefix),
+        "git_sha": derived_manifest["git_sha"],
+        "model_revision": QWEN_REVISION,
+        "provider_fingerprint": source_index["provider_fingerprint"],
+    }
+    _update_provider_cache_index(
+        cache_root, target_tag,
+        key=_provider_cache_cell_key(config_name, dataset, noise, seed),
+        cell=cell,
+    )
+    return cell
 
 
 async def _run_provider_cache_cell(
@@ -1185,6 +1307,7 @@ async def _run_provider_cache_cell(
     size: int, pipelines, *, cache_root: Path, cache_tag: str, max_concurrency: int,
     request_timeout: float, adapter_factory: Callable[[], Any], git_sha: str,
     bundle_hash: str, compatible_git_shas: Sequence[str] = (),
+    reuse_cache_tag: Optional[str] = None,
 ) -> dict[str, Any]:
     """Execute only the provider graph and atomically publish one gold-free cell."""
     _validate_provider_cache_launch([config_name], size=size, ratios=[OFFICIAL_NOISE_RATIO],
@@ -1195,12 +1318,14 @@ async def _run_provider_cache_cell(
         raise ValueError("provider-cache requires a 40-hex git SHA")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
         raise ValueError("provider-cache requires a 64-hex bundle hash")
-    noisy_path = _noisy_path(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
-    if not noisy_path.exists():
-        raise FileNotFoundError(f"official noisy file not found: {noisy_path}")
-    rows = _load_noisy(noisy_path)
-    if len(rows) != OFFICIAL_SAMPLE_SIZE:
-        raise RuntimeError("provider-cache cells require exactly 200 noisy rows")
+    if reuse_cache_tag is not None and size != OFFICIAL_REDUCED_SAMPLE_SIZE:
+        raise ValueError("provider-cache reuse is only supported for the reduced 100-row profile")
+    source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO)
+    if not source_path.exists():
+        raise FileNotFoundError(f"official noisy file not found: {source_path}")
+    rows = _load_official_source_rows(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
+    if len(rows) != size:
+        raise RuntimeError(f"provider-cache cell requires exactly {size} noisy rows")
     cell_path = _provider_cache_cell_path(cache_root, cache_tag, config_name, dataset, noise, seed)
     key = _provider_cache_cell_key(config_name, dataset, noise, seed)
     adapter = adapter_factory()
@@ -1238,14 +1363,23 @@ async def _run_provider_cache_cell(
             manifest,
             compatible_git_shas=compatible_git_shas,
         )
-        if (indexed["path"] != str(cell_path) or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
+        if (indexed["path"] != str(cell_path) or indexed["row_count"] != len(rows)
                 or indexed["git_sha"] != cached_manifest["git_sha"]
                 or indexed["model_revision"] != cached_manifest["model_revision"]):
             raise ValueError("provider-cache index identity mismatch; refusing resume")
-        cached = read_provider_cell(cell_path, indexed["sha256"], OFFICIAL_SAMPLE_SIZE)
+        cached = read_provider_cell(cell_path, indexed["sha256"], len(rows))
         for record in cached:
             _validate_contextual_provider_evidence(record["provider_metadata"], identity, noise)
         return dict(indexed)
+
+    if reuse_cache_tag is not None:
+        reused = _reuse_provider_cache_prefix(
+            cache_root=cache_root, source_tag=reuse_cache_tag, target_tag=cache_tag,
+            config_name=config_name, dataset=dataset, noise=noise, seed=seed,
+            rows=rows, target_manifest=manifest, provider_identity=identity,
+        )
+        if reused is not None:
+            return reused
 
     default_fn, _baseline_fns = pipelines
     sem = asyncio.Semaphore(max_concurrency)
@@ -1362,12 +1496,12 @@ async def _run_contextual_replay_cell(
         raise ValueError("contextual-replay requires a 40-hex Git SHA")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
         raise ValueError("contextual-replay requires a 64-hex bundle hash")
-    noisy_path = _noisy_path(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
-    if not noisy_path.exists():
-        raise FileNotFoundError(f"official noisy file not found: {noisy_path}")
-    source_rows = _load_noisy(noisy_path)
-    if len(source_rows) != OFFICIAL_SAMPLE_SIZE:
-        raise RuntimeError("contextual-replay cells require exactly 200 noisy rows")
+    source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO)
+    if not source_path.exists():
+        raise FileNotFoundError(f"official noisy file not found: {source_path}")
+    source_rows = _load_official_source_rows(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
+    if len(source_rows) != size:
+        raise RuntimeError(f"contextual-replay cell requires exactly {size} noisy rows")
     config = CONFIGURATIONS["selectdenoise_contextual_lattice"]
     expected_manifest = _provider_cache_manifest(
         source_rows, config, dataset=dataset, noise=noise, seed=seed,
@@ -1380,12 +1514,12 @@ async def _run_contextual_replay_cell(
         cache_root, cache_tag, "selectdenoise_contextual_lattice", dataset, noise, seed,
     )
     if (Path(str(indexed["path"])).resolve() != expected_cell_path.resolve()
-            or indexed["row_count"] != OFFICIAL_SAMPLE_SIZE
+            or indexed["row_count"] != len(source_rows)
             or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["sha256"]))
             or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["provider_fingerprint"]))):
         raise ValueError("contextual-replay cache index identity mismatch")
     cell_path = expected_cell_path
-    cached_rows = read_provider_cell(cell_path, str(indexed["sha256"]), OFFICIAL_SAMPLE_SIZE)
+    cached_rows = read_provider_cell(cell_path, str(indexed["sha256"]), len(source_rows))
     cached_manifest = _read_provider_cache_manifest(cell_path)
     _validate_replay_cache_identity(
         cached_manifest,
@@ -1414,6 +1548,7 @@ async def _run_contextual_replay_cell(
     if pred_path.exists() and pred_path.stat().st_size > 0:
         _validate_contextual_replay_prediction(
             pred_path, dataset, noise, cache_sha256,
+            expected_count=len(source_rows),
             enable_thinking=enable_thinking,
         )
         return pred_path
@@ -1822,6 +1957,10 @@ def _parse_args(argv=None):
     ap.add_argument("--provider-cache-tag", default=None,
                     help="Immutable provider-cache namespace for staged runs.")
     ap.add_argument(
+        "--reuse-provider-cache-tag", default=None,
+        help="Optional complete provider-cache tag from which the reduced N100 prefix may be derived.",
+    )
+    ap.add_argument(
         "--compatible-provider-cache-git-sha",
         action="append",
         default=[],
@@ -1918,6 +2057,12 @@ def main(argv=None):
         )
         if not isinstance(args.bundle_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", args.bundle_hash):
             raise ValueError("provider-cache phase requires --bundle-hash with 64 hexadecimal characters")
+        if args.reuse_provider_cache_tag is not None:
+            if args.size != OFFICIAL_REDUCED_SAMPLE_SIZE:
+                raise ValueError("provider-cache reuse requires the reduced size 100 profile")
+            if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.reuse_provider_cache_tag)
+                    or "nothink" not in args.reuse_provider_cache_tag.lower()):
+                raise ValueError("provider-cache reuse requires a valid no-thinking source tag")
 
     official_settings = None
     adapter_factory = None
@@ -1926,8 +2071,8 @@ def main(argv=None):
             raise ValueError("--official cannot be combined with --dummy")
         if args.failure_policy != "abort":
             raise ValueError("official mode does not permit dirty fallback")
-        if args.size != OFFICIAL_SAMPLE_SIZE:
-            raise ValueError("official mode requires --size 200")
+        if args.phase == "end-to-end" and args.size != OFFICIAL_SAMPLE_SIZE:
+            raise ValueError("official end-to-end mode requires --size 200")
         if len(args.ratios) != 1 or abs(args.ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
             raise ValueError("official mode requires exactly --ratios 0.15")
         official_settings, BACKBONE_TAG = _official_settings_from_env(args.configs, os.environ)
@@ -1980,6 +2125,7 @@ def main(argv=None):
                             adapter_factory=adapter_factory, git_sha=git_sha,
                             bundle_hash=args.bundle_hash,
                             compatible_git_shas=args.compatible_provider_cache_git_sha,
+                            reuse_cache_tag=args.reuse_provider_cache_tag,
                         ))
                         n_done += 1
             return

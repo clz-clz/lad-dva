@@ -331,7 +331,57 @@ def test_provider_cache_phase_rejects_partial_canonical_matrix(field, value):
         )
 
 
-def test_provider_cache_does_not_create_historical_prediction_manifest(tmp_path, monkeypatch):
+def test_reduced_stage_a_profile_accepts_only_seed13_and_100_rows():
+    common = {
+        "datasets": run_multiseed.DATASETS,
+        "noise_types": run_multiseed.NOISE_TYPES,
+        "seeds": [13],
+    }
+    run_multiseed._validate_provider_cache_launch(
+        ["selectdenoise_contextual_lattice"], size=100, ratios=[0.15],
+        max_concurrency=32, failure_policy="abort", dummy=False, **common,
+    )
+    with pytest.raises(ValueError, match=r"seeds.*\[13\]"):
+        run_multiseed._validate_provider_cache_launch(
+            ["selectdenoise_contextual_lattice"], size=100, ratios=[0.15],
+            max_concurrency=32, failure_policy="abort", dummy=False,
+            datasets=run_multiseed.DATASETS,
+            noise_types=run_multiseed.NOISE_TYPES,
+            seeds=[42],
+        )
+    with pytest.raises(ValueError, match="size 100 or 200"):
+        run_multiseed._validate_provider_cache_launch(
+            ["selectdenoise_contextual_lattice"], size=101, ratios=[0.15],
+            max_concurrency=32, failure_policy="abort", dummy=False, **common,
+        )
+
+
+def test_reduced_source_loader_uses_only_canonical_n200_prefix(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", tmp_path)
+    source = tmp_path / "noisy_seed13__BT__msra__N200.jsonl"
+    _write_noisy(source, count=200)
+
+    rows = run_multiseed._load_official_source_rows("msra", "BT", 13, 100)
+
+    assert len(rows) == 100
+    assert not (tmp_path / "noisy_seed13__BT__msra__N100.jsonl").exists()
+
+
+def test_cli_exposes_explicit_provider_cache_reuse_source():
+    args = run_multiseed._parse_args([
+        "--phase", "provider-cache",
+        "--reuse-provider-cache-tag", "qwen32b-contextual-nothink-v1",
+    ])
+    assert args.reuse_provider_cache_tag == "qwen32b-contextual-nothink-v1"
+
+
+@pytest.mark.parametrize(
+    ("size", "seeds", "expected_cells"),
+    [(200, [13, 42, 2024], 45), (100, [13], 15)],
+)
+def test_provider_cache_does_not_create_historical_prediction_manifest(
+    tmp_path, monkeypatch, size, seeds, expected_cells,
+):
     monkeypatch.setenv("BACKBONE_PROVIDER", "vllm")
     monkeypatch.setenv("BACKBONE_MODEL", "Qwen/Qwen3-32B-AWQ")
     monkeypatch.setenv("BACKBONE_BASE_URL", "http://127.0.0.1:8000/v1")
@@ -357,12 +407,14 @@ def test_provider_cache_does_not_create_historical_prediction_manifest(tmp_path,
     monkeypatch.setattr(run_multiseed, "_run_provider_cache_cell", fake_cell)
 
     run_multiseed.main([
-        "--phase", "provider-cache", "--official", "--size", "200",
+        "--phase", "provider-cache", "--official", "--size", str(size),
+        "--seeds", *[str(seed) for seed in seeds],
         "--max-concurrency", "32", "--bundle-hash", "b" * 64,
         "--provider-cache-root", str(tmp_path / "cache"),
     ])
 
-    assert len(calls) == 45
+    assert len(calls) == expected_cells
+    assert all(call[0][5] == size for call in calls)
     assert not list((tmp_path / "predictions").glob("run_manifest__*.json"))
 
 
