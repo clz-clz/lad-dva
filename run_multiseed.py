@@ -1620,6 +1620,7 @@ async def _run_contextual_replay_cell(
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
         _validate_contextual_replay_prediction(
             tmp_path, dataset, noise, cache_sha256,
+            expected_count=len(source_rows),
             enable_thinking=enable_thinking,
         )
         tmp_path.replace(pred_path)

@@ -697,3 +697,50 @@ def test_offline_replay_precreates_windows_event_loop_before_blocking_network():
         assert loop.run_until_complete(asyncio.sleep(0, result="ok")) == "ok"
         with pytest.raises(RuntimeError, match="network access is disabled"):
             run_multiseed.socket.create_connection(("127.0.0.1", 9), timeout=0.01)
+
+
+def test_reduced_replay_validates_new_prediction_with_requested_size(monkeypatch, tmp_path):
+    source = [{"tokens": ["x"], "dirty_tags": ["O"], "ner_tags": ["O"]}
+              for _ in range(100)]
+    cached = [{"input_digest": run_multiseed._provider_input_digest(row),
+               "provider_metadata": {}} for row in source]
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_text("present", encoding="utf-8")
+    cell_path = tmp_path / "cell.jsonl"
+    cell_path.write_text("present", encoding="utf-8")
+    expected_manifest = {"git_sha": "a" * 40, "model_revision": _REVISION}
+    monkeypatch.setattr(run_multiseed, "_validate_contextual_replay_launch", lambda *a, **k: None)
+    monkeypatch.setattr(run_multiseed, "_noisy_path", lambda *a, **k: source_path)
+    monkeypatch.setattr(run_multiseed, "_load_official_source_rows", lambda *a, **k: source)
+    monkeypatch.setattr(run_multiseed, "_provider_cache_manifest", lambda *a, **k: expected_manifest)
+    monkeypatch.setattr(run_multiseed, "_provider_cache_cell_path", lambda *a, **k: cell_path)
+    monkeypatch.setattr(run_multiseed, "_read_provider_cache_index_cell", lambda *a, **k: {
+        "path": str(cell_path), "row_count": 100, "sha256": "b" * 64,
+        "provider_fingerprint": "c" * 64, "git_sha": "a" * 40,
+        "model_revision": _REVISION,
+    })
+    monkeypatch.setattr(run_multiseed, "read_provider_cell", lambda *a, **k: cached)
+    monkeypatch.setattr(run_multiseed, "_read_provider_cache_manifest", lambda *a, **k: expected_manifest)
+    monkeypatch.setattr(run_multiseed, "_validate_replay_cache_identity", lambda *a, **k: None)
+    monkeypatch.setattr(run_multiseed, "_validate_replay_source_rows", lambda *a, **k: None)
+    monkeypatch.setattr(run_multiseed, "_validate_contextual_provider_evidence", lambda *a, **k: None)
+    observed = []
+    monkeypatch.setattr(
+        run_multiseed, "_validate_contextual_replay_prediction",
+        lambda *a, **k: observed.append(k.get("expected_count")),
+    )
+
+    def replay(**_kwargs):
+        return {
+            "pred_tags": ["O"], "terminal_anchor_tags": ["O"],
+            "terminal_model_hash": "d" * 64, "terminal_used_anchor": False,
+            "terminal_predicted_gain": 0.0, "terminal_fallback_count": 0,
+        }
+
+    asyncio.run(run_multiseed._run_contextual_replay_cell(
+        "msra", "BT", 13, 100, cache_root=tmp_path, cache_tag="nothink-test",
+        bundle_hash="e" * 64, git_sha="a" * 40, replay_fn=replay,
+        terminal=object(), max_concurrency=32, prediction_path=tmp_path / "pred.jsonl",
+        enable_thinking=False,
+    ))
+    assert observed == [100]
