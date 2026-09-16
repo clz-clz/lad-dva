@@ -347,6 +347,415 @@ def test_reduced_profile_reuses_only_verified_prefix_of_complete_source_cell(tmp
     assert official_provider_cache.read_provider_cell(source_cell, source_sha, 200)
 
 
+def _write_reduced_source_for_full_continuation(
+    cache_root, rows, *, source_tag="qwen32b-contextual-nothink-s13-n100-v1",
+    bundle_hash="b" * 64, enable_thinking=False,
+):
+    config = run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"]
+    source_rows = rows[:100]
+    records = []
+    for index, row in enumerate(source_rows):
+        record = _record(index, run_multiseed._provider_input_digest(row))
+        record["provider_metadata"]["coder"] = [
+            _evidence("coder", "live") for _ in range(3)
+        ]
+        if enable_thinking:
+            for stage_records in record["provider_metadata"].values():
+                for evidence in stage_records:
+                    evidence["enable_thinking"] = True
+                    evidence["thinking_mode"] = "thinking"
+        records.append(record)
+    source_manifest = run_multiseed._provider_cache_manifest(
+        source_rows, config, dataset="msra", noise="BT", seed=13,
+        git_sha="d" * 40, bundle_hash=bundle_hash,
+        enable_thinking=enable_thinking,
+    )
+    source_manifest["request_limits"] = {
+        "provider_timeout_seconds": 300.0,
+        "runner_timeout_seconds": 3600.0,
+        "max_concurrency": 20,
+    }
+    source_cell = run_multiseed._provider_cache_cell_path(
+        cache_root, source_tag, "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    source_sha = official_provider_cache.write_provider_cell(
+        source_cell, records, source_manifest,
+    )
+    run_multiseed._update_provider_cache_index(
+        cache_root, source_tag,
+        key=run_multiseed._provider_cache_cell_key(
+            "selectdenoise_contextual_lattice", "msra", "BT", 13,
+        ),
+        cell={"path": str(source_cell), "sha256": source_sha, "row_count": 100,
+              "git_sha": "d" * 40, "model_revision": _REVISION,
+              "provider_fingerprint": "e" * 64},
+    )
+    return source_cell, source_sha, records
+
+
+def _continuation_adapter():
+    class Adapter:
+        def provider_metadata(self):
+            return {
+                "timeout_seconds": 600.0, "provider": "vllm", "model": _MODEL,
+                "served_model": _SERVED_MODEL, "revision": _REVISION,
+                "structured_api": "chat-completions-json-schema",
+                "enable_thinking": False, "thinking_mode": "nothink",
+            }
+
+        def structured_requester(self, stage, payload):
+            return {}
+
+    return Adapter()
+
+
+def _full_continuation_rows(tmp_path, monkeypatch):
+    noisy_dir = tmp_path / "noisy"
+    noisy_dir.mkdir()
+    monkeypatch.setattr(run_multiseed, "NOISY_DIR", noisy_dir)
+    rows = [
+        {"tokens": [f"token-{index}", "x"], "dirty_tags": ["O", "O"],
+         "ner_tags": ["O", "O"]}
+        for index in range(200)
+    ]
+    run_multiseed._noisy_path("msra", "BT", 13, 200, 0.15).write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+    return rows
+
+
+def test_full_profile_continues_verified_n100_prefix_and_requests_only_suffix(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    source_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    target_tag = "qwen32b-contextual-nothink-v1"
+    _source_cell, source_sha, source_records = _write_reduced_source_for_full_continuation(
+        cache_root, rows, source_tag=source_tag,
+    )
+    source_index_path = run_multiseed._provider_cache_index_path(cache_root, source_tag)
+    source_index = json.loads(source_index_path.read_text(encoding="utf-8"))
+    source_key = run_multiseed._provider_cache_cell_key(
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    source_index["cells"][source_key]["path"] = str(
+        Path("C:/previous-worktree/provider_cache") / source_tag
+        / Path(_source_cell).name
+    )
+    source_index_path.write_text(json.dumps(source_index), encoding="utf-8")
+    requested = []
+
+    async def suffix_pipeline(tokens, dirty_tags, config, dataset_name=None):
+        requested.append(int(tokens[0].split("-")[1]))
+        return {
+            "pred_tags": list(dirty_tags),
+            "candidate_paths": [list(dirty_tags)] * 3,
+            "rag_weights": [1.0, 1.0, 1.0],
+            "confidence": [1.0] * len(tokens),
+            "provider_metadata": {
+                "coder": [_evidence("coder", "live") for _ in range(3)],
+                "reviewer": [_evidence("reviewer", "skipped_identical")],
+                "verifier": [_evidence("verifier", "skipped_uncontested")],
+            },
+            "fallback_used": False,
+        }
+
+    cell = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, 200, (suffix_pipeline, {}),
+        cache_root=cache_root, cache_tag=target_tag, max_concurrency=32,
+        request_timeout=7200, adapter_factory=_continuation_adapter,
+        git_sha="a" * 40, bundle_hash="b" * 64,
+        reuse_cache_tag=source_tag,
+        compatible_git_shas=("d" * 40,),
+    ))
+
+    assert sorted(requested) == list(range(100, 200))
+    assert cell["row_count"] == 200
+    target = Path(cell["path"])
+    combined = official_provider_cache.read_provider_cell(target, cell["sha256"], 200)
+    assert combined[:100] == source_records
+    manifest = run_multiseed._read_provider_cache_manifest(target)
+    assert manifest["git_sha"] == "a" * 40
+    assert manifest["request_limits"] == {
+        "provider_timeout_seconds": 600.0,
+        "runner_timeout_seconds": 7200,
+        "max_concurrency": 32,
+    }
+    assert manifest["derived_from"] == {
+        "cache_tag": source_tag,
+        "sha256": source_sha,
+        "source_row_count": 100,
+        "selected_rows": [0, 100],
+        "producer_git_sha": "d" * 40,
+    }
+
+    requested.clear()
+    target_index_path = run_multiseed._provider_cache_index_path(cache_root, target_tag)
+    target_index = json.loads(target_index_path.read_text(encoding="utf-8"))
+    target_key = run_multiseed._provider_cache_cell_key(
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    target_index["cells"][target_key]["path"] = str(
+        Path("C:/previous-worktree/provider_cache") / target_tag / target.name
+    )
+    target_index_path.write_text(json.dumps(target_index), encoding="utf-8")
+
+    async def must_not_run(*_args, **_kwargs):
+        pytest.fail("a verified existing N200 target cell must make zero requests")
+
+    resumed = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, 200, (must_not_run, {}),
+        cache_root=cache_root, cache_tag=target_tag, max_concurrency=32,
+        request_timeout=7200, adapter_factory=_continuation_adapter,
+        git_sha="a" * 40, bundle_hash="b" * 64,
+        reuse_cache_tag=source_tag,
+        compatible_git_shas=("d" * 40,),
+    ))
+    assert resumed["path"] == str(target)
+    assert resumed["sha256"] == cell["sha256"]
+    assert requested == []
+
+
+@pytest.mark.parametrize("mismatch", ["thinking", "bundle", "input", "sha"])
+def test_full_profile_reuse_rejects_mismatch_or_tamper_without_publishing(
+    tmp_path, monkeypatch, mismatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    source_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    source_rows = list(rows)
+    if mismatch == "input":
+        source_rows[0] = {
+            "tokens": ["different", "x"], "dirty_tags": ["O", "O"],
+            "ner_tags": ["O", "O"],
+        }
+    source_cell, _sha, _records = _write_reduced_source_for_full_continuation(
+        cache_root, source_rows, source_tag=source_tag,
+        bundle_hash=("c" * 64 if mismatch == "bundle" else "b" * 64),
+        enable_thinking=mismatch == "thinking",
+    )
+    if mismatch == "sha":
+        source_cell.write_bytes(source_cell.read_bytes() + b"\n")
+
+    async def must_not_run(*_args, **_kwargs):
+        pytest.fail("invalid reuse must fail before provider requests")
+
+    with pytest.raises(ValueError):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (must_not_run, {}),
+            cache_root=cache_root, cache_tag="qwen32b-contextual-nothink-v1",
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64, reuse_cache_tag=source_tag,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+    target = run_multiseed._provider_cache_cell_path(
+        cache_root, "qwen32b-contextual-nothink-v1",
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    assert not target.exists()
+    assert not target.with_suffix(target.suffix + ".tmp").exists()
+
+
+def test_full_profile_suffix_failure_leaves_no_target_or_temporary_cache(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    source_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    _write_reduced_source_for_full_continuation(cache_root, rows, source_tag=source_tag)
+
+    async def fail_suffix(*_args, **_kwargs):
+        raise RuntimeError("suffix failed")
+
+    with pytest.raises(RuntimeError, match="suffix failed"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (fail_suffix, {}),
+            cache_root=cache_root, cache_tag="qwen32b-contextual-nothink-v1",
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64, reuse_cache_tag=source_tag,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+    target = run_multiseed._provider_cache_cell_path(
+        cache_root, "qwen32b-contextual-nothink-v1",
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    assert not target.exists()
+    assert not target.with_suffix(target.suffix + ".tmp").exists()
+    assert not run_multiseed._provider_cache_index_path(
+        cache_root, "qwen32b-contextual-nothink-v1",
+    ).exists()
+
+
+def test_full_profile_missing_source_cell_runs_normally_even_when_source_index_exists(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    source_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    _write_reduced_source_for_full_continuation(cache_root, rows, source_tag=source_tag)
+    target_manifest = run_multiseed._provider_cache_manifest(
+        rows, run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        dataset="msra", noise="BT", seed=42, git_sha="a" * 40,
+        bundle_hash="b" * 64, enable_thinking=False,
+    )
+
+    result = run_multiseed._load_provider_cache_continuation_prefix(
+        cache_root=cache_root, source_tag=source_tag,
+        target_tag="qwen32b-contextual-nothink-v1",
+        config_name="selectdenoise_contextual_lattice", dataset="msra",
+        noise="BT", seed=42, rows=rows, target_manifest=target_manifest,
+        provider_identity=_continuation_adapter().provider_metadata(),
+    )
+
+    assert result is None
+
+
+def test_formal_full_profile_rejects_missing_seed13_prefix_before_requests(
+    tmp_path, monkeypatch,
+):
+    _full_continuation_rows(tmp_path, monkeypatch)
+
+    async def must_not_run(*_args, **_kwargs):
+        pytest.fail("missing approved seed13 prefix must fail before paid requests")
+
+    with pytest.raises(ValueError, match="seed13.*prefix"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (must_not_run, {}),
+            cache_root=tmp_path / "cache",
+            cache_tag=run_multiseed.QWEN_FORMAL_CACHE_TAG,
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64,
+            reuse_cache_tag=run_multiseed.QWEN_REDUCED_CACHE_TAG,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+
+def test_formal_full_profile_rejects_unapproved_prefix_producer(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    _write_reduced_source_for_full_continuation(
+        cache_root, rows, source_tag=run_multiseed.QWEN_REDUCED_CACHE_TAG,
+    )
+
+    async def must_not_run(*_args, **_kwargs):
+        pytest.fail("unapproved source producer must fail before paid requests")
+
+    with pytest.raises(ValueError, match="producer Git SHA"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (must_not_run, {}),
+            cache_root=cache_root,
+            cache_tag=run_multiseed.QWEN_FORMAL_CACHE_TAG,
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64,
+            reuse_cache_tag=run_multiseed.QWEN_REDUCED_CACHE_TAG,
+            compatible_git_shas=("e" * 40,),
+        ))
+
+
+def test_formal_full_profile_cleans_published_cell_when_index_update_fails(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    _write_reduced_source_for_full_continuation(
+        cache_root, rows, source_tag=run_multiseed.QWEN_REDUCED_CACHE_TAG,
+    )
+
+    async def suffix_pipeline(tokens, dirty_tags, config, dataset_name=None):
+        return {
+            "pred_tags": list(dirty_tags),
+            "candidate_paths": [list(dirty_tags)] * 3,
+            "rag_weights": [1.0, 1.0, 1.0],
+            "confidence": [1.0] * len(tokens),
+            "provider_metadata": {
+                "coder": [_evidence("coder", "live") for _ in range(3)],
+                "reviewer": [_evidence("reviewer", "skipped_identical")],
+                "verifier": [_evidence("verifier", "skipped_uncontested")],
+            },
+            "fallback_used": False,
+        }
+
+    original_update = run_multiseed._update_provider_cache_index
+
+    def fail_target_index(root, tag, **kwargs):
+        if tag == run_multiseed.QWEN_FORMAL_CACHE_TAG:
+            raise OSError("index publish failed")
+        return original_update(root, tag, **kwargs)
+
+    monkeypatch.setattr(run_multiseed, "_update_provider_cache_index", fail_target_index)
+    with pytest.raises(OSError, match="index publish failed"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (suffix_pipeline, {}),
+            cache_root=cache_root,
+            cache_tag=run_multiseed.QWEN_FORMAL_CACHE_TAG,
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64,
+            reuse_cache_tag=run_multiseed.QWEN_REDUCED_CACHE_TAG,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+    target = run_multiseed._provider_cache_cell_path(
+        cache_root, run_multiseed.QWEN_FORMAL_CACHE_TAG,
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    assert not target.exists()
+    assert not target.with_suffix(target.suffix + ".tmp").exists()
+    assert not run_multiseed._provider_cache_index_path(
+        cache_root, run_multiseed.QWEN_FORMAL_CACHE_TAG,
+    ).exists()
+
+
+def test_formal_full_profile_rejects_timeout_drift_before_requests(
+    tmp_path, monkeypatch,
+):
+    _full_continuation_rows(tmp_path, monkeypatch)
+    adapter = _continuation_adapter()
+    adapter.provider_metadata = lambda: {
+        **_continuation_adapter().provider_metadata(), "timeout_seconds": 300.0,
+    }
+
+    async def must_not_run(*_args, **_kwargs):
+        pytest.fail("timeout drift must fail before provider requests")
+
+    with pytest.raises(ValueError, match="600"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (must_not_run, {}),
+            cache_root=tmp_path / "cache",
+            cache_tag=run_multiseed.QWEN_FORMAL_CACHE_TAG,
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=lambda: adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64,
+            reuse_cache_tag=run_multiseed.QWEN_REDUCED_CACHE_TAG,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+
 def test_contextual_replay_phase_parses_an_explicit_cache_tag_and_root(tmp_path):
     args = run_multiseed._parse_args([
         "--phase", "contextual-replay",

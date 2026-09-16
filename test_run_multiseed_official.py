@@ -836,6 +836,26 @@ def test_qwen_nothink_environment_is_bound_to_manifest_and_requires_fresh_tag():
         )
 
 
+def test_formal_qwen_continuation_requires_exact_provider_timeout():
+    environment = _env()
+    environment.update({
+        "QWEN_ENABLE_THINKING": "false",
+        "BACKBONE_TAG": run_multiseed.QWEN_FORMAL_CACHE_TAG,
+        "BACKBONE_REVISION": CONTEXTUAL_REVISION,
+    })
+    with pytest.raises(ValueError, match="600"):
+        run_multiseed._official_settings_from_env(
+            ["selectdenoise_contextual_lattice"], environment,
+        )
+
+    environment["QWEN_PROVIDER_TIMEOUT_SECONDS"] = "600"
+    settings, tag = run_multiseed._official_settings_from_env(
+        ["selectdenoise_contextual_lattice"], environment,
+    )
+    assert tag == run_multiseed.QWEN_FORMAL_CACHE_TAG
+    assert settings.timeout_seconds == 600.0
+
+
 def test_manifest_is_canonical_sanitized_and_required_for_resume(tmp_path):
     settings = LiveBackboneSettings(
         provider="vllm", model="Qwen/Qwen3-32B-AWQ",

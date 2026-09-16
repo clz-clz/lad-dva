@@ -1,4 +1,6 @@
 import math
+import hashlib
+import json
 import subprocess
 import time
 
@@ -200,3 +202,64 @@ def test_report_failure_cannot_mask_launch_error(tmp_path, monkeypatch):
                        '--billing-basis','conservative-estimate','--report',str(tmp_path / 'budget.json'),
                        '--','--phase','provider-cache'])
     assert caught.value is original
+
+
+def test_continuation_ledger_chains_old_sha_and_never_restores_full_balance(tmp_path):
+    old_path = tmp_path / 'old-ledger.json'
+    old, _ = executor._open_budget_ledger(
+        old_path, total=110, spent=20, hourly_rate=5.59,
+        reserve_factor=1.25, billing_basis='conservative-estimate',
+    )
+    old['reported_spent_yuan'] = 54.25
+    executor._atomic_json_write(old_path, old)
+    old_bytes = old_path.read_bytes()
+    old_sha = hashlib.sha256(old_bytes).hexdigest()
+
+    continuation_path = tmp_path / 'continuation-ledger.json'
+    ledger, seconds = executor._open_budget_ledger(
+        continuation_path, total=110, spent=55.0, hourly_rate=5.59,
+        reserve_factor=1.25, billing_basis='conservative-estimate',
+        previous_ledger=old_path,
+    )
+
+    assert old_path.read_bytes() == old_bytes
+    assert ledger['initial_spent_yuan'] == 55.0
+    assert ledger['reported_spent_yuan'] == 55.0
+    assert ledger['continuation'] == {
+        'previous_ledger_sha256': old_sha,
+        'previous_reported_spent_yuan': 54.25,
+    }
+    assert seconds == executor.remaining_seconds(110, 55.0, 5.59, 1.25)
+    assert seconds < executor.remaining_seconds(110, 0, 5.59, 1.25)
+
+    with pytest.raises(ValueError, match='lower cumulative spent'):
+        executor._open_budget_ledger(
+            tmp_path / 'invalid-continuation.json', total=110, spent=54.0,
+            hourly_rate=5.59, reserve_factor=1.25,
+            billing_basis='conservative-estimate', previous_ledger=old_path,
+        )
+    assert not (tmp_path / 'invalid-continuation.json').exists()
+
+
+def test_existing_continuation_rejects_a_different_predecessor(tmp_path):
+    old_path = tmp_path / 'old-ledger.json'
+    executor._open_budget_ledger(
+        old_path, total=110, spent=20, hourly_rate=5.59,
+        reserve_factor=1.25, billing_basis='conservative-estimate',
+    )
+    continuation_path = tmp_path / 'continuation-ledger.json'
+    executor._open_budget_ledger(
+        continuation_path, total=110, spent=21, hourly_rate=5.59,
+        reserve_factor=1.25, billing_basis='conservative-estimate',
+        previous_ledger=old_path,
+    )
+    tampered = json.loads(old_path.read_text(encoding='utf-8'))
+    tampered['reported_spent_yuan'] = 20.5
+    executor._atomic_json_write(old_path, tampered)
+
+    with pytest.raises(ValueError, match='predecessor'):
+        executor._open_budget_ledger(
+            continuation_path, total=110, spent=21, hourly_rate=5.59,
+            reserve_factor=1.25, billing_basis='conservative-estimate',
+            previous_ledger=old_path,
+        )

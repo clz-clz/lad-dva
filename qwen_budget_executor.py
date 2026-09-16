@@ -5,6 +5,7 @@ launch time, including earlier hosts, diagnostics, idle time, and reruns.
 """
 import argparse
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -84,8 +85,37 @@ def _ledger_deadline_seconds(ledger):
     return seconds
 
 
+def _previous_ledger_link(path, *, total, hourly_rate, reserve_factor,
+                          billing_basis):
+    previous_path = Path(path)
+    try:
+        content = previous_path.read_bytes()
+        previous = json.loads(content.decode('utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError('previous budget ledger is unreadable') from exc
+    if not isinstance(previous, dict) or previous.get('schema') != LEDGER_SCHEMA:
+        raise ValueError('previous budget ledger schema is invalid')
+    expected = {
+        'total_yuan': total,
+        'hourly_rate_yuan': hourly_rate,
+        'reserve_factor': reserve_factor,
+        'billing_basis': billing_basis,
+    }
+    if any(previous.get(key) != value for key, value in expected.items()):
+        raise ValueError('previous budget ledger does not match this continuation')
+    previous_spent = previous.get('reported_spent_yuan')
+    if (type(previous_spent) not in (int, float)
+            or not math.isfinite(previous_spent) or previous_spent < 0
+            or previous_spent >= total):
+        raise ValueError('previous budget ledger spend is invalid')
+    return {
+        'previous_ledger_sha256': hashlib.sha256(content).hexdigest(),
+        'previous_reported_spent_yuan': float(previous_spent),
+    }
+
+
 def _open_budget_ledger(path, *, total, spent, hourly_rate, reserve_factor,
-                        billing_basis):
+                        billing_basis, previous_ledger=None):
     """Create or resume one cumulative budget deadline across all phases."""
     if (not all(math.isfinite(value) for value in
                  (total, spent, hourly_rate, reserve_factor))
@@ -93,6 +123,19 @@ def _open_budget_ledger(path, *, total, spent, hourly_rate, reserve_factor,
             or reserve_factor < 1):
         raise ValueError('invalid or exhausted rental budget')
     path = Path(path)
+    continuation = None
+    if previous_ledger is not None:
+        previous_path = Path(previous_ledger)
+        if previous_path.resolve() == path.resolve():
+            raise ValueError('continuation ledger must not overwrite its predecessor')
+        continuation = _previous_ledger_link(
+            previous_path, total=total, hourly_rate=hourly_rate,
+            reserve_factor=reserve_factor, billing_basis=billing_basis,
+        )
+        if spent < continuation['previous_reported_spent_yuan']:
+            raise ValueError(
+                'budget ledger rejects a lower cumulative spent value than its predecessor'
+            )
     if path.exists():
         try:
             ledger = json.loads(path.read_text(encoding='utf-8'))
@@ -100,6 +143,11 @@ def _open_budget_ledger(path, *, total, spent, hourly_rate, reserve_factor,
             raise ValueError('budget ledger is unreadable') from exc
         if not isinstance(ledger, dict) or ledger.get('schema') != LEDGER_SCHEMA:
             raise ValueError('budget ledger schema is invalid')
+        recorded_continuation = ledger.get('continuation')
+        if continuation is None and recorded_continuation is not None:
+            raise ValueError('continuation ledger requires its predecessor')
+        if continuation is not None and recorded_continuation != continuation:
+            raise ValueError('continuation ledger predecessor does not match')
         expected = {
             'total_yuan': total,
             'hourly_rate_yuan': hourly_rate,
@@ -137,6 +185,8 @@ def _open_budget_ledger(path, *, total, spent, hourly_rate, reserve_factor,
         'deadline_at': (started + timedelta(seconds=seconds)).isoformat(),
         'phases': [],
     }
+    if continuation is not None:
+        ledger['continuation'] = continuation
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with path.open('x', encoding='utf-8') as handle:
@@ -145,6 +195,7 @@ def _open_budget_ledger(path, *, total, spent, hourly_rate, reserve_factor,
         return _open_budget_ledger(
             path, total=total, spent=spent, hourly_rate=hourly_rate,
             reserve_factor=reserve_factor, billing_basis=billing_basis,
+            previous_ledger=previous_ledger,
         )
     return ledger, seconds
 
@@ -176,17 +227,22 @@ def main(argv=None):
     parser.add_argument('--report', type=Path, required=True)
     parser.add_argument('--ledger', type=Path, default=None,
                         help='Shared cumulative ledger for diagnosis, smoke, and reruns.')
+    parser.add_argument('--previous-ledger', type=Path, default=None,
+                        help='Immutable predecessor ledger for a budget continuation.')
     parser.add_argument('--runner-script', type=Path, default=None,
                         help='Python runner to execute; defaults to run_multiseed.py.')
     parser.add_argument('runner_args', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     ledger = None
     ledger_seconds = None
+    if args.previous_ledger is not None and args.ledger is None:
+        parser.error('--previous-ledger requires --ledger')
     if args.ledger is not None:
         ledger, ledger_seconds = _open_budget_ledger(
             args.ledger, total=args.total_yuan, spent=args.spent_yuan,
             hourly_rate=args.hourly_rate_yuan, reserve_factor=args.reserve_factor,
             billing_basis=args.billing_basis,
+            previous_ledger=args.previous_ledger,
         )
     seconds = ledger_seconds if ledger_seconds is not None else remaining_seconds(
         args.total_yuan, args.spent_yuan, args.hourly_rate_yuan, args.reserve_factor

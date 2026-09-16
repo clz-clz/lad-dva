@@ -1,6 +1,8 @@
 # Claude / IDE internals
 .agents/
 .claude/
+.planning/
+.pytest-tmp/
 CLAUDE.md
 STRATEGY.md
 skills-lock.json

@@ -87,6 +87,8 @@ OFFICIAL_MANIFEST_SCHEMA = "lad-rg-official-run-v2"
 # contextual-replay phase; legacy/end-to-end execution remains unchanged.
 OFFICIAL_PROVIDER_CACHE_SCHEMA = PROVIDER_CACHE_SCHEMA
 OFFICIAL_QWEN_MODEL = "Qwen/Qwen3-32B-AWQ"
+QWEN_FORMAL_CACHE_TAG = "qwen32b-contextual-nothink-v1"
+QWEN_REDUCED_CACHE_TAG = "qwen32b-contextual-nothink-s13-n100-v1"
 PROVIDER_CACHE_DIR = Path("provider_cache")
 PROVIDER_CACHE_INDEX_SCHEMA = "selectdenoise-contextual-provider-cache-index-v1"
 CONTEXTUAL_REPLAY_PHASE = "contextual-replay"
@@ -287,6 +289,13 @@ def _official_settings_from_env(config_names: list[str], environment: Mapping[st
                     for name in config_names)
             and "nothink" not in tag.lower()):
         raise ValueError("QWEN_ENABLE_THINKING=false requires a fresh BACKBONE_TAG containing 'nothink'")
+    if (tag == QWEN_FORMAL_CACHE_TAG
+            and any(_official_profile(CONFIGURATIONS[name]) == "contextual-lattice"
+                    for name in config_names)
+            and settings.timeout_seconds != 600.0):
+        raise ValueError(
+            "the formal Qwen continuation requires QWEN_PROVIDER_TIMEOUT_SECONDS=600"
+        )
     return settings, tag
 
 
@@ -871,6 +880,20 @@ def _provider_cache_index_path(root: Path, tag: str) -> Path:
     return Path(root) / tag / "index.json"
 
 
+def _provider_cache_index_path_matches(indexed_path: Any, actual_path: Path) -> bool:
+    """Accept a SHA-verified cache cell copied with its immutable index."""
+    if not isinstance(indexed_path, str) or not indexed_path:
+        return False
+    indexed = Path(indexed_path)
+    actual = Path(actual_path)
+    if indexed.resolve() == actual.resolve():
+        return True
+    # Relocation changes only the cache root. The tag directory and canonical
+    # filename remain fixed, while the actual file is selected from the
+    # caller's root and is still verified against the indexed SHA.
+    return indexed.name == actual.name and indexed.parent.name == actual.parent.name
+
+
 def _provider_cache_cell_key(config_name: str, dataset: str, noise: str, seed: int) -> str:
     return f"{config_name}__{dataset}__{noise}__seed{seed}"
 
@@ -1190,7 +1213,8 @@ def _validate_contextual_replay_prediction(
                 or model_hash != LOCKED_DECODER_MODEL_HASH
                 or not isinstance(used_anchor, bool)
                 or isinstance(gain, bool) or not isinstance(gain, (int, float)) or not math.isfinite(float(gain))
-                or isinstance(fallback_count, bool) or not isinstance(fallback_count, int) or fallback_count < 0
+                or isinstance(fallback_count, bool) or not isinstance(fallback_count, int)
+                or fallback_count != 0
                 or row.get("provider_cache_sha256") != expected_sha256
                 or row.get("fallback_used") is not False
                 or not isinstance(row.get("provider_metadata"), Mapping)):
@@ -1256,7 +1280,7 @@ def _reuse_provider_cache_prefix(
     source_index = _read_provider_cache_index_cell(
         cache_root, source_tag, _provider_cache_cell_key(config_name, dataset, noise, seed),
     )
-    if (Path(str(source_index["path"])).resolve() != source_path.resolve()
+    if (not _provider_cache_index_path_matches(source_index["path"], source_path)
             or source_index["row_count"] != OFFICIAL_SAMPLE_SIZE
             or source_index["model_revision"] != QWEN_REVISION
             or not re.fullmatch(r"[0-9a-fA-F]{40}", str(source_index["git_sha"]))
@@ -1313,6 +1337,109 @@ def _reuse_provider_cache_prefix(
     return cell
 
 
+def _load_provider_cache_continuation_prefix(
+    *,
+    cache_root: Path,
+    source_tag: str,
+    target_tag: str,
+    config_name: str,
+    dataset: str,
+    noise: str,
+    seed: int,
+    rows: Sequence[Mapping[str, Any]],
+    target_manifest: Mapping[str, Any],
+    provider_identity: Mapping[str, Any],
+    compatible_git_shas: Sequence[str] = (),
+) -> Optional[tuple[list[dict[str, Any]], dict[str, Any]]]:
+    """Load a verified N100 prefix for an otherwise unpublished N200 cell."""
+    if source_tag == target_tag:
+        raise ValueError("provider-cache reuse source and target tags must differ")
+    if len(rows) != OFFICIAL_SAMPLE_SIZE:
+        raise ValueError("provider-cache continuation requires the full N200 profile")
+    is_formal = target_tag == QWEN_FORMAL_CACHE_TAG
+    if is_formal and source_tag != QWEN_REDUCED_CACHE_TAG:
+        raise ValueError(
+            f"formal Qwen continuation requires source tag {QWEN_REDUCED_CACHE_TAG}"
+        )
+    source_path = _provider_cache_cell_path(
+        cache_root, source_tag, config_name, dataset, noise, seed,
+    )
+    source_index_path = _provider_cache_index_path(cache_root, source_tag)
+    key = _provider_cache_cell_key(config_name, dataset, noise, seed)
+    if not source_path.exists():
+        if not source_index_path.exists():
+            if is_formal and seed == 13:
+                raise ValueError("formal Qwen seed13 continuation requires an approved N100 prefix")
+            return None
+        try:
+            raw_index = json.loads(source_index_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("provider-cache continuation source index is malformed") from exc
+        source_cells = raw_index.get("cells") if isinstance(raw_index, Mapping) else None
+        if (not isinstance(source_cells, Mapping)
+                or raw_index.get("schema") != PROVIDER_CACHE_INDEX_SCHEMA):
+            raise ValueError("provider-cache continuation source index is malformed")
+        if key in source_cells:
+            raise ValueError("provider-cache continuation source is incomplete")
+        if is_formal and seed == 13:
+            raise ValueError("formal Qwen seed13 continuation requires an approved N100 prefix")
+        return None
+    if not source_index_path.exists():
+        raise ValueError("provider-cache continuation source is incomplete")
+    source_index = _read_provider_cache_index_cell(cache_root, source_tag, key)
+    if (not _provider_cache_index_path_matches(source_index["path"], source_path)
+            or source_index["row_count"] != OFFICIAL_REDUCED_SAMPLE_SIZE
+            or source_index["model_revision"] != QWEN_REVISION
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", str(source_index["git_sha"]))
+            or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", str(source_index["provider_fingerprint"])
+            )):
+        raise ValueError("provider-cache continuation source is not a complete N100 cell")
+    source_records = read_provider_cell(
+        source_path, str(source_index["sha256"]), OFFICIAL_REDUCED_SAMPLE_SIZE,
+    )
+    source_manifest = _read_provider_cache_manifest(source_path)
+    if (str(source_index["git_sha"]).lower()
+            != str(source_manifest.get("git_sha", "")).lower()
+            or source_index["model_revision"] != source_manifest.get("model_revision")):
+        raise ValueError("provider-cache continuation source index provenance mismatch")
+    allowed_source_producers = set()
+    for value in compatible_git_shas:
+        normalized = str(value).lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", normalized):
+            raise ValueError("provider-cache compatible git_sha is invalid")
+        allowed_source_producers.add(normalized)
+    source_producer = str(source_manifest.get("git_sha", "")).lower()
+    if is_formal and source_producer not in allowed_source_producers:
+        raise ValueError("provider-cache continuation source producer Git SHA is not approved")
+    for field in ("schema", "model_revision", "bundle_hash", "configuration"):
+        if source_manifest.get(field) != target_manifest.get(field):
+            raise ValueError(
+                f"provider-cache continuation {field} identity mismatch"
+            )
+    source_digests = source_manifest.get("source_digests")
+    if not isinstance(source_digests, Mapping):
+        raise ValueError("provider-cache continuation source digests are malformed")
+    for index, (source_record, row) in enumerate(
+            zip(source_records, rows[:OFFICIAL_REDUCED_SAMPLE_SIZE])):
+        expected_digest = _provider_input_digest(row)
+        if (source_digests.get(str(index)) != expected_digest
+                or source_record.get("row_index") != index
+                or source_record.get("input_digest") != expected_digest):
+            raise ValueError(f"provider-cache continuation input mismatch at row {index}")
+        _validate_contextual_provider_evidence(
+            source_record["provider_metadata"], provider_identity, noise,
+        )
+    provenance = {
+        "cache_tag": source_tag,
+        "sha256": str(source_index["sha256"]).lower(),
+        "source_row_count": OFFICIAL_REDUCED_SAMPLE_SIZE,
+        "selected_rows": [0, OFFICIAL_REDUCED_SAMPLE_SIZE],
+        "producer_git_sha": str(source_manifest["git_sha"]).lower(),
+    }
+    return source_records, provenance
+
+
 async def _run_provider_cache_cell(
     config_name: str, config: Mapping[str, Any], dataset: str, noise: str, seed: int,
     size: int, pipelines, *, cache_root: Path, cache_tag: str, max_concurrency: int,
@@ -1329,8 +1456,9 @@ async def _run_provider_cache_cell(
         raise ValueError("provider-cache requires a 40-hex git SHA")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
         raise ValueError("provider-cache requires a 64-hex bundle hash")
-    if reuse_cache_tag is not None and size != OFFICIAL_REDUCED_SAMPLE_SIZE:
-        raise ValueError("provider-cache reuse is only supported for the reduced 100-row profile")
+    if reuse_cache_tag is not None and size not in (
+            OFFICIAL_REDUCED_SAMPLE_SIZE, OFFICIAL_SAMPLE_SIZE):
+        raise ValueError("provider-cache reuse requires the N100 or N200 profile")
     source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO)
     if not source_path.exists():
         raise FileNotFoundError(f"official noisy file not found: {source_path}")
@@ -1355,6 +1483,18 @@ async def _run_provider_cache_cell(
         raise RuntimeError("provider-cache adapter identity has an invalid thinking-mode binding")
     if not enable_thinking and "nothink" not in cache_tag.lower():
         raise ValueError("no-thinking provider caches require a fresh tag containing 'nothink'")
+    is_formal_full = cache_tag == QWEN_FORMAL_CACHE_TAG and size == OFFICIAL_SAMPLE_SIZE
+    if is_formal_full:
+        if identity.get("timeout_seconds") != 600.0:
+            raise ValueError("formal Qwen provider cache requires a 600 second provider timeout")
+        if request_timeout != 7200.0:
+            raise ValueError("formal Qwen provider cache requires a 7200 second runner timeout")
+        if enable_thinking is not False:
+            raise ValueError("formal Qwen provider cache requires enable_thinking=false")
+        if reuse_cache_tag != QWEN_REDUCED_CACHE_TAG:
+            raise ValueError(
+                f"formal Qwen provider cache requires --reuse-provider-cache-tag {QWEN_REDUCED_CACHE_TAG}"
+            )
     manifest = _provider_cache_manifest(
         rows, config, dataset=dataset, noise=noise, seed=seed,
         git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower(),
@@ -1374,23 +1514,37 @@ async def _run_provider_cache_cell(
             manifest,
             compatible_git_shas=compatible_git_shas,
         )
-        if (indexed["path"] != str(cell_path) or indexed["row_count"] != len(rows)
+        if (not _provider_cache_index_path_matches(indexed["path"], cell_path)
+                or indexed["row_count"] != len(rows)
                 or indexed["git_sha"] != cached_manifest["git_sha"]
                 or indexed["model_revision"] != cached_manifest["model_revision"]):
             raise ValueError("provider-cache index identity mismatch; refusing resume")
         cached = read_provider_cell(cell_path, indexed["sha256"], len(rows))
         for record in cached:
             _validate_contextual_provider_evidence(record["provider_metadata"], identity, noise)
-        return dict(indexed)
+        return {**dict(indexed), "path": str(cell_path)}
 
+    continuation_prefix: list[dict[str, Any]] = []
     if reuse_cache_tag is not None:
-        reused = _reuse_provider_cache_prefix(
-            cache_root=cache_root, source_tag=reuse_cache_tag, target_tag=cache_tag,
-            config_name=config_name, dataset=dataset, noise=noise, seed=seed,
-            rows=rows, target_manifest=manifest, provider_identity=identity,
-        )
-        if reused is not None:
-            return reused
+        if size == OFFICIAL_REDUCED_SAMPLE_SIZE:
+            reused = _reuse_provider_cache_prefix(
+                cache_root=cache_root, source_tag=reuse_cache_tag, target_tag=cache_tag,
+                config_name=config_name, dataset=dataset, noise=noise, seed=seed,
+                rows=rows, target_manifest=manifest, provider_identity=identity,
+            )
+            if reused is not None:
+                return reused
+        else:
+            continuation = _load_provider_cache_continuation_prefix(
+                cache_root=cache_root, source_tag=reuse_cache_tag,
+                target_tag=cache_tag, config_name=config_name, dataset=dataset,
+                noise=noise, seed=seed, rows=rows, target_manifest=manifest,
+                provider_identity=identity,
+                compatible_git_shas=compatible_git_shas,
+            )
+            if continuation is not None:
+                continuation_prefix, provenance = continuation
+                manifest["derived_from"] = provenance
 
     default_fn, _baseline_fns = pipelines
     sem = asyncio.Semaphore(max_concurrency)
@@ -1437,6 +1591,7 @@ async def _run_provider_cache_cell(
             provider_sem.release()
 
     cached: list[Optional[dict[str, Any]]] = [None] * len(rows)
+    cached[:len(continuation_prefix)] = continuation_prefix
     provider_config = dict(config)
     provider_config["preterminal_only"] = True
 
@@ -1463,7 +1618,11 @@ async def _run_provider_cache_cell(
                              "rag_weights": result.get("rag_weights"), "confidence": result.get("confidence"),
                              "provider_metadata": evidence, "fallback_used": result.get("fallback_used")}
 
-    tasks = [asyncio.create_task(process(index, row)) for index, row in enumerate(rows)]
+    tasks = [
+        asyncio.create_task(process(index, row))
+        for index, row in enumerate(rows)
+        if index >= len(continuation_prefix)
+    ]
     try:
         await asyncio.gather(*tasks)
         if any(record is None for record in cached):
@@ -1482,7 +1641,12 @@ async def _run_provider_cache_cell(
     cell = {"path": str(cell_path), "sha256": digest, "row_count": len(cached),
             "git_sha": manifest["git_sha"], "model_revision": QWEN_REVISION,
             "provider_fingerprint": fingerprint}
-    _update_provider_cache_index(cache_root, cache_tag, key=key, cell=cell)
+    try:
+        _update_provider_cache_index(cache_root, cache_tag, key=key, cell=cell)
+    except BaseException:
+        cell_path.unlink(missing_ok=True)
+        cell_path.with_suffix(cell_path.suffix + ".tmp").unlink(missing_ok=True)
+        raise
     return cell
 
 
@@ -1524,7 +1688,7 @@ async def _run_contextual_replay_cell(
     expected_cell_path = _provider_cache_cell_path(
         cache_root, cache_tag, "selectdenoise_contextual_lattice", dataset, noise, seed,
     )
-    if (Path(str(indexed["path"])).resolve() != expected_cell_path.resolve()
+    if (not _provider_cache_index_path_matches(indexed["path"], expected_cell_path)
             or indexed["row_count"] != len(source_rows)
             or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["sha256"]))
             or not re.fullmatch(r"[0-9a-fA-F]{64}", str(indexed["provider_fingerprint"]))):
@@ -1970,7 +2134,8 @@ def _parse_args(argv=None):
                     help="Immutable provider-cache namespace for staged runs.")
     ap.add_argument(
         "--reuse-provider-cache-tag", default=None,
-        help="Optional complete provider-cache tag from which the reduced N100 prefix may be derived.",
+        help=("Optional provider-cache tag: derive N100 from a complete N200 cell, "
+              "or continue a missing N200 cell from a complete N100 prefix."),
     )
     ap.add_argument(
         "--compatible-provider-cache-git-sha",
@@ -2070,8 +2235,8 @@ def main(argv=None):
         if not isinstance(args.bundle_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", args.bundle_hash):
             raise ValueError("provider-cache phase requires --bundle-hash with 64 hexadecimal characters")
         if args.reuse_provider_cache_tag is not None:
-            if args.size != OFFICIAL_REDUCED_SAMPLE_SIZE:
-                raise ValueError("provider-cache reuse requires the reduced size 100 profile")
+            if args.size not in (OFFICIAL_REDUCED_SAMPLE_SIZE, OFFICIAL_SAMPLE_SIZE):
+                raise ValueError("provider-cache reuse requires size 100 or 200")
             if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.reuse_provider_cache_tag)
                     or "nothink" not in args.reuse_provider_cache_tag.lower()):
                 raise ValueError("provider-cache reuse requires a valid no-thinking source tag")
@@ -2088,6 +2253,13 @@ def main(argv=None):
         if len(args.ratios) != 1 or abs(args.ratios[0] - OFFICIAL_NOISE_RATIO) >= 1e-12:
             raise ValueError("official mode requires exactly --ratios 0.15")
         official_settings, BACKBONE_TAG = _official_settings_from_env(args.configs, os.environ)
+        if (args.phase == "provider-cache" and args.size == OFFICIAL_SAMPLE_SIZE
+                and BACKBONE_TAG == QWEN_FORMAL_CACHE_TAG
+                and args.reuse_provider_cache_tag != QWEN_REDUCED_CACHE_TAG):
+            raise ValueError(
+                f"formal Qwen continuation requires --reuse-provider-cache-tag "
+                f"{QWEN_REDUCED_CACHE_TAG}"
+            )
         _configure_official_request_model(official_settings)
         git_sha = subprocess.run(
             ["git", "rev-parse", "HEAD"], check=True, text=True,

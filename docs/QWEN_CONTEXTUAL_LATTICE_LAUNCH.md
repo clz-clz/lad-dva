@@ -94,10 +94,11 @@ Use the mandated interpreter from the experiment host:
 
 ```powershell
 D:/py/Anaconda3/python.exe -m pytest -q
-D:/py/Anaconda3/python.exe -m py_compile official_provider_cache.py live_backbone.py multi_agent_v2.py run_multiseed.py official_preflight.py official_smoke.py
+D:/py/Anaconda3/python.exe -m py_compile official_provider_cache.py live_backbone.py multi_agent_v2.py run_multiseed.py official_preflight.py official_smoke.py qwen_budget_executor.py qwen_full_audit.py
 D:/py/Anaconda3/python.exe official_preflight.py static `
   --repo-root . --expected-sha $env:EXPECTED_GIT_SHA `
-  --configs selectdenoise_contextual_lattice
+  --configs selectdenoise_contextual_lattice `
+  --request-timeout 7200
 git diff --check
 ```
 
@@ -137,13 +138,14 @@ when moving to a cloned instance. Verify the service key against `/v1/models`;
 an SSH password change does not imply a service-key change. Do not run the
 same experiment concurrently on the old and replacement instances.
 
-For the formal no-thinking Qwen run, use
-`QWEN_PROVIDER_TIMEOUT_SECONDS=300` and `--request-timeout 3600`. Retain the
+For the formal no-thinking Qwen continuation, use
+`QWEN_PROVIDER_TIMEOUT_SECONDS=600` and `--request-timeout 7200`. Retain the
 32-request provider cap and at most two SDK retries. Provider timeout, runner
-timeout, and effective thinking mode are recorded in the cache manifest;
-different identities cannot resume the same cache. The runner's budget
-executor uses one shared ledger across diagnosis, smoke, and reruns, so a
-later phase cannot reacquire the full budget.
+timeout, and concurrency are recorded as provenance; they are not semantic
+cache conflicts. Model revision, no-thinking mode, contextual configuration,
+bundle hash, and every input digest remain strict identity checks. The runner's
+budget executor chains the new continuation ledger to the immutable old ledger
+SHA, so a later phase cannot reacquire the full budget.
 
 Set `QWEN_DIAGNOSTICS_DIR` to a **local Git-ignored directory** for opt-in
 evidence. Each logical request gets a UUID and SHA-256 payload digest; JSONL
@@ -163,42 +165,51 @@ available. Do not truncate outputs, skip samples, relax validation, add DFA,
 or mutate limits during a run. Preserve the first provider exception when
 aborting.
 
-Before restoring Stage A, require the real failing request, the fixed
-47-row smoke, and one complete 200-row cell to pass. Commit and push the
-verified code and choose a fresh formal tag; never copy diagnostic cells into
-the formal cache. Confirm cumulative cost and the replacement host's hourly
+Before restoring Stage A, require the fixed 47-row smoke to pass. Commit and
+push the verified code, then continue the original formal tag
+`qwen32b-contextual-nothink-v1`; never copy diagnostic cells into the formal
+cache. Confirm cumulative cost and the replacement host's hourly
 rate against the approved total budget, or label a conservative estimate
 explicitly. The executor must enforce a hard deadline derived from remaining
 budget, including diagnosis and reruns. Stopping requests does not itself
 stop instance rental billing.
 
-Stage A is the only paid phase. After the smoke and budget approval, set a
-fresh tag containing `nothink`, set the independent no-thinking profile, and
-run only `selectdenoise_contextual_lattice` with size 200,
+Stage A is the only paid phase. After the smoke and budget approval, set the
+original formal tag, set the independent no-thinking profile, and run only
+`selectdenoise_contextual_lattice` with size 200,
 ratio 0.15, max client concurrency 32, and failure policy `abort`:
 
 ```powershell
 $env:QWEN_ENABLE_THINKING = "false"
-$env:QWEN_PROVIDER_TIMEOUT_SECONDS = "300"
+$env:QWEN_PROVIDER_TIMEOUT_SECONDS = "600"
 $env:BACKBONE_TAG = "qwen32b-contextual-nothink-v1"
 
 D:/py/Anaconda3/python.exe qwen_budget_executor.py `
   --total-yuan 110 --spent-yuan $env:SPENT_YUAN `
   --hourly-rate-yuan $env:HOURLY_RATE_YUAN `
   --billing-basis $env:BILLING_BASIS `
-  --ledger "$env:QWEN_DIAGNOSTICS_DIR/budget-ledger.json" `
+  --ledger "$env:QWEN_DIAGNOSTICS_DIR/continuation-budget-ledger.json" `
+  --previous-ledger "$env:QWEN_DIAGNOSTICS_DIR/006-n100-budget-ledger.json" `
   --report "$env:QWEN_DIAGNOSTICS_DIR/budget-launch.json" -- `
   --official --phase provider-cache `
   --configs selectdenoise_contextual_lattice `
   --size 200 --ratios 0.15 --max-concurrency 32 `
+  --request-timeout 7200 `
   --bundle-hash $env:CONTEXTUAL_BUNDLE_HASH `
-  --provider-cache-root provider_cache
+  --provider-cache-root provider_cache `
+  --reuse-provider-cache-tag qwen32b-contextual-nothink-s13-n100-v1 `
+  --compatible-provider-cache-git-sha $env:EXISTING_FULL_PRODUCER_SHA `
+  --compatible-provider-cache-git-sha $env:REDUCED_PREFIX_PRODUCER_SHA
 ```
 
-The provider cache is immutable, gold-free, atomic, SHA-checked, and resumable
-only when its identity matches the manifest. Stop vLLM immediately after the
-provider-cache index is complete. Validate all 45 cache cells and exactly 200
-rows per cell before proceeding.
+The eight valid N200 cells in the target tag are verified and skipped without
+requests. For each other seed-13 cell, a valid N100 source prefix is held only
+in memory while rows 100–199 run; the target is published atomically only when
+all 200 rows pass. A missing seed-13 prefix is a hard pre-request failure;
+seed 42/2024 cells have no approved prefix and run all 200 rows. A source SHA,
+source tag, selected range, and source producer Git SHA are retained in the
+final manifest. Stop vLLM immediately after the provider-cache index is complete.
+Validate all 45 cache cells and exactly 200 rows per cell before proceeding.
 
 Stage B is local and must not receive provider credentials. It re-reads each
 canonical noisy row, checks the input digest and cache SHA, validates the
@@ -212,7 +223,8 @@ D:/py/Anaconda3/python.exe run_multiseed.py `
   --size 200 --ratios 0.15 `
   --provider-cache-root provider_cache `
   --provider-cache-tag $env:BACKBONE_TAG `
-  --bundle-hash $env:CONTEXTUAL_BUNDLE_HASH
+  --bundle-hash $env:CONTEXTUAL_BUNDLE_HASH `
+  --compatible-provider-cache-git-sha $env:EXISTING_FULL_PRODUCER_SHA
 ```
 
 The final prediction rows must retain the provider-cache SHA,
@@ -222,6 +234,32 @@ prediction cells with exactly 200 rows each before aggregation. Any digest,
 identity, bundle, ontology, length, IOB2, provenance, or fallback failure
 aborts the run. Do not pad, truncate, reorder, retry schemas, or fall back to
 another method in official mode.
+
+Aggregate only the formal method/tag, then run the exact full audit:
+
+```powershell
+$env:BACKBONE_TAG = "qwen32b-contextual-nothink-v1"
+D:/py/Anaconda3/python.exe aggregate_seeds.py `
+  --methods selectdenoise_contextual_lattice `
+  --reference selectdenoise_contextual_lattice
+
+D:/py/Anaconda3/python.exe qwen_full_audit.py `
+  --noisy-root results_multiseed `
+  --provider-cache-root provider_cache `
+  --predictions-root predictions_multiseed `
+  --bundle-hash $env:CONTEXTUAL_BUNDLE_HASH `
+  --producer-git-sha $env:EXPECTED_GIT_SHA `
+  --compatible-provider-cache-git-sha $env:EXISTING_FULL_PRODUCER_SHA `
+  --compatible-provider-cache-git-sha $env:REDUCED_PREFIX_PRODUCER_SHA `
+  --expected-existing-full-cells 8 --expected-prefix-cells 12
+```
+
+The audit fails unless the exact tagged 45-cell cache and prediction matrices
+contain 9,000 rows, every cache SHA/input digest/provider identity passes, all
+predictions match the ontology and strict IOB2, no fallback/temporary file or
+provider gold/credential field exists, reuse counts are exactly 8 and 12, and
+`aggregated__qwen32b-contextual-nothink-v1.json` is complete and newer than
+every prediction.
 
 Historical Qwen LAD-RG manifests, smokes, logit-gap outputs, and prediction
 files are historical evidence. This run writes a new tag and must not

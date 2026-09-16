@@ -1,0 +1,4 @@
+# Frozen runtime hashes are byte-level release evidence and require LF on Windows.
+selectdenoise_contextual_lattice.py text eol=lf
+contextual_lattice_runtime.py text eol=lf
+run_contextual_lattice_gate.py text eol=lf
