@@ -393,6 +393,22 @@ def test_official_contextual_evidence_rejects_live_records_without_usage():
         multi_agent_v2._validate_contextual_official_evidence(evidence)
 
 
+def test_official_contextual_evidence_allows_explicit_study_reviewer_disable_only():
+    evidence = {stage: [_record(stage)] for stage in ("coder", "reviewer", "verifier")}
+    disabled = _record("reviewer", "disabled")
+    disabled.update({
+        "response_model": None, "response_status": None,
+        "finish_reason": None, "usage": {},
+    })
+    evidence["reviewer"] = [disabled]
+
+    with pytest.raises(RuntimeError, match="status"):
+        multi_agent_v2._validate_contextual_official_evidence(evidence)
+    multi_agent_v2._validate_contextual_official_evidence(
+        evidence, allow_reviewer_disabled=True,
+    )
+
+
 @pytest.mark.parametrize(
     "stage, status",
     [("coder", "skipped"), ("reviewer", "failed"), ("verifier", "local")],
@@ -472,6 +488,35 @@ def test_contextual_replay_passes_only_the_locked_terminal_allowlist():
     assert "gold_tags" not in captured
     assert result["terminal_model_hash"] == MODEL_HASH
     assert result["terminal_fallback_count"] == 0
+
+
+def test_contextual_replay_supports_explicit_gate_margin_for_ablation():
+    from contextual_lattice_runtime import ContextualLatticeTerminal
+
+    captured = {}
+
+    class Decoder:
+        model_hash = MODEL_HASH
+        def decode(self, value, *, margin=None):
+            captured["margin"] = margin
+            return SimpleNamespace(
+                tags=value.anchor_tags, model_hash=MODEL_HASH,
+                used_anchor=False, predicted_gain=0.2,
+            )
+
+    terminal = ContextualLatticeTerminal(Decoder())
+
+    multi_agent_v2.run_contextual_lattice_replay(
+        tokens=["Acme"], dirty_tags=["B-ORG"],
+        provider_record={
+            "anchor_tags": ["B-ORG"], "candidate_paths": [["B-ORG"]],
+            "rag_weights": [1.0],
+        },
+        dataset_name="conll2003", terminal=terminal,
+        terminal_margin=-1.0e9,
+    )
+
+    assert captured["margin"] == -1.0e9
 
 
 def test_official_contextual_coder_reviewer_verifier_use_configured_nothink():

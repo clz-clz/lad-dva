@@ -3,6 +3,7 @@
 .claude/
 .planning/
 .pytest-tmp/
+.pytest-tmp*/
 CLAUDE.md
 STRATEGY.md
 skills-lock.json
@@ -19,6 +20,7 @@ __pycache__/
 predictions_multiseed/
 results_multiseed/
 provider_cache/
+contextual_studies/qwen32b-contextual-nothink-studies-v1/
 qwen_diagnostics/
 .qwen_diagnostics/
 

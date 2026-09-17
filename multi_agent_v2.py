@@ -319,7 +319,9 @@ def _with_stage_records(state: Mapping[str, Any], stage: str,
     return evidence
 
 
-def _validate_contextual_official_evidence(evidence: Mapping[str, Any]) -> None:
+def _validate_contextual_official_evidence(
+    evidence: Mapping[str, Any], *, allow_reviewer_disabled: bool = False,
+) -> None:
     """Reject unbound or incomplete provider evidence before cache publication."""
     if set(evidence) != set(_CONTEXTUAL_PROVIDER_STAGES):
         raise RuntimeError("official contextual pipeline is missing stage-separated evidence")
@@ -352,7 +354,10 @@ def _validate_contextual_official_evidence(evidence: Mapping[str, Any]) -> None:
                     raise RuntimeError("official contextual live evidence is incomplete")
             else:
                 allowed_skips = {
-                    "reviewer": {"skipped_identical"},
+                    "reviewer": (
+                        {"skipped_identical", "disabled"}
+                        if allow_reviewer_disabled else {"skipped_identical"}
+                    ),
                     "verifier": {"skipped_uncontested", "skipped_identical"},
                 }.get(stage, set())
                 if record.get("status") not in allowed_skips:
@@ -1074,6 +1079,41 @@ def _load_contextual_lattice_terminal():
         raise ContextualLatticeError("Contextual lattice bundle validation failed") from exc
 
 
+def _decode_contextual_terminal_with_margin(
+    terminal: Any, *, tokens: Sequence[str], dirty_tags: Sequence[str],
+    anchor_tags: Sequence[str], candidate_paths: Sequence[Sequence[str]],
+    reviewer_weights: Sequence[float], valid_types: frozenset[str],
+    deer_stats: Mapping[str, float], margin: float,
+) -> Any:
+    """Apply the study-only gate override without changing the locked runtime."""
+    from selectdenoise_contextual_lattice import ContextualLatticeInput
+
+    raw_paths = [tuple(path) for path in candidate_paths]
+    raw_weights = tuple(float(weight) for weight in reviewer_weights)
+    if raw_weights and len(raw_weights) != len(raw_paths):
+        raise ValueError("reviewer_weights must match candidate_paths or be empty")
+    legal_paths = []
+    legal_weights = []
+    for index, path in enumerate(raw_paths):
+        if len(path) != len(tokens):
+            continue
+        legal_paths.append(path)
+        if raw_weights:
+            legal_weights.append(raw_weights[index])
+    value = ContextualLatticeInput(
+        tokens=tuple(tokens), dirty_tags=tuple(dirty_tags),
+        anchor_tags=tuple(anchor_tags), candidate_paths=tuple(legal_paths),
+        reviewer_weights=tuple(legal_weights) if raw_weights else (),
+        valid_types=valid_types, deer_stats=dict(deer_stats),
+    )
+    lock = getattr(terminal, "_lock", None)
+    decoder = getattr(terminal, "decoder", None)
+    if lock is None or decoder is None:
+        raise ValueError("terminal does not expose the locked study decoder")
+    with lock:
+        return decoder.decode(value, margin=margin)
+
+
 def _apply_contextual_lattice_terminal(state: State, terminal):
     """Apply the terminal using only the allow-listed model-facing fields."""
     tokens = list(state.get("tokens", []))
@@ -1086,15 +1126,29 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
     dataset_name = state.get("dataset_name", "conll2003")
     valid_types = frozenset(DATASET_ENTITY_TYPES.get(dataset_name, DATASET_ENTITY_TYPES["conll2003"]))
     try:
-        result = terminal.decode(
-            tokens=tokens,
-            dirty_tags=dirty_tags,
-            anchor_tags=anchor_tags,
-            candidate_paths=candidate_paths,
-            reviewer_weights=reviewer_weights,
-            valid_types=valid_types,
-            deer_stats=terminal.sentence_deer_stats(tokens),
-        )
+        decode_kwargs = {
+            "tokens": tokens,
+            "dirty_tags": dirty_tags,
+            "anchor_tags": anchor_tags,
+            "candidate_paths": candidate_paths,
+            "reviewer_weights": reviewer_weights,
+            "valid_types": valid_types,
+            "deer_stats": terminal.sentence_deer_stats(tokens),
+        }
+        terminal_margin = state.get("terminal_margin")
+        if terminal_margin is not None:
+            if (isinstance(terminal_margin, bool)
+                    or not isinstance(terminal_margin, (int, float))
+                    or not math.isfinite(float(terminal_margin))):
+                raise ValueError("terminal margin override must be finite")
+            decode_kwargs["margin"] = float(terminal_margin)
+        if terminal_margin is None:
+            result = terminal.decode(**decode_kwargs)
+        else:
+            decode_kwargs.pop("margin", None)
+            result = _decode_contextual_terminal_with_margin(
+                terminal, margin=float(terminal_margin), **decode_kwargs,
+            )
     except Exception as exc:
         raise ContextualLatticeError("Contextual lattice sentence validation failed") from exc
     tags = list(result.tags)
@@ -1137,7 +1191,7 @@ def _apply_contextual_lattice_terminal(state: State, terminal):
 def run_contextual_lattice_replay(
     *, tokens: Sequence[str], dirty_tags: Sequence[str],
     provider_record: Mapping[str, Any], dataset_name: str,
-    terminal: Any = None,
+    terminal: Any = None, terminal_margin: Optional[float] = None,
 ) -> dict[str, Any]:
     """Decode one frozen provider-cache row without reopening the provider graph.
 
@@ -1214,6 +1268,12 @@ def run_contextual_lattice_replay(
         "dataset_name": dataset_name,
         "official": True,
     }
+    if terminal_margin is not None:
+        if (isinstance(terminal_margin, bool)
+                or not isinstance(terminal_margin, (int, float))
+                or not math.isfinite(float(terminal_margin))):
+            raise ContextualLatticeError("contextual replay terminal margin must be finite")
+        state["terminal_margin"] = float(terminal_margin)
     result = _apply_contextual_lattice_terminal(state, terminal)
     return {"pred_tags": result["current_tags"], **result}
 

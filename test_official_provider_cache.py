@@ -589,6 +589,173 @@ def _continuation_adapter():
     return Adapter()
 
 
+def test_study_provider_cache_accepts_explicit_frozen_rows_and_binds_identity(
+    tmp_path, monkeypatch,
+):
+    rows = [
+        {"tokens": [f"study-{index}"], "dirty_tags": ["O"], "ner_tags": ["O"]}
+        for index in range(3)
+    ]
+    requested = []
+
+    async def pipeline(tokens, dirty_tags, config, dataset_name=None):
+        requested.append(tokens[0])
+        return {
+            "pred_tags": list(dirty_tags),
+            "candidate_paths": [list(dirty_tags)] * 3,
+            "rag_weights": [1.0, 1.0, 1.0],
+            "confidence": [1.0] * len(tokens),
+            "provider_metadata": {
+                "coder": [_evidence("coder", "live") for _ in range(3)],
+                "reviewer": [_evidence("reviewer", "skipped_identical")],
+                "verifier": [_evidence("verifier", "skipped_uncontested")],
+            },
+            "fallback_used": False,
+        }
+
+    def canonical_access_is_forbidden(*_args, **_kwargs):
+        raise AssertionError("study cache must not read the canonical noisy namespace")
+
+    monkeypatch.setattr(run_multiseed, "_noisy_path", canonical_access_is_forbidden)
+    monkeypatch.setattr(run_multiseed, "_load_official_source_rows", canonical_access_is_forbidden)
+    study_identity = {
+        "schema": "qwen-contextual-studies-v1",
+        "kind": "ablation",
+        "variant": "full",
+        "ratio": 0.15,
+        "source_file_sha256": "c" * 64,
+        "coordinates_sha256": "d" * 64,
+    }
+    cache_root = tmp_path / "cache"
+    tag = "qwen32b-contextual-studies-nothink-source-r15-v1"
+    cell = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, len(rows), (pipeline, {}),
+        cache_root=cache_root, cache_tag=tag, max_concurrency=2,
+        request_timeout=7200, adapter_factory=_continuation_adapter,
+        git_sha="a" * 40, bundle_hash="b" * 64,
+        explicit_source_rows=rows, study_identity=study_identity,
+    ))
+
+    assert requested == ["study-0", "study-1", "study-2"]
+    manifest = run_multiseed._read_provider_cache_manifest(Path(cell["path"]))
+    assert manifest["configuration"]["study"] == study_identity
+    assert manifest["configuration"]["study_pipeline_config"] == {
+        "terminal_decoder": "contextual-lattice-v1",
+        "deanchor_atf": True,
+        "use_verifier": True,
+        "verifier_semantic_max_retries": 2,
+    }
+    assert cell["row_count"] == 3
+
+    requested.clear()
+    resumed = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, len(rows), (pipeline, {}),
+        cache_root=cache_root, cache_tag=tag, max_concurrency=32,
+        request_timeout=7200, adapter_factory=_continuation_adapter,
+        git_sha="a" * 40, bundle_hash="b" * 64,
+        explicit_source_rows=rows, study_identity=study_identity,
+    ))
+    assert resumed["sha256"] == cell["sha256"]
+    assert requested == []
+
+    changed_identity = {**study_identity, "variant": "minus_atf_deanchor"}
+    with pytest.raises(ValueError, match="configuration identity mismatch"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, len(rows), (pipeline, {}),
+            cache_root=cache_root, cache_tag=tag, max_concurrency=2,
+            request_timeout=7200, adapter_factory=_continuation_adapter,
+            git_sha="a" * 40, bundle_hash="b" * 64,
+            explicit_source_rows=rows, study_identity=changed_identity,
+        ))
+
+
+def test_study_provider_cache_rejects_reuse_and_mismatched_size(tmp_path):
+    rows = [{"tokens": ["x"], "dirty_tags": ["O"], "ner_tags": ["O"]}]
+    common = dict(
+        config_name="selectdenoise_contextual_lattice",
+        config=run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        dataset="msra", noise="BT", seed=13, pipelines=(None, {}),
+        cache_root=tmp_path / "cache", cache_tag="study-nothink-v1",
+        max_concurrency=2, request_timeout=7200,
+        adapter_factory=_continuation_adapter, git_sha="a" * 40,
+        bundle_hash="b" * 64, explicit_source_rows=rows,
+        study_identity={"schema": "qwen-contextual-studies-v1"},
+    )
+
+    with pytest.raises(ValueError, match="size must equal"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(size=2, **common))
+    with pytest.raises(ValueError, match="cannot reuse"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            size=1, reuse_cache_tag="old-nothink", **common,
+        ))
+
+
+def test_study_contextual_replay_uses_same_explicit_identity(tmp_path, monkeypatch):
+    rows = [
+        {"tokens": ["Alice"], "dirty_tags": ["O"], "ner_tags": ["B-PER"]},
+    ]
+    cache_root = tmp_path / "cache"
+    tag = "qwen32b-contextual-studies-nothink-source-r15-v1"
+    identity = {
+        "schema": "qwen-contextual-studies-v1", "kind": "ablation",
+        "variant": "full", "ratio": 0.15,
+    }
+
+    async def pipeline(tokens, dirty_tags, config, dataset_name=None):
+        return {
+            "pred_tags": ["B-PER"],
+            "candidate_paths": [["B-PER"], ["O"]],
+            "rag_weights": [0.8, 0.2], "confidence": [0.8],
+            "provider_metadata": {
+                "coder": [_evidence("coder", "live") for _ in range(3)],
+                "reviewer": [_evidence("reviewer", "live")],
+                "verifier": [_evidence("verifier", "live")],
+            },
+            "fallback_used": False,
+        }
+
+    asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, 1, (pipeline, {}), cache_root=cache_root,
+        cache_tag=tag, max_concurrency=1, request_timeout=7200,
+        adapter_factory=_continuation_adapter, git_sha="a" * 40,
+        bundle_hash="b" * 64, explicit_source_rows=rows,
+        study_identity=identity,
+    ))
+    monkeypatch.setattr(run_multiseed, "_noisy_path", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("study replay must not read canonical input")
+    ))
+
+    def replay(**kwargs):
+        from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
+
+        assert kwargs["provider_record"]["anchor_tags"] == ["B-PER"]
+        return {
+            "pred_tags": ["B-PER"], "terminal_anchor_tags": ["B-PER"],
+            "terminal_model_hash": LOCKED_DECODER_MODEL_HASH,
+            "terminal_used_anchor": True,
+            "terminal_predicted_gain": 0.0, "terminal_fallback_count": 0,
+        }
+
+    output = asyncio.run(run_multiseed._run_contextual_replay_cell(
+        "msra", "BT", 13, 1, cache_root=cache_root, cache_tag=tag,
+        bundle_hash="b" * 64, git_sha="a" * 40, replay_fn=replay,
+        terminal=object(), max_concurrency=1,
+        prediction_path=tmp_path / "prediction.jsonl", enable_thinking=False,
+        explicit_source_rows=rows, study_identity=identity,
+    ))
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["candidate_paths"] == [["B-PER"], ["O"]]
+    assert result["input_digest"] == run_multiseed._provider_input_digest(rows[0])
+
+
 def _full_continuation_rows(tmp_path, monkeypatch):
     noisy_dir = tmp_path / "noisy"
     noisy_dir.mkdir()

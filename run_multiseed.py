@@ -1010,18 +1010,32 @@ def _provider_input_digest(row: Mapping[str, Any]) -> str:
 def _provider_cache_manifest(rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any], *,
                              dataset: str, noise: str, seed: int, git_sha: str,
                              bundle_hash: str,
-                             enable_thinking: bool = True) -> dict[str, Any]:
+                             enable_thinking: bool = True,
+                             study_identity: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     if type(enable_thinking) is not bool:
         raise ValueError("provider-cache thinking identity must be boolean")
+    configuration = {"config": "selectdenoise_contextual_lattice",
+                     "terminal_decoder": config.get("terminal_decoder"),
+                     "dataset": dataset, "noise": noise, "seed": seed,
+                     "enable_thinking": enable_thinking,
+                     "thinking_mode": "thinking" if enable_thinking else "nothink"}
+    if study_identity is not None:
+        if not isinstance(study_identity, Mapping) or not study_identity:
+            raise ValueError("provider-cache study identity must be a non-empty mapping")
+        configuration["study"] = dict(study_identity)
+        configuration["study_pipeline_config"] = {
+            "terminal_decoder": config.get("terminal_decoder"),
+            "deanchor_atf": config.get("deanchor_atf"),
+            "use_verifier": config.get("use_verifier"),
+            "verifier_semantic_max_retries": config.get(
+                "verifier_semantic_max_retries"
+            ),
+        }
     return {
         "schema": PROVIDER_CACHE_SCHEMA,
         "source_digests": {str(index): _provider_input_digest(row) for index, row in enumerate(rows)},
         "git_sha": git_sha, "model_revision": QWEN_REVISION, "bundle_hash": bundle_hash,
-        "configuration": {"config": "selectdenoise_contextual_lattice",
-                          "terminal_decoder": config.get("terminal_decoder"),
-                          "dataset": dataset, "noise": noise, "seed": seed,
-                          "enable_thinking": enable_thinking,
-                          "thinking_mode": "thinking" if enable_thinking else "nothink"},
+        "configuration": configuration,
         "verifier_semantic_retry": dict(OFFICIAL_VERIFIER_SEMANTIC_RETRY_POLICY),
     }
 
@@ -1560,10 +1574,28 @@ async def _run_provider_cache_cell(
     request_timeout: float, adapter_factory: Callable[[], Any], git_sha: str,
     bundle_hash: str, compatible_git_shas: Sequence[str] = (),
     reuse_cache_tag: Optional[str] = None,
+    explicit_source_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    study_identity: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Execute only the provider graph and atomically publish one gold-free cell."""
-    _validate_provider_cache_launch([config_name], size=size, ratios=[OFFICIAL_NOISE_RATIO],
-                                    max_concurrency=max_concurrency, failure_policy="abort", dummy=False)
+    if explicit_source_rows is None:
+        if study_identity is not None:
+            raise ValueError("provider-cache study identity requires explicit source rows")
+        _validate_provider_cache_launch(
+            [config_name], size=size, ratios=[OFFICIAL_NOISE_RATIO],
+            max_concurrency=max_concurrency, failure_policy="abort", dummy=False,
+        )
+    else:
+        if config_name != "selectdenoise_contextual_lattice":
+            raise ValueError("study provider-cache requires the contextual-lattice config")
+        if study_identity is None:
+            raise ValueError("explicit provider-cache rows require a study identity")
+        if size != len(explicit_source_rows):
+            raise ValueError("study provider-cache size must equal explicit source row count")
+        if size <= 0 or max_concurrency <= 0:
+            raise ValueError("study provider-cache requires positive rows and concurrency")
+        if reuse_cache_tag is not None:
+            raise ValueError("study provider-cache cannot reuse an ordinary cache tag")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cache_tag):
         raise ValueError("provider-cache tag is invalid")
     if not re.fullmatch(r"[0-9a-fA-F]{40}", git_sha):
@@ -1573,10 +1605,17 @@ async def _run_provider_cache_cell(
     if reuse_cache_tag is not None and size not in (
             OFFICIAL_REDUCED_SAMPLE_SIZE, OFFICIAL_SAMPLE_SIZE):
         raise ValueError("provider-cache reuse requires the N100 or N200 profile")
-    source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO)
-    if not source_path.exists():
-        raise FileNotFoundError(f"official noisy file not found: {source_path}")
-    rows = _load_official_source_rows(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
+    if explicit_source_rows is None:
+        source_path = _noisy_path(
+            dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO,
+        )
+        if not source_path.exists():
+            raise FileNotFoundError(f"official noisy file not found: {source_path}")
+        rows = _load_official_source_rows(
+            dataset, noise, seed, size, OFFICIAL_NOISE_RATIO,
+        )
+    else:
+        rows = [dict(row) for row in explicit_source_rows]
     if len(rows) != size:
         raise RuntimeError(f"provider-cache cell requires exactly {size} noisy rows")
     cell_path = _provider_cache_cell_path(cache_root, cache_tag, config_name, dataset, noise, seed)
@@ -1612,7 +1651,7 @@ async def _run_provider_cache_cell(
     manifest = _provider_cache_manifest(
         rows, config, dataset=dataset, noise=noise, seed=seed,
         git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower(),
-        enable_thinking=enable_thinking,
+        enable_thinking=enable_thinking, study_identity=study_identity,
     )
     fingerprint = _sha256_json(identity)
     manifest['request_limits'] = {
@@ -1811,13 +1850,26 @@ async def _run_contextual_replay_cell(
     replay_fn: Callable[..., Mapping[str, Any]], terminal: Any,
     max_concurrency: int, prediction_path: Optional[Path] = None,
     enable_thinking: bool = True, compatible_git_shas: Sequence[str] = (),
+    explicit_source_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+    study_identity: Optional[Mapping[str, Any]] = None,
+    config_override: Optional[Mapping[str, Any]] = None,
 ) -> Path:
     """Decode one provider-cache cell locally with no provider adapter."""
-    _validate_contextual_replay_launch(
-        ["selectdenoise_contextual_lattice"], size=size,
-        ratios=[OFFICIAL_NOISE_RATIO], max_concurrency=max_concurrency,
-        failure_policy="abort", dummy=False,
-    )
+    if explicit_source_rows is None:
+        if study_identity is not None or config_override is not None:
+            raise ValueError("contextual study replay requires explicit source rows")
+        _validate_contextual_replay_launch(
+            ["selectdenoise_contextual_lattice"], size=size,
+            ratios=[OFFICIAL_NOISE_RATIO], max_concurrency=max_concurrency,
+            failure_policy="abort", dummy=False,
+        )
+    else:
+        if study_identity is None:
+            raise ValueError("explicit contextual replay rows require a study identity")
+        if size != len(explicit_source_rows):
+            raise ValueError("study contextual replay size must equal explicit source row count")
+        if size <= 0 or max_concurrency <= 0:
+            raise ValueError("study contextual replay requires positive rows and concurrency")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cache_tag):
         raise ValueError("contextual-replay provider-cache tag is invalid")
     if not enable_thinking and "nothink" not in cache_tag.lower():
@@ -1826,17 +1878,24 @@ async def _run_contextual_replay_cell(
         raise ValueError("contextual-replay requires a 40-hex Git SHA")
     if not re.fullmatch(r"[0-9a-fA-F]{64}", bundle_hash):
         raise ValueError("contextual-replay requires a 64-hex bundle hash")
-    source_path = _noisy_path(dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO)
-    if not source_path.exists():
-        raise FileNotFoundError(f"official noisy file not found: {source_path}")
-    source_rows = _load_official_source_rows(dataset, noise, seed, size, OFFICIAL_NOISE_RATIO)
+    if explicit_source_rows is None:
+        source_path = _noisy_path(
+            dataset, noise, seed, OFFICIAL_SAMPLE_SIZE, OFFICIAL_NOISE_RATIO,
+        )
+        if not source_path.exists():
+            raise FileNotFoundError(f"official noisy file not found: {source_path}")
+        source_rows = _load_official_source_rows(
+            dataset, noise, seed, size, OFFICIAL_NOISE_RATIO,
+        )
+    else:
+        source_rows = [dict(row) for row in explicit_source_rows]
     if len(source_rows) != size:
         raise RuntimeError(f"contextual-replay cell requires exactly {size} noisy rows")
-    config = CONFIGURATIONS["selectdenoise_contextual_lattice"]
+    config = dict(config_override or CONFIGURATIONS["selectdenoise_contextual_lattice"])
     expected_manifest = _provider_cache_manifest(
         source_rows, config, dataset=dataset, noise=noise, seed=seed,
         git_sha=git_sha.lower(), bundle_hash=bundle_hash.lower(),
-        enable_thinking=enable_thinking,
+        enable_thinking=enable_thinking, study_identity=study_identity,
     )
     key = _provider_cache_cell_key("selectdenoise_contextual_lattice", dataset, noise, seed)
     indexed = _read_provider_cache_index_cell(cache_root, cache_tag, key)
@@ -1927,6 +1986,13 @@ async def _run_contextual_replay_cell(
                 "provider_metadata": cached["provider_metadata"],
                 "fallback_used": False,
             }
+            if study_identity is not None:
+                buffer[index].update({
+                    "input_digest": cached["input_digest"],
+                    "candidate_paths": cached["candidate_paths"],
+                    "rag_weights": cached["rag_weights"],
+                    "confidence": cached["confidence"],
+                })
 
     tasks = [asyncio.create_task(process(index, source, cached))
              for index, (source, cached) in enumerate(zip(source_rows, cached_rows))]
