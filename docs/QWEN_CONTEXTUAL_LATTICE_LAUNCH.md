@@ -251,6 +251,7 @@ D:/py/Anaconda3/python.exe qwen_full_audit.py `
   --producer-git-sha $env:EXPECTED_GIT_SHA `
   --compatible-provider-cache-git-sha $env:EXISTING_FULL_PRODUCER_SHA `
   --compatible-provider-cache-git-sha $env:REDUCED_PREFIX_PRODUCER_SHA `
+  --existing-full-producer-git-sha $env:EXISTING_FULL_PRODUCER_SHA `
   --expected-existing-full-cells 8 --expected-prefix-cells 12
 ```
 

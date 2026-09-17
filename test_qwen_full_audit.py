@@ -29,7 +29,10 @@ def _evidence(stage, status):
     return value
 
 
-def _write_minimal_matrix(tmp_path, *, credential=False, row_count=2, prefix_source=False):
+def _write_minimal_matrix(
+    tmp_path, *, credential=False, row_count=2, prefix_source=False,
+    manifest_git_sha="a" * 40,
+):
     noisy_root = tmp_path / "noisy"
     cache_root = tmp_path / "cache"
     predictions_root = tmp_path / "predictions"
@@ -58,7 +61,7 @@ def _write_minimal_matrix(tmp_path, *, credential=False, row_count=2, prefix_sou
         })
     manifest = run_multiseed._provider_cache_manifest(
         rows, run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
-        dataset="msra", noise="BT", seed=13, git_sha="a" * 40,
+        dataset="msra", noise="BT", seed=13, git_sha=manifest_git_sha,
         bundle_hash="b" * 64, enable_thinking=False,
     )
     manifest["request_limits"] = {
@@ -105,7 +108,7 @@ def _write_minimal_matrix(tmp_path, *, credential=False, row_count=2, prefix_sou
             "selectdenoise_contextual_lattice", "msra", "BT", 13,
         ),
         cell={"path": str(cell), "sha256": digest, "row_count": row_count,
-              "git_sha": "a" * 40, "model_revision": REVISION,
+              "git_sha": manifest_git_sha, "model_revision": REVISION,
               "provider_fingerprint": "c" * 64},
     )
 
@@ -167,6 +170,43 @@ def test_exact_qwen_audit_accepts_cache_prediction_iob2_and_fresh_aggregate(tmp_
     }
     assert report["checks"]["reuse"] == {
         "existing_full_cells": 0, "prefix_cells": 0,
+        "continuation_full_cells": 0, "current_full_cells": 1,
+    }
+
+
+def test_exact_qwen_audit_distinguishes_original_reuse_from_continuation_cells(tmp_path):
+    noisy, cache, predictions, _aggregate, _prediction = _write_minimal_matrix(
+        tmp_path, manifest_git_sha="c" * 40,
+    )
+
+    report = qwen_full_audit.audit_qwen_full(
+        noisy_root=noisy, cache_root=cache, predictions_root=predictions,
+        cache_tag=TAG, bundle_hash="b" * 64, producer_git_sha="a" * 40,
+        compatible_git_shas=("c" * 40,),
+        existing_full_producer_git_shas=(),
+        datasets=("msra",), noises=("BT",), seeds=(13,), expected_rows=2,
+        expected_existing_full_cells=0, expected_prefix_cells=0,
+    )
+
+    assert report["ok"] is True
+    assert report["checks"]["reuse"] == {
+        "existing_full_cells": 0, "prefix_cells": 0,
+        "continuation_full_cells": 1, "current_full_cells": 0,
+    }
+
+    report = qwen_full_audit.audit_qwen_full(
+        noisy_root=noisy, cache_root=cache, predictions_root=predictions,
+        cache_tag=TAG, bundle_hash="b" * 64, producer_git_sha="a" * 40,
+        compatible_git_shas=("c" * 40,),
+        existing_full_producer_git_shas=("c" * 40,),
+        datasets=("msra",), noises=("BT",), seeds=(13,), expected_rows=2,
+        expected_existing_full_cells=1, expected_prefix_cells=0,
+    )
+
+    assert report["ok"] is True
+    assert report["checks"]["reuse"] == {
+        "existing_full_cells": 1, "prefix_cells": 0,
+        "continuation_full_cells": 0, "current_full_cells": 0,
     }
 
 

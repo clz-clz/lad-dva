@@ -129,6 +129,7 @@ def audit_qwen_full(
     bundle_hash: str,
     producer_git_sha: str,
     compatible_git_shas: Sequence[str],
+    existing_full_producer_git_shas: Sequence[str] = (),
     datasets: Sequence[str] = DATASETS,
     noises: Sequence[str] = NOISE_TYPES,
     seeds: Sequence[int] = SEEDS,
@@ -155,6 +156,17 @@ def audit_qwen_full(
     )}
     if any(not re.fullmatch(r"[0-9a-f]{40}", value) for value in allowed_git_shas):
         _block(blockers, "invalid_git_sha", "producer Git SHAs must be 40 hexadecimal characters")
+    existing_full_producers = {
+        str(value).lower() for value in existing_full_producer_git_shas
+    }
+    if (any(not re.fullmatch(r"[0-9a-f]{40}", value)
+            for value in existing_full_producers)
+            or not existing_full_producers <= allowed_git_shas
+            or producer_git_sha.lower() in existing_full_producers):
+        _block(
+            blockers, "invalid_existing_full_producer_git_sha",
+            "original full-cache producer Git SHAs must be compatible prior producers",
+        )
 
     index_path = _provider_cache_index_path(cache_root, cache_tag)
     index_cells: Mapping[str, Any] = {}
@@ -268,6 +280,7 @@ def audit_qwen_full(
     }
     cache_cells = prediction_cells = total_rows = 0
     prefix_cells = existing_full_cells = 0
+    continuation_full_cells = current_full_cells = 0
     source_hashes: dict[str, str] = {}
     prediction_paths: list[Path] = []
     verified_metrics: dict[tuple[str, str, int], dict[str, float]] = {}
@@ -402,8 +415,14 @@ def audit_qwen_full(
                                 {"manifest": source_manifest, "records": source_cached}):
                             raise ValueError("credential field in cache prefix source")
                         prefix_cells += 1
-                    elif str(manifest.get("git_sha", "")).lower() != producer_git_sha.lower():
-                        existing_full_cells += 1
+                    else:
+                        manifest_git_sha = str(manifest.get("git_sha", "")).lower()
+                        if manifest_git_sha == producer_git_sha.lower():
+                            current_full_cells += 1
+                        elif manifest_git_sha in existing_full_producers:
+                            existing_full_cells += 1
+                        else:
+                            continuation_full_cells += 1
                     cache_cells += 1
                 except Exception as exc:  # noqa: BLE001 - audit every cell
                     code = "gold_leak" if "gold labels" in str(exc).lower() else "cache_validation"
@@ -526,6 +545,8 @@ def audit_qwen_full(
             "reuse": {
                 "existing_full_cells": existing_full_cells,
                 "prefix_cells": prefix_cells,
+                "continuation_full_cells": continuation_full_cells,
+                "current_full_cells": current_full_cells,
             },
             "source_sha256": source_hashes,
             "aggregate": str(aggregate_path),
@@ -543,6 +564,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--bundle-hash", required=True)
     parser.add_argument("--producer-git-sha", required=True)
     parser.add_argument("--compatible-provider-cache-git-sha", action="append", default=[])
+    parser.add_argument("--existing-full-producer-git-sha", action="append", default=[])
     parser.add_argument("--expected-existing-full-cells", type=int, default=8)
     parser.add_argument("--expected-prefix-cells", type=int, default=12)
     return parser.parse_args(argv)
@@ -555,6 +577,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         predictions_root=args.predictions_root, cache_tag=args.provider_cache_tag,
         bundle_hash=args.bundle_hash, producer_git_sha=args.producer_git_sha,
         compatible_git_shas=args.compatible_provider_cache_git_sha,
+        existing_full_producer_git_shas=args.existing_full_producer_git_sha,
         expected_existing_full_cells=args.expected_existing_full_cells,
         expected_prefix_cells=args.expected_prefix_cells,
     )
