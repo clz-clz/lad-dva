@@ -198,6 +198,44 @@ def test_exact_qwen_audit_rejects_credential_material_in_cache(tmp_path):
     assert "credential_leak" in {item["code"] for item in report["blockers"]}
 
 
+def test_exact_qwen_audit_recursively_rejects_failure_tmp_files(tmp_path):
+    noisy, cache, predictions, _aggregate, _prediction = _write_minimal_matrix(tmp_path)
+    failures = cache / TAG / "failures"
+    failures.mkdir()
+    (failures / "interrupted.json.tmp").write_text("partial", encoding="utf-8")
+
+    report = qwen_full_audit.audit_qwen_full(
+        noisy_root=noisy, cache_root=cache, predictions_root=predictions,
+        cache_tag=TAG, bundle_hash="b" * 64, producer_git_sha="a" * 40,
+        compatible_git_shas=(), datasets=("msra",), noises=("BT",),
+        seeds=(13,), expected_rows=2, expected_existing_full_cells=0,
+        expected_prefix_cells=0,
+    )
+
+    assert "temporary_cache" in {item["code"] for item in report["blockers"]}
+
+
+def test_exact_qwen_audit_rejects_sensitive_failure_artifact(tmp_path):
+    noisy, cache, predictions, _aggregate, _prediction = _write_minimal_matrix(tmp_path)
+    failures = cache / TAG / "failures"
+    failures.mkdir()
+    (failures / "verifier_semantic_failure__bad.json").write_text(json.dumps({
+        "schema": "selectdenoise-verifier-semantic-failure-v1",
+        "credential": "must-not-be-present",
+        "gold_tags": ["O"],
+    }), encoding="utf-8")
+
+    report = qwen_full_audit.audit_qwen_full(
+        noisy_root=noisy, cache_root=cache, predictions_root=predictions,
+        cache_tag=TAG, bundle_hash="b" * 64, producer_git_sha="a" * 40,
+        compatible_git_shas=(), datasets=("msra",), noises=("BT",),
+        seeds=(13,), expected_rows=2, expected_existing_full_cells=0,
+        expected_prefix_cells=0,
+    )
+
+    assert "failure_provenance" in {item["code"] for item in report["blockers"]}
+
+
 def test_exact_qwen_audit_rejects_any_terminal_fallback(tmp_path):
     report, _aggregate, prediction = _audit(tmp_path)
     assert report["ok"] is True

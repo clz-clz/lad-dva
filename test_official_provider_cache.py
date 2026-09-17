@@ -10,6 +10,11 @@ import pytest
 
 import official_provider_cache
 import run_multiseed
+from official_contract import (
+    VerifierSemanticRetryExhausted,
+    VerifierSemanticRetryInterrupted,
+    validate_verifier_semantic_retry_evidence,
+)
 
 
 _MODEL = "Qwen/Qwen3-32B-AWQ"
@@ -258,6 +263,181 @@ def test_contextual_cache_thinking_modes_are_not_interchangeable():
 
     with pytest.raises(ValueError, match="configuration"):
         run_multiseed._validate_replay_cache_identity(actual, expected)
+
+
+def test_provider_cache_manifest_records_bounded_verifier_semantic_retry_policy():
+    row = {"tokens": ["Acme"], "dirty_tags": ["B-ORG"]}
+    manifest = run_multiseed._provider_cache_manifest(
+        [row], run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        dataset="conll2003", noise="ATF", seed=42, git_sha="a" * 40,
+        bundle_hash="b" * 64, enable_thinking=False,
+    )
+
+    assert manifest["verifier_semantic_retry"] == {
+        "max_retries": 2,
+        "max_attempts": 3,
+        "retryable_error": "illegal-iob2-transition-v1",
+        "feedback": "first-invalid-transition-v1",
+        "no_dfa": True,
+        "no_fallback": True,
+    }
+
+
+def test_replay_requires_retry_policy_for_current_producer_but_accepts_legacy_compatible():
+    row = {"tokens": ["Acme"], "dirty_tags": ["B-ORG"]}
+    expected = run_multiseed._provider_cache_manifest(
+        [row], run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        dataset="conll2003", noise="ATF", seed=42, git_sha="a" * 40,
+        bundle_hash="b" * 64, enable_thinking=False,
+    )
+    missing_policy = json.loads(json.dumps(expected))
+    missing_policy.pop("verifier_semantic_retry")
+
+    with pytest.raises(ValueError, match="semantic retry policy"):
+        run_multiseed._validate_replay_cache_identity(missing_policy, expected)
+
+    missing_policy["git_sha"] = "c" * 40
+    run_multiseed._validate_replay_cache_identity(
+        missing_policy, expected, compatible_git_shas=("c" * 40,),
+    )
+
+    same_legacy_producer = json.loads(json.dumps(expected))
+    same_legacy_producer.pop("verifier_semantic_retry")
+    run_multiseed._validate_replay_cache_identity(
+        same_legacy_producer, expected, compatible_git_shas=("a" * 40,),
+    )
+
+
+def test_contextual_provider_evidence_accepts_auditable_verifier_semantic_retry():
+    rejected = _evidence("verifier", "live")
+    rejected.update({
+        "semantic_attempt": 1,
+        "semantic_outcome": "rejected_illegal_iob2",
+        "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+        "rejected_tags": ["O", "I-ORG"],
+        "response_sha256": "d" * 64,
+    })
+    accepted = _evidence("verifier", "live")
+    accepted.update({"semantic_attempt": 2, "semantic_outcome": "accepted"})
+    evidence = {
+        "coder": [_evidence("coder", "live") for _ in range(5)],
+        "reviewer": [_evidence("reviewer", "live")],
+        "verifier": [rejected, accepted],
+    }
+    identity = {
+        "provider": "vllm", "model": _MODEL, "served_model": _SERVED_MODEL,
+        "revision": _REVISION, "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False, "thinking_mode": "nothink",
+    }
+
+    rejected["response_sha256"] = run_multiseed._sha256_json({
+        "tags": rejected["rejected_tags"],
+    })
+    run_multiseed._validate_contextual_provider_evidence(evidence, identity, "ATF")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"illegal_transition": {"index": 1, "previous": "O", "current": "O"}},
+        {"illegal_transition": {"index": 99, "previous": "O", "current": "I-ORG"}},
+        {"response_sha256": "0" * 64},
+    ],
+)
+def test_verifier_retry_provenance_rejects_false_or_unbound_illegal_edges(mutation):
+    rejected = _evidence("verifier", "live")
+    rejected.update({
+        "semantic_attempt": 1,
+        "semantic_outcome": "rejected_illegal_iob2",
+        "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+        "rejected_tags": ["O", "I-ORG"],
+        "response_sha256": run_multiseed._sha256_json({"tags": ["O", "I-ORG"]}),
+    })
+    rejected.update(mutation)
+    accepted = _evidence("verifier", "live")
+    accepted.update({"semantic_attempt": 2, "semantic_outcome": "accepted"})
+
+    with pytest.raises(ValueError):
+        validate_verifier_semantic_retry_evidence([rejected, accepted])
+
+
+def test_semantic_retry_failure_provenance_is_persisted_without_target_labels(tmp_path):
+    attempts = []
+    for number in range(1, 4):
+        record = _evidence("verifier", "live")
+        record.update({
+            "semantic_attempt": number,
+            "semantic_outcome": "rejected_illegal_iob2",
+            "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+            "rejected_tags": ["O", "I-ORG"],
+            "response_sha256": run_multiseed._sha256_json({"tags": ["O", "I-ORG"]}),
+        })
+        attempts.append(record)
+    error = VerifierSemanticRetryExhausted(attempts)
+
+    path = run_multiseed._write_verifier_semantic_failure_provenance(
+        cache_root=tmp_path,
+        cache_tag="qwen32b-contextual-nothink-v1",
+        config_name="selectdenoise_contextual_lattice",
+        dataset="fewnerd",
+        noise="ATF",
+        seed=42,
+        row_index=137,
+        input_digest="e" * 64,
+        git_sha="a" * 40,
+        attempts=error.records,
+    )
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "selectdenoise-verifier-semantic-failure-v1"
+    assert payload["row_index"] == 137
+    assert len(payload["attempts"]) == 3
+    assert "gold_tags" not in path.read_text(encoding="utf-8")
+    assert not list(path.parent.glob("*.tmp"))
+
+
+def test_semantic_failure_provenance_whitelists_attempt_metadata(tmp_path):
+    attempts = []
+    for number in range(1, 4):
+        record = _evidence("verifier", "live")
+        record.update({
+            "semantic_attempt": number,
+            "semantic_outcome": "rejected_illegal_iob2",
+            "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+            "rejected_tags": ["O", "I-ORG"],
+            "response_sha256": run_multiseed._sha256_json({"tags": ["O", "I-ORG"]}),
+            "api_key": "must-not-be-written",
+            "gold_tags": ["B-ORG", "I-ORG"],
+        })
+        record["usage"] = {
+            "prompt_tokens": 7,
+            "completion_tokens": 2,
+            "secret": "must-not-be-written",
+        }
+        attempts.append(record)
+
+    path = run_multiseed._write_verifier_semantic_failure_provenance(
+        cache_root=tmp_path,
+        cache_tag="qwen32b-contextual-nothink-v1",
+        config_name="selectdenoise_contextual_lattice",
+        dataset="fewnerd",
+        noise="ATF",
+        seed=42,
+        row_index=137,
+        input_digest="e" * 64,
+        git_sha="a" * 40,
+        attempts=attempts,
+    )
+
+    text = path.read_text(encoding="utf-8")
+    assert "must-not-be-written" not in text
+    assert "api_key" not in text
+    assert "gold_tags" not in text
+    assert "secret" not in text
+    payload = json.loads(text)
+    assert payload["attempts"][0]["usage"] == {
+        "prompt_tokens": 7, "completion_tokens": 2,
+    }
 
 
 def test_contextual_cache_allows_explicitly_compatible_producer_with_new_request_limits():
@@ -597,6 +777,94 @@ def test_full_profile_suffix_failure_leaves_no_target_or_temporary_cache(
     assert not run_multiseed._provider_cache_index_path(
         cache_root, "qwen32b-contextual-nothink-v1",
     ).exists()
+
+
+def test_exhausted_semantic_retries_persist_failure_provenance_without_a_cell(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    source_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    _write_reduced_source_for_full_continuation(cache_root, rows, source_tag=source_tag)
+    attempts = []
+    for number in range(1, 4):
+        record = _evidence("verifier", "live")
+        record.update({
+            "semantic_attempt": number,
+            "semantic_outcome": "rejected_illegal_iob2",
+            "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+            "rejected_tags": ["O", "I-ORG"],
+            "response_sha256": run_multiseed._sha256_json({"tags": ["O", "I-ORG"]}),
+        })
+        attempts.append(record)
+
+    async def exhaust_retries(*_args, **_kwargs):
+        raise VerifierSemanticRetryExhausted(attempts)
+
+    with pytest.raises(VerifierSemanticRetryExhausted, match="after 3 attempts"):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (exhaust_retries, {}),
+            cache_root=cache_root, cache_tag="qwen32b-contextual-nothink-v1",
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64, reuse_cache_tag=source_tag,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+    target = run_multiseed._provider_cache_cell_path(
+        cache_root, "qwen32b-contextual-nothink-v1",
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    failures = list((target.parent / "failures").glob("*.json"))
+    assert failures
+    assert not target.exists()
+    assert not list(target.parent.rglob("*.tmp"))
+
+
+def test_interrupted_semantic_retries_persist_rejected_prefix_without_a_cell(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    source_tag = "qwen32b-contextual-nothink-s13-n100-v1"
+    _write_reduced_source_for_full_continuation(cache_root, rows, source_tag=source_tag)
+    rejected = _evidence("verifier", "live")
+    rejected.update({
+        "semantic_attempt": 1,
+        "semantic_outcome": "rejected_illegal_iob2",
+        "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+        "rejected_tags": ["O", "I-ORG"],
+        "response_sha256": run_multiseed._sha256_json({"tags": ["O", "I-ORG"]}),
+    })
+
+    async def interrupt_retries(*_args, **_kwargs):
+        raise VerifierSemanticRetryInterrupted([rejected], ValueError("bad ontology"))
+
+    with pytest.raises(VerifierSemanticRetryInterrupted):
+        asyncio.run(run_multiseed._run_provider_cache_cell(
+            "selectdenoise_contextual_lattice",
+            run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+            "msra", "BT", 13, 200, (interrupt_retries, {}),
+            cache_root=cache_root, cache_tag="qwen32b-contextual-nothink-v1",
+            max_concurrency=32, request_timeout=7200,
+            adapter_factory=_continuation_adapter, git_sha="a" * 40,
+            bundle_hash="b" * 64, reuse_cache_tag=source_tag,
+            compatible_git_shas=("d" * 40,),
+        ))
+
+    target = run_multiseed._provider_cache_cell_path(
+        cache_root, "qwen32b-contextual-nothink-v1",
+        "selectdenoise_contextual_lattice", "msra", "BT", 13,
+    )
+    failures = list((target.parent / "failures").glob("*.json"))
+    assert failures
+    payload = json.loads(failures[0].read_text(encoding="utf-8"))
+    assert payload["terminal_outcome"] == "nonsemantic_interruption"
+    assert payload["terminal_error_type"] == "ValueError"
+    assert len(payload["attempts"]) == 1
+    assert not target.exists()
 
 
 def test_full_profile_missing_source_cell_runs_normally_even_when_source_index_exists(

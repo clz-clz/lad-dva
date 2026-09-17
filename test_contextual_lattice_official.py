@@ -7,6 +7,10 @@ import pytest
 
 import multi_agent_v2
 from live_backbone import LiveBackboneResult
+from official_contract import (
+    VerifierSemanticRetryExhausted,
+    VerifierSemanticRetryInterrupted,
+)
 
 
 REVISION = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
@@ -216,6 +220,157 @@ def test_official_contextual_verifier_uses_structured_requester_and_records_live
     assert deer_cache_modes == [True]
     assert result["current_tags"] == ["B-ORG", "O"]
     assert result["provider_metadata"]["verifier"] == [_record("verifier")]
+
+
+def _official_verifier_state(requester):
+    return {
+        "official": True,
+        "tokens": ["Acme", "Labs"],
+        "dirty_tags": ["B-ORG", "I-ORG"],
+        "candidate_paths": [["B-ORG", "I-ORG"], ["B-PER", "I-PER"]],
+        "rag_weights": [0.5, 0.5],
+        "dataset_name": "conll2003",
+        "noise_type": "ATF",
+        "use_verifier": True,
+        "verify_all": False,
+        "verifier_topk": 4,
+        "verifier_semantic_max_retries": 2,
+        "structured_requester": requester,
+        "provider_settings": _settings(),
+        "provider_metadata": {
+            "coder": [_record("coder")],
+            "reviewer": [_record("reviewer")],
+            "verifier": [],
+        },
+    }
+
+
+def test_official_contextual_verifier_retries_transition_illegality_with_provenance(
+    monkeypatch,
+):
+    calls = []
+    responses = [["O", "I-ORG"], ["B-ORG", "I-ORG"]]
+
+    def requester(stage, payload):
+        calls.append((stage, payload))
+        return LiveBackboneResult({"tags": responses[len(calls) - 1]}, _record(stage))
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_a, **_k: [])
+    result = asyncio.run(multi_agent_v2.verifier_node(_official_verifier_state(requester)))
+
+    assert result["current_tags"] == ["B-ORG", "I-ORG"]
+    assert len(calls) == 2
+    retry_message = calls[1][1]["messages"][-1]["content"]
+    assert "token index 1" in retry_message
+    assert "O -> I-ORG" in retry_message
+    records = result["provider_metadata"]["verifier"]
+    assert len(records) == 2
+    assert records[0]["semantic_attempt"] == 1
+    assert records[0]["semantic_outcome"] == "rejected_illegal_iob2"
+    assert records[0]["illegal_transition"] == {
+        "index": 1, "previous": "O", "current": "I-ORG",
+    }
+    assert len(records[0]["response_sha256"]) == 64
+    assert records[1]["semantic_attempt"] == 2
+    assert records[1]["semantic_outcome"] == "accepted"
+
+
+def test_official_contextual_verifier_aborts_after_semantic_retries_are_exhausted(
+    monkeypatch,
+):
+    calls = []
+
+    def requester(stage, payload):
+        calls.append((stage, payload))
+        return LiveBackboneResult({"tags": ["O", "I-ORG"]}, _record(stage))
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_a, **_k: [])
+    with pytest.raises(VerifierSemanticRetryExhausted, match="after 3 attempts") as error:
+        asyncio.run(multi_agent_v2.verifier_node(_official_verifier_state(requester)))
+
+    assert len(calls) == 3
+    assert len(error.value.records) == 3
+    assert all(
+        record["semantic_outcome"] == "rejected_illegal_iob2"
+        and record["rejected_tags"] == ["O", "I-ORG"]
+        for record in error.value.records
+    )
+
+
+def test_official_contextual_verifier_does_not_retry_nonsemantic_errors(monkeypatch):
+    calls = []
+
+    def requester(stage, payload):
+        calls.append((stage, payload))
+        return LiveBackboneResult({"tags": ["B-NOT-IN-ONTOLOGY", "O"]}, _record(stage))
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_a, **_k: [])
+    with pytest.raises(ValueError, match="outside the dataset ontology"):
+        asyncio.run(multi_agent_v2.verifier_node(_official_verifier_state(requester)))
+
+    assert len(calls) == 1
+
+
+def test_official_contextual_verifier_preserves_rejected_prefix_before_nonsemantic_abort(
+    monkeypatch,
+):
+    calls = []
+    responses = [["O", "I-ORG"], ["B-NOT-IN-ONTOLOGY", "O"]]
+
+    def requester(stage, payload):
+        calls.append((stage, payload))
+        return LiveBackboneResult({"tags": responses[len(calls) - 1]}, _record(stage))
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_a, **_k: [])
+    with pytest.raises(VerifierSemanticRetryInterrupted) as error:
+        asyncio.run(multi_agent_v2.verifier_node(_official_verifier_state(requester)))
+
+    assert len(calls) == 2
+    assert error.value.cause_type == "ValueError"
+    assert len(error.value.records) == 1
+    assert error.value.records[0]["semantic_outcome"] == "rejected_illegal_iob2"
+    assert isinstance(error.value.__cause__, ValueError)
+    assert "outside the dataset ontology" in str(error.value.__cause__)
+
+
+def test_official_contextual_verifier_records_rejected_prefix_before_cancellation(
+    monkeypatch,
+):
+    recorded = []
+    calls = 0
+
+    async def exercise():
+        retry_started = asyncio.Event()
+        blocker = asyncio.Event()
+
+        async def requester(stage, payload):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return LiveBackboneResult({"tags": ["O", "I-ORG"]}, _record(stage))
+            retry_started.set()
+            await blocker.wait()
+            raise AssertionError("cancelled retry unexpectedly resumed")
+
+        state = _official_verifier_state(requester)
+        state["verifier_semantic_interruption_recorder"] = (
+            lambda attempts, error_type: recorded.append((attempts, error_type))
+        )
+        task = asyncio.create_task(multi_agent_v2.verifier_node(state))
+        await retry_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    monkeypatch.setattr(multi_agent_v2, "_get_deer_examples", lambda *_a, **_k: [])
+    asyncio.run(exercise())
+
+    assert calls == 2
+    assert len(recorded) == 1
+    attempts, error_type = recorded[0]
+    assert error_type == "CancelledError"
+    assert len(attempts) == 1
+    assert attempts[0]["semantic_outcome"] == "rejected_illegal_iob2"
 
 
 def test_official_contextual_verifier_records_an_explicit_skip():

@@ -44,7 +44,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
 
-from official_contract import official_manifest_decoder_constants
+from official_contract import (
+    OFFICIAL_VERIFIER_SEMANTIC_MAX_RETRIES,
+    OFFICIAL_VERIFIER_SEMANTIC_RETRY_POLICY,
+    VerifierSemanticRetryExhausted,
+    VerifierSemanticRetryInterrupted,
+    official_manifest_decoder_constants,
+    validate_verifier_semantic_retry_evidence,
+)
 from request_diagnostics import sentence_context, queue_context, safe_emit as emit
 from official_provider_cache import (
     PROVIDER_CACHE_SCHEMA, QWEN_MODEL, QWEN_REVISION, QWEN_SERVED_MODEL,
@@ -110,6 +117,7 @@ CONFIGURATIONS: Dict[str, dict] = {
         "terminal_decoder": "contextual-lattice-v1",
         "deanchor_atf": True,
         "use_verifier": True,
+        "verifier_semantic_max_retries": OFFICIAL_VERIFIER_SEMANTIC_MAX_RETRIES,
     },
     # SelectDenoise: Coder(+ATF de-anchoring) -> Reviewer(LADS/DEER) -> Verifier
     "selectdenoise_full":        {"deanchor_atf": True,  "use_verifier": True},
@@ -629,9 +637,13 @@ def _validate_contextual_provider_evidence(
             not in {"live", "skipped_identical"}):
         raise RuntimeError("official contextual Reviewer evidence status is unjustified")
     verifier = records("verifier")
-    if (len(verifier) != 1 or verifier[0].get("status")
+    if (len(verifier) == 1 and verifier[0].get("status")
             not in {"live", "skipped_uncontested", "skipped_identical"}):
         raise RuntimeError("official contextual Verifier evidence status is unjustified")
+    try:
+        validate_verifier_semantic_retry_evidence(verifier)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -880,6 +892,93 @@ def _provider_cache_index_path(root: Path, tag: str) -> Path:
     return Path(root) / tag / "index.json"
 
 
+def _write_verifier_semantic_failure_provenance(
+    *, cache_root: Path, cache_tag: str, config_name: str, dataset: str,
+    noise: str, seed: int, row_index: int, input_digest: str, git_sha: str,
+    attempts: Sequence[Mapping[str, Any]],
+    interrupted: bool = False, terminal_error_type: str | None = None,
+) -> Path:
+    """Persist gold-free retry evidence independently of an atomic cache cell."""
+    validate_verifier_semantic_retry_evidence(
+        attempts, exhausted=not interrupted, interrupted=interrupted,
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", input_digest):
+        raise ValueError("semantic failure provenance input digest is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", git_sha):
+        raise ValueError("semantic failure provenance Git SHA is invalid")
+    if interrupted:
+        if not isinstance(terminal_error_type, str) or re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]{0,127}", terminal_error_type
+        ) is None:
+            raise ValueError("semantic failure provenance error type is invalid")
+    elif terminal_error_type is not None:
+        raise ValueError("exhausted semantic failure cannot have an interruption type")
+
+    allowed_fields = (
+        "stage", "status", "provider", "model", "served_model", "revision",
+        "response_model", "system_fingerprint", "structured_api",
+        "response_status", "finish_reason", "incomplete_reason",
+        "enable_thinking", "thinking_mode", "semantic_attempt",
+        "semantic_outcome", "illegal_transition", "rejected_tags",
+        "response_sha256",
+    )
+    allowed_usage_fields = (
+        "prompt_tokens", "completion_tokens", "total_tokens",
+        "input_tokens", "output_tokens",
+    )
+    safe_attempts = []
+    for record in attempts:
+        safe = {
+            field: json.loads(json.dumps(record[field], ensure_ascii=False))
+            for field in allowed_fields if field in record
+        }
+        usage = record.get("usage")
+        if isinstance(usage, Mapping):
+            safe_usage = {
+                field: usage[field] for field in allowed_usage_fields
+                if field in usage and type(usage[field]) is int and usage[field] >= 0
+            }
+            if safe_usage:
+                safe["usage"] = safe_usage
+        safe_attempts.append(safe)
+    validate_verifier_semantic_retry_evidence(
+        safe_attempts, exhausted=not interrupted, interrupted=interrupted,
+    )
+    payload = {
+        "schema": "selectdenoise-verifier-semantic-failure-v1",
+        "cache_tag": cache_tag,
+        "config": config_name,
+        "dataset": dataset,
+        "noise": noise,
+        "seed": seed,
+        "row_index": row_index,
+        "input_digest": input_digest,
+        "git_sha": git_sha,
+        "terminal_outcome": (
+            "nonsemantic_interruption" if interrupted
+            else "semantic_retries_exhausted"
+        ),
+        "attempts": safe_attempts,
+    }
+    if interrupted:
+        payload["terminal_error_type"] = terminal_error_type
+    directory = Path(cache_root) / cache_tag / "failures"
+    directory.mkdir(parents=True, exist_ok=True)
+    nonce = f"{time.time_ns()}-{threading.get_ident()}"
+    path = directory / (
+        f"verifier_semantic_failure__{config_name}__{dataset}__{noise}__"
+        f"seed{seed}__row{row_index}__{nonce}.json"
+    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(_canonical_json(payload) + "\n", encoding="utf-8")
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path
+
+
 def _provider_cache_index_path_matches(indexed_path: Any, actual_path: Path) -> bool:
     """Accept a SHA-verified cache cell copied with its immutable index."""
     if not isinstance(indexed_path, str) or not indexed_path:
@@ -923,6 +1022,7 @@ def _provider_cache_manifest(rows: Sequence[Mapping[str, Any]], config: Mapping[
                           "dataset": dataset, "noise": noise, "seed": seed,
                           "enable_thinking": enable_thinking,
                           "thinking_mode": "thinking" if enable_thinking else "nothink"},
+        "verifier_semantic_retry": dict(OFFICIAL_VERIFIER_SEMANTIC_RETRY_POLICY),
     }
 
 
@@ -987,16 +1087,30 @@ def _validate_replay_cache_identity(
     if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
         raise ValueError("provider-cache replay identity must be a mapping")
     allowed_git_shas = {str(expected.get("git_sha", "")).lower()}
+    compatible_git_sha_set = set()
     for value in compatible_git_shas:
         normalized = str(value).lower()
         if not re.fullmatch(r"[0-9a-f]{40}", normalized):
             raise ValueError("provider-cache compatible git_sha is invalid")
         allowed_git_shas.add(normalized)
-    if str(actual.get("git_sha", "")).lower() not in allowed_git_shas:
+        compatible_git_sha_set.add(normalized)
+    actual_git_sha = str(actual.get("git_sha", "")).lower()
+    expected_git_sha = str(expected.get("git_sha", "")).lower()
+    if actual_git_sha not in allowed_git_shas:
         raise ValueError("provider-cache replay git_sha identity mismatch")
     for field in ("schema", "model_revision", "bundle_hash", "configuration", "source_digests"):
         if actual.get(field) != expected.get(field):
             raise ValueError(f"provider-cache replay {field} identity mismatch")
+    expected_retry_policy = expected.get("verifier_semantic_retry")
+    actual_retry_policy = actual.get("verifier_semantic_retry")
+    is_allowlisted_legacy_policy = (
+        actual_retry_policy is None and actual_git_sha in compatible_git_sha_set
+    )
+    if actual_git_sha == expected_git_sha and not is_allowlisted_legacy_policy:
+        if actual_retry_policy != expected_retry_policy:
+            raise ValueError("provider-cache replay semantic retry policy mismatch")
+    elif not is_allowlisted_legacy_policy and actual_retry_policy != expected_retry_policy:
+        raise ValueError("provider-cache replay semantic retry policy mismatch")
 
 
 def _validate_replay_source_rows(source_rows: Sequence[Mapping[str, Any]],
@@ -1603,9 +1717,50 @@ async def _run_provider_cache_cell(
                                    "official": True, "__return_candidates__": True,
                                    "structured_requester": limited_provider_requester,
                                    "provider_metadata": dict(identity)})
-            with sentence_context(dataset=dataset, noise=noise, seed=seed, row_index=index):
-                result = await asyncio.wait_for(
-                    default_fn(tokens, dirty, runtime_config, dataset_name=dataset), timeout=request_timeout)
+            runtime_config["verifier_semantic_interruption_recorder"] = (
+                lambda attempts, error_type: _write_verifier_semantic_failure_provenance(
+                    cache_root=cache_root,
+                    cache_tag=cache_tag,
+                    config_name=config_name,
+                    dataset=dataset,
+                    noise=noise,
+                    seed=seed,
+                    row_index=index,
+                    input_digest=_provider_input_digest(row),
+                    git_sha=git_sha.lower(),
+                    attempts=attempts,
+                    interrupted=True,
+                    terminal_error_type=error_type,
+                )
+            )
+            try:
+                with sentence_context(
+                    dataset=dataset, noise=noise, seed=seed, row_index=index
+                ):
+                    result = await asyncio.wait_for(
+                        default_fn(
+                            tokens, dirty, runtime_config, dataset_name=dataset
+                        ),
+                        timeout=request_timeout,
+                    )
+            except (VerifierSemanticRetryExhausted,
+                    VerifierSemanticRetryInterrupted) as exc:
+                interrupted = isinstance(exc, VerifierSemanticRetryInterrupted)
+                _write_verifier_semantic_failure_provenance(
+                    cache_root=cache_root,
+                    cache_tag=cache_tag,
+                    config_name=config_name,
+                    dataset=dataset,
+                    noise=noise,
+                    seed=seed,
+                    row_index=index,
+                    input_digest=_provider_input_digest(row),
+                    git_sha=git_sha.lower(),
+                    attempts=exc.records,
+                    interrupted=interrupted,
+                    terminal_error_type=exc.cause_type if interrupted else None,
+                )
+                raise
             if not isinstance(result, Mapping):
                 raise RuntimeError(f"provider-cache sentence {index} returned no stage evidence")
             anchor, evidence = result.get("pred_tags"), result.get("provider_metadata")

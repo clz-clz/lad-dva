@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from official_provider_cache import QWEN_REVISION, read_provider_cell
+from official_contract import validate_verifier_semantic_retry_evidence
 from metrics import compute_prf1, compute_ser
 from run_multiseed import (
     CONFIGURATIONS,
@@ -42,6 +43,7 @@ _FORBIDDEN_CREDENTIAL_FIELDS = frozenset({
     "api_key", "authorization", "password", "secret", "access_token",
     "credential", "credentials",
 })
+_FORBIDDEN_GOLD_FIELDS = frozenset({"gold_tags", "ner_tags", "gold_labels"})
 
 
 def _sha256_file(path: Path) -> str:
@@ -74,6 +76,18 @@ def _contains_credential_field(value: Any) -> bool:
                 return True
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return any(_contains_credential_field(item) for item in value)
+    return False
+
+
+def _contains_gold_field(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if isinstance(key, str) and key.lower() in _FORBIDDEN_GOLD_FIELDS:
+                return True
+            if _contains_gold_field(nested):
+                return True
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return any(_contains_gold_field(item) for item in value)
     return False
 
 
@@ -176,11 +190,60 @@ def audit_qwen_full(
             missing=sorted(str(path) for path in expected_cache_paths - actual_cache_paths),
             extra=sorted(str(path) for path in actual_cache_paths - expected_cache_paths),
         )
-    temporary_cache = sorted(str(path) for path in target_dir.glob("*.tmp")) \
+    temporary_cache = sorted(str(path) for path in target_dir.rglob("*.tmp")) \
         if target_dir.is_dir() else []
     if temporary_cache:
         _block(blockers, "temporary_cache", "temporary provider-cache files remain",
                files=temporary_cache)
+
+    failure_paths = sorted(target_dir.glob("failures/*.json")) \
+        if target_dir.is_dir() else []
+    for failure_path in failure_paths:
+        try:
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            if not isinstance(failure, Mapping):
+                raise ValueError("failure provenance is not an object")
+            if (_contains_credential_field(failure) or _contains_gold_field(failure)):
+                raise ValueError("failure provenance contains credential or gold fields")
+            outcome = failure.get("terminal_outcome")
+            interrupted = outcome == "nonsemantic_interruption"
+            required = {
+                "schema", "cache_tag", "config", "dataset", "noise", "seed",
+                "row_index", "input_digest", "git_sha", "terminal_outcome",
+                "attempts",
+            } | ({"terminal_error_type"} if interrupted else set())
+            if set(failure) != required:
+                raise ValueError("failure provenance fields are malformed")
+            if (failure.get("schema") != "selectdenoise-verifier-semantic-failure-v1"
+                    or failure.get("cache_tag") != cache_tag
+                    or failure.get("config") != CONFIG_NAME
+                    or failure.get("dataset") not in datasets
+                    or failure.get("noise") not in noises
+                    or failure.get("seed") not in seeds
+                    or type(failure.get("row_index")) is not int
+                    or not 0 <= failure["row_index"] < expected_rows
+                    or re.fullmatch(r"[0-9a-f]{64}", str(failure.get("input_digest", ""))) is None
+                    or str(failure.get("git_sha", "")).lower() not in allowed_git_shas
+                    or outcome not in {
+                        "semantic_retries_exhausted", "nonsemantic_interruption",
+                    }):
+                raise ValueError("failure provenance identity is malformed")
+            if interrupted and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]{0,127}",
+                str(failure.get("terminal_error_type", "")),
+            ) is None:
+                raise ValueError("failure provenance interruption type is malformed")
+            attempts = failure.get("attempts")
+            if not isinstance(attempts, list):
+                raise ValueError("failure provenance attempts are malformed")
+            validate_verifier_semantic_retry_evidence(
+                attempts, exhausted=not interrupted, interrupted=interrupted,
+            )
+        except Exception as exc:  # noqa: BLE001 - audit every failure artifact
+            _block(
+                blockers, "failure_provenance", str(exc),
+                file=str(failure_path),
+            )
 
     expected_noisy_paths = {
         _noisy_path(noisy_root, dataset, noise, seed).resolve()
@@ -320,7 +383,10 @@ def audit_qwen_full(
                             git_sha=source_producer, bundle_hash=bundle_hash.lower(),
                             enable_thinking=False,
                         )
-                        _validate_replay_cache_identity(source_manifest, source_expected)
+                        _validate_replay_cache_identity(
+                            source_manifest, source_expected,
+                            compatible_git_shas=[source_producer],
+                        )
                         if (str(source_manifest.get("git_sha", "")).lower()
                                 != source_producer
                                 or source_index["git_sha"] != source_manifest.get("git_sha")):

@@ -24,6 +24,10 @@ from official_contract import (
     OFFICIAL_DECODER_CONSTANTS,
     OFFICIAL_PROVIDER_TIMEOUT_SECONDS,
     OFFICIAL_SDK_MAX_RETRIES,
+    OFFICIAL_VERIFIER_SEMANTIC_MAX_RETRIES,
+    VerifierSemanticRetryExhausted,
+    VerifierSemanticRetryInterrupted,
+    validate_verifier_semantic_retry_evidence,
 )
 
 load_dotenv()
@@ -357,6 +361,11 @@ def _validate_contextual_official_evidence(evidence: Mapping[str, Any]) -> None:
                         or record.get("response_status") is not None
                         or record.get("finish_reason") is not None):
                     raise RuntimeError("official contextual skipped evidence claims a response")
+        if stage == "verifier":
+            try:
+                validate_verifier_semantic_retry_evidence(records)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from exc
 
 
 def _official_tag_path(content: Any, expected_length: int,
@@ -2098,6 +2107,15 @@ def _is_legal_tag_sequence(tags: List[str]) -> bool:
     return True
 
 
+def _first_illegal_tag_transition(tags: Sequence[str]) -> Optional[dict[str, Any]]:
+    previous = "O"
+    for index, current in enumerate(tags):
+        if not _is_valid_transition(previous, current):
+            return {"index": index, "previous": previous, "current": current}
+        previous = current
+    return None
+
+
 def _official_gasd_request(
     payload: Mapping[str, Any], valid_tags: Sequence[str], token_count: int
 ) -> dict[str, Any]:
@@ -2490,6 +2508,12 @@ contain exactly {n} IOB2 tags in token order. No markdown or explanation."""
 
     if official:
         requester = _require_structured_requester(state, "Verifier")
+        max_semantic_retries = state.get("verifier_semantic_max_retries", 0)
+        if (
+            type(max_semantic_retries) is not int
+            or not 0 <= max_semantic_retries <= OFFICIAL_VERIFIER_SEMANTIC_MAX_RETRIES
+        ):
+            raise ValueError("official Verifier semantic retry limit is invalid")
         schema = {
             "type": "object", "additionalProperties": False,
             "required": ["tags"],
@@ -2498,24 +2522,75 @@ contain exactly {n} IOB2 tags in token order. No markdown or explanation."""
                 "items": {"type": "string", "enum": sorted(valid_tags)},
             }},
         }
-        response = await _invoke_structured_requester(requester, "verifier", {
-            "name": "selectdenoise_verifier", "schema": schema,
-            "messages": [
-                {"role": "system", "content": "You are a strict SelectDenoise Verifier. Return only the requested JSON object."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.0,
-            "enable_thinking": _official_enable_thinking(state),
-        })
-        picked = _official_tag_path(response, n, valid_tags)
-        if not _is_legal_tag_sequence(picked):
-            raise ValueError("official Verifier returned an illegal IOB2 sequence")
-        return {
-            "current_tags": picked,
-            "provider_metadata": _with_stage_records(state, "verifier", [
-                _callback_stage_record(response, "verifier", state.get("provider_settings"))
-            ]),
-        }
+        messages = [
+            {"role": "system", "content": "You are a strict SelectDenoise Verifier. Return only the requested JSON object."},
+            {"role": "user", "content": prompt},
+        ]
+        records: list[dict[str, Any]] = []
+        for attempt in range(1, max_semantic_retries + 2):
+            try:
+                response = await _invoke_structured_requester(requester, "verifier", {
+                    "name": "selectdenoise_verifier", "schema": schema,
+                    "messages": list(messages),
+                    "temperature": 0.0,
+                    "enable_thinking": _official_enable_thinking(state),
+                })
+                # Length, ontology, and schema failures are deliberately not retried.
+                picked = _official_tag_path(response, n, valid_tags)
+            except asyncio.CancelledError:
+                recorder = state.get("verifier_semantic_interruption_recorder")
+                if records and callable(recorder):
+                    recorder(tuple(records), "CancelledError")
+                raise
+            except Exception as exc:
+                if records:
+                    raise VerifierSemanticRetryInterrupted(records, exc) from exc
+                raise
+            transition = _first_illegal_tag_transition(picked)
+            record = _callback_stage_record(
+                response, "verifier", state.get("provider_settings")
+            )
+            if transition is None:
+                if records:
+                    record.update({
+                        "semantic_attempt": attempt,
+                        "semantic_outcome": "accepted",
+                    })
+                    records.append(record)
+                    validate_verifier_semantic_retry_evidence(records)
+                else:
+                    records = [record]
+                return {
+                    "current_tags": picked,
+                    "provider_metadata": _with_stage_records(
+                        state, "verifier", records
+                    ),
+                }
+
+            record.update({
+                "semantic_attempt": attempt,
+                "semantic_outcome": "rejected_illegal_iob2",
+                "illegal_transition": transition,
+                "rejected_tags": list(picked),
+                "response_sha256": hashlib.sha256(json.dumps(
+                    {"tags": picked}, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest(),
+            })
+            records.append(record)
+            if attempt > max_semantic_retries:
+                raise VerifierSemanticRetryExhausted(records)
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous tags passed JSON, length, and ontology validation "
+                    "but failed strict IOB2 transition validation at token index "
+                    f"{transition['index']}: {transition['previous']} -> "
+                    f"{transition['current']}. Regenerate the entire tags array; do "
+                    "not explain, shorten, or locally patch the prior answer. Previous "
+                    f"rejected tags: {json.dumps(picked, ensure_ascii=False)}"
+                ),
+            })
 
     try:
         response = await asyncio.to_thread(llm.invoke, prompt)
@@ -2699,6 +2774,12 @@ async def run_agent_pipeline(tokens: List[str], dirty_tags: List[str],
         "use_verifier": config.get("use_verifier", True),
         "verify_all": config.get("verify_all", False),
         "verifier_topk": config.get("verifier_topk", 4),
+        "verifier_semantic_max_retries": config.get(
+            "verifier_semantic_max_retries", 0
+        ),
+        "verifier_semantic_interruption_recorder": config.get(
+            "verifier_semantic_interruption_recorder"
+        ),
     }
     
     return_candidates = bool(config.get("__return_candidates__"))
