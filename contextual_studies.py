@@ -538,17 +538,20 @@ def prepare_inputs(
     source_tag: str = SOURCE_TAG,
     *,
     frozen_source_root: Path,
+    formal_source_root: Path = Path("results_multiseed"),
 ) -> dict[str, Any]:
-    """Copy and verify the authoritative DeepSeek study input bank.
+    """Prepare the paired study bank with the existing formal Qwen r15 inputs.
 
-    The source predictions are intentionally not imported: only the immutable
-    225 noisy-input files and paired 450-row selection define cross-backbone
-    experimental parity.
+    The frozen DeepSeek artifact remains authoritative for the locked 450-row
+    selection and the four non-r15 gradient points.  The r15 slice is replaced
+    by the canonical Qwen formal inputs so Full and the r15 gradient can reuse
+    the already completed formal Qwen matrix exactly.
     """
     root = Path(root)
     if source_tag != SOURCE_TAG:
         raise ValueError("study source tag does not identify the frozen input bank")
     frozen_source_root = Path(frozen_source_root)
+    formal_source_root = Path(formal_source_root)
     source_manifest_path = frozen_source_root / "manifest.json"
     source_input_manifest_path = frozen_source_root / "input_manifest.json"
     source_selection_path = frozen_source_root / "selection.json"
@@ -597,6 +600,8 @@ def prepare_inputs(
     )
 
     copied_hashes: dict[str, str] = {}
+    r15_hashes: dict[str, str] = {}
+    frozen_non_r15_hashes: dict[str, str] = {}
     for ratio in GRADIENT_RATIOS:
         for dataset in DATASETS:
             for noise in NOISE_TYPES:
@@ -604,10 +609,25 @@ def prepare_inputs(
                     relative = Path("inputs") / rate_token(ratio) / (
                         f"noisy_seed{seed}__{noise}__{dataset}__N{SAMPLE_SIZE}.jsonl"
                     )
-                    source = frozen_source_root / relative
-                    expected = expected_hashes.get(relative.as_posix())
-                    if not source.is_file() or expected != sha256_file(source):
-                        raise ValueError(f"frozen input SHA mismatch: {relative.as_posix()}")
+                    if abs(float(ratio) - OFFICIAL_RATIO) < 1e-12:
+                        source = formal_source_root / (
+                            f"noisy_seed{seed}__{noise}__{dataset}"
+                            f"__N{SAMPLE_SIZE}.jsonl"
+                        )
+                        if not source.is_file():
+                            raise FileNotFoundError(
+                                f"formal Qwen r15 input is missing: {source}"
+                            )
+                        expected = sha256_file(source)
+                        r15_hashes[relative.as_posix()] = expected
+                    else:
+                        source = frozen_source_root / relative
+                        expected = expected_hashes.get(relative.as_posix())
+                        if not source.is_file() or expected != sha256_file(source):
+                            raise ValueError(
+                                f"frozen input SHA mismatch: {relative.as_posix()}"
+                            )
+                        frozen_non_r15_hashes[relative.as_posix()] = expected
                     rows = load_jsonl(source)
                     if len(rows) != SAMPLE_SIZE:
                         raise ValueError(
@@ -639,8 +659,13 @@ def prepare_inputs(
         "noise_types": list(NOISE_TYPES),
         "seeds": list(SEEDS),
         "selection_rows": len(selection),
+        "r15_source_tag": "qwen32b-contextual-nothink-v1",
         "frozen_source_manifest_sha256": sha256_file(source_manifest_path),
         "frozen_selection_sha256": sha256_file(source_selection_path),
+        "r15_input_files_sha256": dict(sorted(r15_hashes.items())),
+        "frozen_non_r15_input_files_sha256": dict(
+            sorted(frozen_non_r15_hashes.items())
+        ),
         "input_files_sha256": dict(sorted(copied_hashes.items())),
         "input_files": sorted(
             str(path.relative_to(root))

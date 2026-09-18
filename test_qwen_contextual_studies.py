@@ -59,14 +59,21 @@ def _frozen_fixture(tmp_path, monkeypatch):
     monkeypatch.setattr(study, "FROZEN_SOURCE_MANIFEST_SHA256", _sha(source / "manifest.json"))
     monkeypatch.setattr(study, "FROZEN_INPUT_MANIFEST_SHA256", _sha(source / "input_manifest.json"))
     monkeypatch.setattr(study, "FROZEN_SELECTION_SHA256", _sha(source / "selection.json"))
-    return source, relative, rows
+    formal = tmp_path / "formal-r15"
+    _write_jsonl(
+        formal / "noisy_seed13__BT__msra__N2.jsonl",
+        rows,
+    )
+    return source, formal, relative, rows
 
 
 def test_prepare_inputs_copies_only_sha_verified_frozen_bank(tmp_path, monkeypatch):
-    source, relative, rows = _frozen_fixture(tmp_path, monkeypatch)
+    source, formal, relative, rows = _frozen_fixture(tmp_path, monkeypatch)
     target = tmp_path / "qwen-study"
 
-    manifest = study.prepare_inputs(target, frozen_source_root=source)
+    manifest = study.prepare_inputs(
+        target, frozen_source_root=source, formal_source_root=formal,
+    )
 
     assert study.load_jsonl(target / relative) == rows
     assert manifest["selection_rows"] == 1
@@ -74,19 +81,24 @@ def test_prepare_inputs_copies_only_sha_verified_frozen_bank(tmp_path, monkeypat
     assert json.loads((target / "selection.json").read_text(encoding="utf-8"))[0]["seed"] == 13
 
 
-def test_prepare_inputs_rejects_tampered_frozen_file(tmp_path, monkeypatch):
-    source, relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
-    with (source / relative).open("a", encoding="utf-8") as handle:
-        handle.write("{}\n")
+def test_prepare_inputs_rejects_tampered_frozen_selection(tmp_path, monkeypatch):
+    source, formal, _relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
+    with (source / "selection.json").open("a", encoding="utf-8") as handle:
+        handle.write(" \n")
 
-    with pytest.raises(ValueError, match="SHA mismatch"):
-        study.prepare_inputs(tmp_path / "qwen-study", frozen_source_root=source)
+    with pytest.raises(ValueError, match="selection SHA mismatch"):
+        study.prepare_inputs(
+            tmp_path / "qwen-study", frozen_source_root=source,
+            formal_source_root=formal,
+        )
 
 
 def test_every_phase_rehashes_prepared_frozen_inputs(tmp_path, monkeypatch):
-    source, relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
+    source, formal, relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
     target = tmp_path / "qwen-study"
-    study.prepare_inputs(target, frozen_source_root=source)
+    study.prepare_inputs(
+        target, frozen_source_root=source, formal_source_root=formal,
+    )
 
     assert runner.verify_frozen_inputs(target) == {
         relative.as_posix(): _sha(source / relative),
@@ -98,9 +110,15 @@ def test_every_phase_rehashes_prepared_frozen_inputs(tmp_path, monkeypatch):
 
 
 def test_prepared_manifest_cannot_redeclare_a_tampered_input(tmp_path, monkeypatch):
-    source, relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
+    source, formal, relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
     target = tmp_path / "qwen-study"
-    study.prepare_inputs(target, frozen_source_root=source)
+    study.prepare_inputs(
+        target, frozen_source_root=source, formal_source_root=formal,
+    )
+    original_manifest_sha = _sha(target / "input_manifest.json")
+    _write_json(target / "manifest.json", {
+        "input_manifest_sha256": original_manifest_sha,
+    })
 
     with (target / relative).open("a", encoding="utf-8") as handle:
         handle.write("{}\n")
@@ -111,6 +129,28 @@ def test_prepared_manifest_cannot_redeclare_a_tampered_input(tmp_path, monkeypat
 
     with pytest.raises(ValueError, match="provenance is invalid"):
         runner.verify_frozen_inputs(target)
+
+
+def test_prepare_inputs_replaces_frozen_r15_with_formal_qwen_input(
+    tmp_path, monkeypatch,
+):
+    source, formal, relative, _rows = _frozen_fixture(tmp_path, monkeypatch)
+    formal_rows = [
+        {"tokens": ["Alice"], "ner_tags": ["B-PER"], "dirty_tags": ["B-PER"]},
+        {"tokens": ["Paris"], "ner_tags": ["B-LOC"], "dirty_tags": ["O"]},
+    ]
+    _write_jsonl(formal / "noisy_seed13__BT__msra__N2.jsonl", formal_rows)
+
+    target = tmp_path / "qwen-study"
+    manifest = study.prepare_inputs(
+        target, frozen_source_root=source, formal_source_root=formal,
+    )
+
+    assert study.load_jsonl(target / relative) == formal_rows
+    assert manifest["r15_source_tag"] == "qwen32b-contextual-nothink-v1"
+    assert manifest["r15_input_files_sha256"] == {
+        relative.as_posix(): _sha(formal / "noisy_seed13__BT__msra__N2.jsonl")
+    }
 
 
 def test_qwen_manifest_is_no_thinking_and_secret_free():
@@ -145,6 +185,25 @@ def test_qwen_runner_protocol_matches_deepseek_study_matrix():
     assert protocol["no_exception_fallback"] is True
 
 
+def test_r15_source_is_the_existing_formal_qwen_matrix():
+    protocol = runner._protocol()
+
+    assert runner.SOURCE_CACHE_TAG == runner.run_multiseed.QWEN_FORMAL_CACHE_TAG
+    assert protocol["r15_source_tag"] == runner.run_multiseed.QWEN_FORMAL_CACHE_TAG
+    assert protocol["r15_provider_rows_new"] == 0
+    assert protocol["r15_gradient_rows_reused"] == 450
+
+
+def test_source_cache_phase_refuses_to_repeat_the_formal_matrix(tmp_path, monkeypatch):
+    def unexpected_live_factory(_tag):
+        raise AssertionError("source-cache must not construct a live provider")
+
+    monkeypatch.setattr(runner, "_live_factory", unexpected_live_factory)
+
+    with pytest.raises(RuntimeError, match="existing formal Qwen cache"):
+        runner.run_source_cache(tmp_path / "study", tmp_path / "cache")
+
+
 def test_decorate_preserves_coordinates_and_locked_selection():
     row = {
         "tokens": ["Alice"], "gold_tags": ["B-PER"], "pred_tags": ["B-PER"],
@@ -173,7 +232,7 @@ def _auditable_row():
     from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
 
     def evidence(stage, status):
-        return {
+        record = {
             "stage": stage, "status": status, "provider": "vllm",
             "model": "Qwen/Qwen3-32B-AWQ",
             "served_model": (
@@ -183,6 +242,16 @@ def _auditable_row():
             "structured_api": "chat-completions-json-schema",
             "enable_thinking": False, "thinking_mode": "nothink",
         }
+        if status == "live":
+            record.update({
+                "response_model": (
+                    "Qwen/Qwen3-32B-AWQ@"
+                    "0499c3ac83fdef8810b907a23894ba91e95eddd8"
+                ),
+                "response_status": "completed", "finish_reason": "stop",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            })
+        return record
 
     return {
         "tokens": ["Alice"], "gold_tags": ["B-PER"], "pred_tags": ["B-PER"],
@@ -194,7 +263,7 @@ def _auditable_row():
         "candidate_paths": [["B-PER"], ["O"]],
         "rag_weights": [0.8, 0.2], "confidence": [0.8],
         "provider_metadata": {
-            "coder": [evidence("coder", "live")],
+            "coder": [evidence("coder", "live") for _ in range(3)],
             "reviewer": [evidence("reviewer", "live")],
             "verifier": [evidence("verifier", "live")],
         },
@@ -299,50 +368,14 @@ def test_audit_recomputes_minus_contextual_semantics():
         )
 
 
-def test_source_cache_routes_frozen_rows_through_explicit_study_contract(
-    tmp_path, monkeypatch,
-):
-    monkeypatch.setattr(study, "DATASETS", ("msra",))
-    monkeypatch.setattr(study, "NOISE_TYPES", ("BT",))
-    monkeypatch.setattr(study, "SEEDS", (13,))
-    monkeypatch.setattr(study, "SAMPLE_SIZE", 1)
-    root = tmp_path / "study"
-    input_path = study.study_input_path(root, "msra", "BT", 13, 0.15)
-    _write_jsonl(input_path, [{
-        "tokens": ["Alice"], "ner_tags": ["B-PER"], "dirty_tags": ["O"],
-    }])
-    monkeypatch.setattr(runner, "_require_clean_worktree", lambda: None)
-    monkeypatch.setattr(runner, "_git_sha", lambda: "a" * 40)
-    monkeypatch.setattr(runner, "ensure_manifest", lambda *_a, **_k: {})
-    monkeypatch.setattr(runner.run_multiseed, "_import_pipeline", lambda _dummy: (object(), {}))
+def test_source_cache_never_routes_rows_to_a_live_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_live_factory",
+        lambda _tag: (_ for _ in ()).throw(AssertionError("unexpected live provider")),
+    )
 
-    class Factory:
-        closed = False
-
-        def close(self):
-            self.closed = True
-
-    factory = Factory()
-    monkeypatch.setattr(runner, "_live_factory", lambda _tag: factory)
-    observed = []
-
-    async def fake_cache(*args, **kwargs):
-        observed.append((args, kwargs))
-        return {"row_count": 1}
-
-    monkeypatch.setattr(runner.run_multiseed, "_run_provider_cache_cell", fake_cache)
-
-    runner.run_source_cache(root, tmp_path / "cache", max_concurrency=2)
-
-    assert factory.closed is True
-    assert len(observed) == 1
-    args, kwargs = observed[0]
-    assert args[2:6] == ("msra", "BT", 13, 1)
-    assert kwargs["explicit_source_rows"][0]["tokens"] == ["Alice"]
-    assert kwargs["study_identity"]["variant"] == "full"
-    assert kwargs["study_identity"]["coordinates_sha256"] == runner._sha256_json([
-        {"seed": 13, "row_index": 0},
-    ])
+    with pytest.raises(RuntimeError, match="existing formal Qwen cache"):
+        runner.run_source_cache(tmp_path / "study", tmp_path / "cache")
 
 
 def test_reviewer_weighting_row_cache_resumes_without_repeating_paid_rows(
@@ -522,21 +555,17 @@ def test_cache_registry_rehashes_indexed_cells_before_audit(tmp_path, monkeypatc
     cache_root = tmp_path / "cache"
     root = tmp_path / "study"
     tag = runner.SOURCE_CACHE_TAG
+    monkeypatch.setattr(runner, "FORMAL_CACHE_PRODUCER_GIT_SHAS", ("a" * 40,))
     monkeypatch.setattr(runner, "_expected_cache_counts", lambda _root: {tag: 1})
     monkeypatch.setattr(study, "SAMPLE_SIZE", 1)
     row = {"tokens": ["Alice"], "dirty_tags": ["O"]}
     _write_json(root / "selection.json", [])
     input_path = study.study_input_path(root, "msra", "BT", 13, 0.15)
     _write_jsonl(input_path, [{**row, "ner_tags": ["B-PER"]}])
-    identity = runner._study_identity(
-        root, kind="ablation", variant="full", dataset="msra", noise="BT",
-        seed=13, ratio=0.15, coordinates=[{"seed": 13, "row_index": 0}],
-    )
     manifest = runner.run_multiseed._provider_cache_manifest(
         [row], runner.run_multiseed.CONFIGURATIONS[runner.CONFIG_NAME],
         dataset="msra", noise="BT", seed=13, git_sha="a" * 40,
         bundle_hash=LOCKED_BUNDLE_MANIFEST_HASH, enable_thinking=False,
-        study_identity=identity,
     )
     prediction = _auditable_row()
     record = {
@@ -568,7 +597,7 @@ def test_cache_registry_rehashes_indexed_cells_before_audit(tmp_path, monkeypatc
     assert runner._validated_cache_registry(root, cache_root)[sha]["records"] == [record]
 
     wrong_manifest = json.loads(json.dumps(manifest))
-    wrong_manifest["configuration"]["study_pipeline_config"]["deanchor_atf"] = False
+    wrong_manifest["configuration"]["terminal_decoder"] = "wrong-decoder"
     wrong_sha = runner.run_multiseed.write_provider_cell(
         cell_path, [record], wrong_manifest,
     )
@@ -583,7 +612,7 @@ def test_cache_registry_rehashes_indexed_cells_before_audit(tmp_path, monkeypatc
             "provider_fingerprint": "e" * 64,
         },
     )
-    with pytest.raises(ValueError, match="manifest identity mismatch"):
+    with pytest.raises(ValueError, match="configuration identity mismatch"):
         runner._validated_cache_registry(root, cache_root)
 
     sha = runner.run_multiseed.write_provider_cell(cell_path, [record], manifest)
@@ -608,6 +637,7 @@ def test_reviewer_cache_must_reuse_exact_source_coder_evidence(tmp_path, monkeyp
     from contextual_lattice_runtime import LOCKED_BUNDLE_MANIFEST_HASH
 
     root, cache_root = tmp_path / "study", tmp_path / "cache"
+    monkeypatch.setattr(runner, "FORMAL_CACHE_PRODUCER_GIT_SHAS", ("a" * 40,))
     monkeypatch.setattr(study, "SAMPLE_SIZE", 1)
     monkeypatch.setattr(runner, "_expected_cache_counts", lambda _root: {
         runner.SOURCE_CACHE_TAG: 1, runner.REVIEWER_CACHE_TAG: 1,
@@ -635,7 +665,7 @@ def test_reviewer_cache_must_reuse_exact_source_coder_evidence(tmp_path, monkeyp
             [noisy], runner.run_multiseed.CONFIGURATIONS[runner.CONFIG_NAME],
             dataset="msra", noise="BT", seed=13, git_sha="a" * 40,
             bundle_hash=LOCKED_BUNDLE_MANIFEST_HASH, enable_thinking=False,
-            study_identity=identity,
+            study_identity=(None if tag == runner.SOURCE_CACHE_TAG else identity),
         )
         path = runner.run_multiseed._provider_cache_cell_path(
             cache_root, tag, runner.CONFIG_NAME, "msra", "BT", 13,

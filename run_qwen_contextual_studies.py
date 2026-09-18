@@ -22,12 +22,20 @@ from contextual_lattice_runtime import LOCKED_BUNDLE_MANIFEST_HASH
 from official_provider_cache import QWEN_MODEL, QWEN_REVISION, QWEN_SERVED_MODEL
 
 
-STUDY_TAG = "qwen32b-contextual-nothink-studies-v1"
-SOURCE_CACHE_TAG = f"{STUDY_TAG}-source-r15"
+STUDY_TAG = "qwen32b-contextual-nothink-studies-v2-formal-r15"
+# The confirmed protocol reuses the already audited formal Qwen matrix at
+# r15.  A study-specific source cache would repeat 9,000 paid provider rows and
+# would no longer be the existing formal Full condition.
+SOURCE_CACHE_TAG = run_multiseed.QWEN_FORMAL_CACHE_TAG
 REVIEWER_CACHE_TAG = f"{STUDY_TAG}-minus-reviewer-weighting-r15"
 DEFAULT_ROOT = Path("contextual_studies") / STUDY_TAG
 CONFIG_NAME = "selectdenoise_contextual_lattice"
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+FORMAL_CACHE_PRODUCER_GIT_SHAS = (
+    "ddd93acfc87f46ecf4474e60bcccbbd30da54dd7",
+    "1544f7bddf7a0a65766492605c6e526c09462dac",
+    "3d6c5c9bfd1734a08720848aa94cdc6de22c9c0b",
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -107,13 +115,28 @@ def verify_frozen_inputs(root: Path) -> dict[str, str]:
         raise ValueError("prepared frozen source manifest identity is invalid")
     manifest = json.loads(input_manifest_path.read_text(encoding="utf-8"))
     expected = manifest.get("input_files_sha256")
+    r15_expected = manifest.get("r15_input_files_sha256")
+    frozen_non_r15_expected = manifest.get("frozen_non_r15_input_files_sha256")
     if (manifest.get("frozen_source_manifest_sha256")
             != study.FROZEN_SOURCE_MANIFEST_SHA256
             or manifest.get("frozen_selection_sha256")
             != study.FROZEN_SELECTION_SHA256
             or not isinstance(expected, Mapping)
-            or dict(expected) != dict(authoritative)):
+            or not isinstance(r15_expected, Mapping)
+            or not isinstance(frozen_non_r15_expected, Mapping)
+            or set(expected) != set(r15_expected) | set(frozen_non_r15_expected)
+            or set(r15_expected) & set(frozen_non_r15_expected)
+            or any(expected.get(key) != value for key, value in r15_expected.items())
+            or any(expected.get(key) != value
+                   for key, value in frozen_non_r15_expected.items())
+            or any(authoritative.get(key) != value
+                   for key, value in frozen_non_r15_expected.items())):
         raise ValueError("prepared frozen-input provenance is invalid")
+    study_manifest_path = root / "manifest.json"
+    if study_manifest_path.is_file():
+        study_manifest = json.loads(study_manifest_path.read_text(encoding="utf-8"))
+        if study_manifest.get("input_manifest_sha256") != _sha256_file(input_manifest_path):
+            raise ValueError("prepared frozen-input provenance is invalid")
     expected_keys = set(expected)
     actual_paths = sorted((root / "inputs").rglob("*.jsonl"))
     actual_keys = {path.relative_to(root).as_posix() for path in actual_paths}
@@ -153,6 +176,9 @@ def _protocol() -> dict[str, Any]:
         "no_exception_fallback": True,
         "noise_strength_not_exposed_to_prompt": True,
         "frozen_input_source": study.SOURCE_TAG,
+        "r15_source_tag": run_multiseed.QWEN_FORMAL_CACHE_TAG,
+        "r15_provider_rows_new": 0,
+        "r15_gradient_rows_reused": 450,
     }
 
 
@@ -252,34 +278,12 @@ def _live_factory(expected_tag: str):
 
 
 def run_source_cache(root: Path, cache_root: Path, *, max_concurrency: int = 32) -> None:
-    """Build the 45-cell r15 provider source used by every ablation."""
-    _require_clean_worktree()
-    git_sha = _git_sha()
-    ensure_manifest(root, git_sha)
-    factory = _live_factory(STUDY_TAG)
-    pipelines = run_multiseed._import_pipeline(False)
-    try:
-        for dataset in study.DATASETS:
-            for noise in study.NOISE_TYPES:
-                for seed in study.SEEDS:
-                    rows = _input_rows(root, dataset, noise, seed, study.OFFICIAL_RATIO)
-                    coords = [{"seed": seed, "row_index": index} for index in range(len(rows))]
-                    identity = _study_identity(
-                        root, kind="ablation", variant="full", dataset=dataset,
-                        noise=noise, seed=seed, ratio=study.OFFICIAL_RATIO,
-                        coordinates=coords,
-                    )
-                    asyncio.run(run_multiseed._run_provider_cache_cell(
-                        CONFIG_NAME, run_multiseed.CONFIGURATIONS[CONFIG_NAME],
-                        dataset, noise, seed, len(rows), pipelines,
-                        cache_root=cache_root, cache_tag=SOURCE_CACHE_TAG,
-                        max_concurrency=max_concurrency, request_timeout=7200.0,
-                        adapter_factory=factory, git_sha=git_sha,
-                        bundle_hash=LOCKED_BUNDLE_MANIFEST_HASH,
-                        explicit_source_rows=rows, study_identity=identity,
-                    ))
-    finally:
-        factory.close()
+    """Reject the obsolete paid source pass; Full comes from the formal run."""
+    del root, cache_root, max_concurrency
+    raise RuntimeError(
+        "source-cache is disabled: reuse the existing formal Qwen cache and "
+        "predictions through source-replay"
+    )
 
 
 def _decorate(
@@ -320,14 +324,66 @@ def _decorate(
     return decorated
 
 
+def _formal_prediction_path(dataset: str, noise: str, seed: int) -> Path:
+    return Path("predictions_multiseed") / (
+        f"pred_seed{seed}__{CONFIG_NAME}__{dataset}__{noise}"
+        f"__{run_multiseed.QWEN_FORMAL_CACHE_TAG}.jsonl"
+    )
+
+
+def _load_formal_provider_cell(
+    cache_root: Path, *, dataset: str, noise: str, seed: int,
+    rows: Sequence[Mapping[str, Any]], git_sha: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    key = run_multiseed._provider_cache_cell_key(
+        CONFIG_NAME, dataset, noise, seed,
+    )
+    indexed = run_multiseed._read_provider_cache_index_cell(
+        cache_root, SOURCE_CACHE_TAG, key,
+    )
+    cell_path = run_multiseed._provider_cache_cell_path(
+        cache_root, SOURCE_CACHE_TAG, CONFIG_NAME, dataset, noise, seed,
+    )
+    if (not run_multiseed._provider_cache_index_path_matches(
+            indexed["path"], cell_path)
+            or indexed["row_count"] != len(rows)):
+        raise ValueError("formal provider-cache index identity mismatch")
+    cached = run_multiseed.read_provider_cell(
+        cell_path, str(indexed["sha256"]), len(rows),
+    )
+    expected_manifest = run_multiseed._provider_cache_manifest(
+        rows, run_multiseed.CONFIGURATIONS[CONFIG_NAME],
+        dataset=dataset, noise=noise, seed=seed, git_sha=git_sha,
+        bundle_hash=LOCKED_BUNDLE_MANIFEST_HASH, enable_thinking=False,
+    )
+    actual_manifest = run_multiseed._read_provider_cache_manifest(cell_path)
+    run_multiseed._validate_replay_cache_identity(
+        actual_manifest, expected_manifest,
+        compatible_git_shas=FORMAL_CACHE_PRODUCER_GIT_SHAS,
+    )
+    if (indexed["git_sha"] != actual_manifest["git_sha"]
+            or indexed["model_revision"] != QWEN_REVISION):
+        raise ValueError("formal provider-cache index provenance mismatch")
+    run_multiseed._validate_replay_source_rows(rows, cached)
+    provider_identity = {
+        "provider": "vllm", "model": QWEN_MODEL,
+        "served_model": QWEN_SERVED_MODEL, "revision": QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False, "thinking_mode": "nothink",
+    }
+    for record in cached:
+        run_multiseed._validate_contextual_provider_evidence(
+            record["provider_metadata"], provider_identity, noise,
+        )
+    return str(indexed["sha256"]).lower(), cached
+
+
 def run_source_replay(root: Path, cache_root: Path, *, max_concurrency: int = 32) -> None:
-    """Replay the source cache locally into the full ablation namespace."""
+    """Import the existing formal Full matrix and provider traces offline."""
+    del max_concurrency
     git_sha = _git_sha()
     ensure_manifest(root, git_sha)
     selection = study.load_selection(root)
-    from multi_agent_v2 import _load_contextual_lattice_terminal, run_contextual_lattice_replay
-
-    terminal = _load_contextual_lattice_terminal()
     for dataset in study.DATASETS:
         for noise in study.NOISE_TYPES:
             for seed in study.SEEDS:
@@ -341,34 +397,46 @@ def run_source_replay(root: Path, cache_root: Path, *, max_concurrency: int = 32
                     )
                     continue
                 rows = _input_rows(root, dataset, noise, seed, study.OFFICIAL_RATIO)
-                coords = [{"seed": seed, "row_index": index} for index in range(len(rows))]
-                identity = _study_identity(
-                    root, kind="ablation", variant="full", dataset=dataset,
-                    noise=noise, seed=seed, ratio=study.OFFICIAL_RATIO,
-                    coordinates=coords,
+                cache_sha, provider_rows = _load_formal_provider_cell(
+                    cache_root, dataset=dataset, noise=noise, seed=seed,
+                    rows=rows, git_sha=git_sha,
                 )
-                staging = output.with_suffix(".replay.jsonl")
-                asyncio.run(run_multiseed._run_contextual_replay_cell(
-                    dataset, noise, seed, len(rows), cache_root=cache_root,
-                    cache_tag=SOURCE_CACHE_TAG,
-                    bundle_hash=LOCKED_BUNDLE_MANIFEST_HASH, git_sha=git_sha,
-                    replay_fn=run_contextual_lattice_replay, terminal=terminal,
-                    max_concurrency=max_concurrency, prediction_path=staging,
-                    enable_thinking=False, explicit_source_rows=rows,
-                    study_identity=identity,
-                ))
-                replayed = study.load_jsonl(staging)
+                formal_path = _formal_prediction_path(dataset, noise, seed)
+                run_multiseed._validate_contextual_replay_prediction(
+                    formal_path, dataset, noise, cache_sha,
+                    expected_count=study.SAMPLE_SIZE, enable_thinking=False,
+                )
+                formal_rows = study.load_jsonl(formal_path)
+                coords = [{"seed": seed, "row_index": index} for index in range(len(rows))]
+                replayed = []
+                for index, (formal, noisy, provider) in enumerate(zip(
+                    formal_rows, rows, provider_rows,
+                )):
+                    if (formal.get("tokens") != noisy.get("tokens")
+                            or formal.get("gold_tags") != noisy.get("ner_tags")
+                            or provider.get("row_index") != index):
+                        raise ValueError("formal Full source alignment mismatch")
+                    item = dict(formal)
+                    item.update({
+                        "input_digest": provider["input_digest"],
+                        "candidate_paths": provider["candidate_paths"],
+                        "rag_weights": provider["rag_weights"],
+                        "confidence": provider["confidence"],
+                        "provider_metadata": provider["provider_metadata"],
+                        "provider_cache_sha256": cache_sha,
+                        "fallback_used": False,
+                    })
+                    replayed.append(item)
                 decorated = _decorate(
                     replayed, kind="ablation", variant="full", dataset=dataset,
                     noise=noise, ratio=study.OFFICIAL_RATIO,
-                    coordinates=coords, origin="provider_cache_replay",
+                    coordinates=coords, origin="formal_prediction_reuse",
                     selection=selection,
                 )
                 study._write_variant_cell(
                     root, "full", dataset, noise, study.OFFICIAL_RATIO,
                     seed, decorated,
                 )
-                staging.unlink(missing_ok=True)
 
 
 def _terminal_replay(
@@ -1017,11 +1085,43 @@ def _validated_cache_registry(
             )
             manifest = run_multiseed._read_provider_cache_manifest(actual_path)
             configuration = manifest.get("configuration", {})
-            identity = configuration.get("study") if isinstance(configuration, Mapping) else None
             if tag == SOURCE_CACHE_TAG:
-                expected_kind, expected_variant = "ablation", "full"
-                expected_ratio = study.OFFICIAL_RATIO
-            elif tag == REVIEWER_CACHE_TAG:
+                dataset = configuration.get("dataset")
+                noise = configuration.get("noise")
+                seed = configuration.get("seed")
+                if (dataset not in study.DATASETS or noise not in study.NOISE_TYPES
+                        or seed not in study.SEEDS or row_count != study.SAMPLE_SIZE):
+                    raise ValueError(
+                        f"formal provider-cache coordinates are invalid: {tag}/{key}"
+                    )
+                source_rows = _input_rows(
+                    root, dataset, noise, seed, study.OFFICIAL_RATIO,
+                )
+                verified_sha, verified_records = _load_formal_provider_cell(
+                    cache_root, dataset=dataset, noise=noise, seed=seed,
+                    rows=source_rows, git_sha=_git_sha(),
+                )
+                if verified_sha != sha or verified_records != records:
+                    raise ValueError(
+                        f"formal provider-cache verification mismatch: {tag}/{key}"
+                    )
+                identity = _study_identity(
+                    root, kind="ablation", variant="full", dataset=dataset,
+                    noise=noise, seed=seed, ratio=study.OFFICIAL_RATIO,
+                    coordinates=[
+                        {"seed": seed, "row_index": row_index}
+                        for row_index in range(study.SAMPLE_SIZE)
+                    ],
+                )
+                if sha in registry:
+                    raise ValueError("duplicate provider-cache SHA across study cells")
+                registry[sha] = {
+                    "tag": tag, "key": key, "manifest": manifest,
+                    "identity": identity, "records": records,
+                }
+                continue
+            identity = configuration.get("study") if isinstance(configuration, Mapping) else None
+            if tag == REVIEWER_CACHE_TAG:
                 expected_kind = "ablation"
                 expected_variant = "minus_reviewer_weighting"
                 expected_ratio = study.OFFICIAL_RATIO
@@ -1362,7 +1462,7 @@ def audit_outputs(root: Path, cache_root: Path) -> dict[str, Any]:
                         for row_index, row in enumerate(rows):
                             expected_origin = "offline_replay"
                             if variant == "full":
-                                expected_origin = "provider_cache_replay"
+                                expected_origin = "formal_prediction_reuse"
                             elif variant == "minus_reviewer_weighting":
                                 expected_origin = "source_coder_verifier_live"
                             elif variant == "minus_atf_deanchor" and noise == "ATF":
@@ -1500,6 +1600,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--cache-root", type=Path, default=Path("provider_cache"))
     parser.add_argument("--frozen-source-root", type=Path)
+    parser.add_argument(
+        "--formal-source-root", type=Path, default=Path("results_multiseed"),
+    )
     parser.add_argument("--max-concurrency", type=int, default=32)
     return parser.parse_args(argv)
 
@@ -1512,6 +1615,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("prepare requires --frozen-source-root")
         study.prepare_inputs(
             root, frozen_source_root=args.frozen_source_root.resolve(),
+            formal_source_root=args.formal_source_root.resolve(),
         )
         return
     verify_frozen_inputs(root)
