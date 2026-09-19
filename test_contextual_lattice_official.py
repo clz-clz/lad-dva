@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from langgraph.graph import START, StateGraph
 
 import multi_agent_v2
 from live_backbone import LiveBackboneResult
@@ -16,6 +17,22 @@ from official_contract import (
 REVISION = "0499c3ac83fdef8810b907a23894ba91e95eddd8"
 SERVED_MODEL = f"Qwen/Qwen3-32B-AWQ@{REVISION}"
 MODEL_HASH = "b" * 64
+
+
+def test_official_verifier_retry_controls_survive_graph_state_boundary():
+    graph = StateGraph(multi_agent_v2.State)
+    graph.add_node("capture", lambda state: {
+        "current_tags": [
+            str(state.get("verifier_semantic_max_retries")),
+            str(callable(state.get("verifier_semantic_interruption_recorder"))),
+        ],
+    })
+    graph.add_edge(START, "capture")
+    result = graph.compile().invoke({
+        "verifier_semantic_max_retries": 2,
+        "verifier_semantic_interruption_recorder": lambda *_args: None,
+    })
+    assert result["current_tags"] == ["2", "True"]
 
 
 def _settings():

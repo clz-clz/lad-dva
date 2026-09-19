@@ -168,6 +168,10 @@ class State(TypedDict):
     use_verifier: bool
     verify_all: bool             # ablation: verify every sentence (no trigger)
     verifier_topk: int           # max distinct candidate paths shown to verifier
+    verifier_semantic_max_retries: int
+    verifier_semantic_interruption_recorder: Optional[
+        Callable[[Sequence[Mapping[str, Any]], str], None]
+    ]
 
 
 _PROVIDER_STAGES = ("coder", "reviewer", "ror", "gasd")
