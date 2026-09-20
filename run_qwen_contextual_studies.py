@@ -276,8 +276,18 @@ def ensure_manifest(root: Path, git_sha: str) -> dict[str, Any]:
             }
             continuation_path = root / "invalid_output_continuation.json"
             if continuation_path.exists():
-                if json.loads(continuation_path.read_text(encoding="utf-8")) != continuation:
+                existing_continuation = json.loads(
+                    continuation_path.read_text(encoding="utf-8")
+                )
+                immutable_keys = (
+                    "schema", "parent_manifest_sha256", "parent_git_sha",
+                    "scope", "invalid_row_scoring",
+                )
+                if any(existing_continuation.get(key) != continuation[key]
+                       for key in immutable_keys):
                     raise ValueError("invalid-output continuation collision")
+                if existing_continuation != continuation:
+                    study._write_json_atomic(continuation_path, continuation)
             else:
                 study._write_json_atomic(continuation_path, continuation)
     else:
