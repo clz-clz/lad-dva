@@ -20,6 +20,7 @@ _RECORD_FIELDS = frozenset({
     "row_index", "input_digest", "anchor_tags", "candidate_paths",
     "rag_weights", "confidence", "provider_metadata", "fallback_used",
 })
+_INVALID_RECORD_FIELDS = _RECORD_FIELDS | {"provider_outcome_status"}
 _STAGES = frozenset({"coder", "reviewer", "verifier"})
 _FORBIDDEN_GOLD_FIELDS = frozenset({"gold_tags", "ner_tags", "gold_labels"})
 
@@ -132,8 +133,15 @@ def _validate_records(records: Sequence[Mapping[str, Any]], manifest: Mapping[st
         if not isinstance(record, Mapping):
             raise ValueError("provider-cache record must be a mapping")
         _reject_gold_fields(record)
-        if set(record) != _RECORD_FIELDS:
+        if set(record) not in {_RECORD_FIELDS, _INVALID_RECORD_FIELDS}:
             raise ValueError("provider-cache record has an invalid field set")
+        if ("provider_outcome_status" in record
+                and record["provider_outcome_status"] != "invalid_verifier_iob2"):
+            raise ValueError("provider-cache record has an invalid outcome status")
+        if (record.get("provider_outcome_status") == "invalid_verifier_iob2"
+                and (record.get("anchor_tags") != []
+                     or record.get("confidence") != [])):
+            raise ValueError("invalid Verifier cache record must not fabricate an anchor")
         index = record["row_index"]
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise ValueError("row_index must be a non-negative integer")

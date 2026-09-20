@@ -582,6 +582,7 @@ def _validate_official_provider_evidence(
 
 def _validate_contextual_provider_evidence(
     evidence: Mapping[str, Any], identity: Mapping[str, Any], noise_type: str,
+    *, allow_verifier_exhausted: bool = False,
 ) -> None:
     """Validate the immutable three-stage Contextual Lattice provider contract."""
     if set(evidence) != _OFFICIAL_CONTEXTUAL_STAGES:
@@ -641,7 +642,12 @@ def _validate_contextual_provider_evidence(
             not in {"live", "skipped_uncontested", "skipped_identical"}):
         raise RuntimeError("official contextual Verifier evidence status is unjustified")
     try:
-        validate_verifier_semantic_retry_evidence(verifier)
+        exhausted = (
+            allow_verifier_exhausted and len(verifier) == 3
+            and all(record.get("semantic_outcome") == "rejected_illegal_iob2"
+                    for record in verifier)
+        )
+        validate_verifier_semantic_retry_evidence(verifier, exhausted=exhausted)
     except ValueError as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -1308,6 +1314,7 @@ def _offline_contextual_replay_loop():
 def _validate_contextual_replay_prediction(
     path: Path, dataset: str, noise_type: str, expected_sha256: str,
     expected_count: int = OFFICIAL_SAMPLE_SIZE, enable_thinking: bool = True,
+    *, allow_invalid_verifier: bool = False,
 ) -> None:
     from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
 
@@ -1324,12 +1331,35 @@ def _validate_contextual_replay_prediction(
     }
     for index, row in enumerate(rows):
         tokens, gold, pred = row.get("tokens"), row.get("gold_tags"), row.get("pred_tags")
-        if (not isinstance(tokens, list) or not isinstance(gold, list) or not isinstance(pred, list)
+        status = row.get("prediction_status")
+        invalid = status == "invalid_verifier_iob2"
+        if (not isinstance(tokens, list) or not isinstance(gold, list)
+                or not isinstance(pred, list)
+                or (status is not None and not invalid)
                 or not len(tokens) == len(gold) == len(pred)
-                or not all(isinstance(value, str) for values in (tokens, gold, pred) for value in values)
+                or not all(isinstance(value, str)
+                           for values in (tokens, gold, pred) for value in values)
                 or any(tag not in valid for values in (gold, pred) for tag in values)
-                or not _is_legal_iob2(pred)):
+                or (not invalid and not _is_legal_iob2(pred))
+                or (invalid and not allow_invalid_verifier)):
             raise RuntimeError(f"contextual replay row {index} is structurally invalid")
+        metadata = row.get("provider_metadata")
+        if invalid:
+            records = metadata.get("verifier") if isinstance(metadata, Mapping) else None
+            if (not isinstance(records, list) or len(records) != 3
+                    or row.get("terminal_anchor_tags") is not None
+                    or row.get("terminal_model_hash") is not None
+                    or row.get("terminal_used_anchor") is not None
+                    or row.get("terminal_predicted_gain") is not None
+                    or row.get("terminal_fallback_count") != 0
+                    or row.get("fallback_used") is not False
+                    or row.get("provider_cache_sha256") != expected_sha256
+                    or pred != records[-1].get("rejected_tags")):
+                raise RuntimeError(f"contextual replay invalid row {index} lacks provenance")
+            _validate_contextual_provider_evidence(
+                metadata, identity, noise_type, allow_verifier_exhausted=True,
+            )
+            continue
         anchor = row.get("terminal_anchor_tags")
         model_hash = row.get("terminal_model_hash")
         used_anchor = row.get("terminal_used_anchor")
@@ -1345,9 +1375,9 @@ def _validate_contextual_replay_prediction(
                 or fallback_count != 0
                 or row.get("provider_cache_sha256") != expected_sha256
                 or row.get("fallback_used") is not False
-                or not isinstance(row.get("provider_metadata"), Mapping)):
+                or not isinstance(metadata, Mapping)):
             raise RuntimeError(f"contextual replay row {index} lacks terminal provenance")
-        _validate_contextual_provider_evidence(row["provider_metadata"], identity, noise_type)
+        _validate_contextual_provider_evidence(metadata, identity, noise_type)
 
 
 def _validate_provider_cache_launch(config_names: Sequence[str], *, size: int | None,
@@ -1576,6 +1606,7 @@ async def _run_provider_cache_cell(
     reuse_cache_tag: Optional[str] = None,
     explicit_source_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     study_identity: Optional[Mapping[str, Any]] = None,
+    allow_verifier_exhausted: bool = False,
 ) -> dict[str, Any]:
     """Execute only the provider graph and atomically publish one gold-free cell."""
     if explicit_source_rows is None:
@@ -1674,7 +1705,10 @@ async def _run_provider_cache_cell(
             raise ValueError("provider-cache index identity mismatch; refusing resume")
         cached = read_provider_cell(cell_path, indexed["sha256"], len(rows))
         for record in cached:
-            _validate_contextual_provider_evidence(record["provider_metadata"], identity, noise)
+            _validate_contextual_provider_evidence(
+                record["provider_metadata"], identity, noise,
+                allow_verifier_exhausted=allow_verifier_exhausted,
+            )
         return {**dict(indexed), "path": str(cell_path)}
 
     continuation_prefix: list[dict[str, Any]] = []
@@ -1799,14 +1833,47 @@ async def _run_provider_cache_cell(
                     interrupted=interrupted,
                     terminal_error_type=exc.cause_type if interrupted else None,
                 )
-                raise
+                if (not allow_verifier_exhausted
+                        or interrupted
+                        or not isinstance(exc, VerifierSemanticRetryExhausted)
+                        or not isinstance(exc.context, Mapping)):
+                    raise
+                context = dict(exc.context)
+                candidate_paths = context.get("candidate_paths")
+                rag_weights = context.get("rag_weights")
+                evidence = context.get("provider_metadata")
+                if (not isinstance(candidate_paths, list)
+                        or not isinstance(rag_weights, list)
+                        or not isinstance(evidence, Mapping)):
+                    raise RuntimeError(
+                        "exhausted Verifier context is incomplete"
+                    ) from exc
+                _validate_contextual_provider_evidence(
+                    evidence, identity, noise,
+                    allow_verifier_exhausted=True,
+                )
+                cached[index] = {
+                    "row_index": index,
+                    "input_digest": _provider_input_digest(row),
+                    "anchor_tags": [],
+                    "candidate_paths": candidate_paths,
+                    "rag_weights": rag_weights,
+                    "confidence": [],
+                    "provider_metadata": evidence,
+                    "fallback_used": False,
+                    "provider_outcome_status": "invalid_verifier_iob2",
+                }
+                return
             if not isinstance(result, Mapping):
                 raise RuntimeError(f"provider-cache sentence {index} returned no stage evidence")
             anchor, evidence = result.get("pred_tags"), result.get("provider_metadata")
             if (not isinstance(anchor, list) or len(anchor) != len(tokens)
                     or any(tag not in _valid_tags(dataset) for tag in anchor) or not _is_legal_iob2(anchor)):
                 raise RuntimeError(f"provider-cache sentence {index} returned invalid anchor tags")
-            _validate_contextual_provider_evidence(evidence, identity, noise)
+            _validate_contextual_provider_evidence(
+                evidence, identity, noise,
+                allow_verifier_exhausted=allow_verifier_exhausted,
+            )
             cached[index] = {"row_index": index, "input_digest": _provider_input_digest(row),
                              "anchor_tags": anchor, "candidate_paths": result.get("candidate_paths"),
                              "rag_weights": result.get("rag_weights"), "confidence": result.get("confidence"),
@@ -1853,6 +1920,7 @@ async def _run_contextual_replay_cell(
     explicit_source_rows: Optional[Sequence[Mapping[str, Any]]] = None,
     study_identity: Optional[Mapping[str, Any]] = None,
     config_override: Optional[Mapping[str, Any]] = None,
+    allow_invalid_verifier: bool = False,
 ) -> Path:
     """Decode one provider-cache cell locally with no provider adapter."""
     if explicit_source_rows is None:
@@ -1929,6 +1997,7 @@ async def _run_contextual_replay_cell(
     for cached in cached_rows:
         _validate_contextual_provider_evidence(
             cached["provider_metadata"], provider_identity, noise,
+            allow_verifier_exhausted=allow_invalid_verifier,
         )
     cache_sha256 = str(indexed["sha256"]).lower()
     pred_path = Path(prediction_path) if prediction_path is not None else _pred_path(
@@ -1939,6 +2008,7 @@ async def _run_contextual_replay_cell(
             pred_path, dataset, noise, cache_sha256,
             expected_count=len(source_rows),
             enable_thinking=enable_thinking,
+            allow_invalid_verifier=allow_invalid_verifier,
         )
         return pred_path
 
@@ -1957,6 +2027,36 @@ async def _run_contextual_replay_cell(
             if (not isinstance(tokens, list) or not isinstance(dirty_tags, list)
                     or not isinstance(gold_tags, list)):
                 raise ValueError(f"contextual-replay source row {index} is malformed")
+            if cached.get("provider_outcome_status") == "invalid_verifier_iob2":
+                records = cached.get("provider_metadata", {}).get("verifier", [])
+                if (not allow_invalid_verifier or len(records) != 3
+                        or not all(record.get("semantic_outcome")
+                                   == "rejected_illegal_iob2"
+                                   for record in records)):
+                    raise RuntimeError(
+                        f"contextual-replay invalid Verifier row {index} is not approved"
+                    )
+                buffer[index] = {
+                    "tokens": list(tokens), "gold_tags": list(gold_tags),
+                    "pred_tags": list(records[-1]["rejected_tags"]),
+                    "prediction_status": "invalid_verifier_iob2",
+                    "terminal_anchor_tags": None,
+                    "terminal_model_hash": None,
+                    "terminal_used_anchor": None,
+                    "terminal_predicted_gain": None,
+                    "terminal_fallback_count": 0,
+                    "provider_cache_sha256": cache_sha256,
+                    "provider_metadata": cached["provider_metadata"],
+                    "fallback_used": False,
+                }
+                if study_identity is not None:
+                    buffer[index].update({
+                        "input_digest": cached["input_digest"],
+                        "candidate_paths": cached["candidate_paths"],
+                        "rag_weights": cached["rag_weights"],
+                        "confidence": [],
+                    })
+                return
             result = await asyncio.to_thread(
                 replay_fn,
                 tokens=tokens,
@@ -2007,6 +2107,7 @@ async def _run_contextual_replay_cell(
             tmp_path, dataset, noise, cache_sha256,
             expected_count=len(source_rows),
             enable_thinking=enable_thinking,
+            allow_invalid_verifier=allow_invalid_verifier,
         )
         tmp_path.replace(pred_path)
     except BaseException:

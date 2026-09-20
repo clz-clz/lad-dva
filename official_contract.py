@@ -127,10 +127,15 @@ def validate_verifier_semantic_retry_evidence(
 class VerifierSemanticRetryExhausted(ValueError):
     """Carry credential-free rejected-attempt evidence across atomic cell aborts."""
 
-    def __init__(self, records: Sequence[Mapping[str, Any]]):
+    def __init__(self, records: Sequence[Mapping[str, Any]],
+                 context: Mapping[str, Any] | None = None):
         copied = json.loads(json.dumps(list(records), ensure_ascii=False))
         validate_verifier_semantic_retry_evidence(copied, exhausted=True)
         self.records: tuple[dict[str, Any], ...] = tuple(copied)
+        self.context = (
+            json.loads(json.dumps(dict(context), ensure_ascii=False))
+            if context is not None else None
+        )
         super().__init__(
             "official Verifier returned illegal IOB2 sequences after "
             f"{len(self.records)} attempts"

@@ -2646,7 +2646,16 @@ contain exactly {n} IOB2 tags in token order. No markdown or explanation."""
             })
             records.append(record)
             if attempt > max_semantic_retries:
-                raise VerifierSemanticRetryExhausted(records)
+                raise VerifierSemanticRetryExhausted(
+                    records,
+                    context={
+                        "candidate_paths": [list(path) for path in candidate_paths],
+                        "rag_weights": [float(value) for value in weights],
+                        "provider_metadata": _with_stage_records(
+                            state, "verifier", records,
+                        ),
+                    },
+                )
             messages.append({
                 "role": "user",
                 "content": (

@@ -247,8 +247,15 @@ def validate_study_prediction_row(
 
         metadata = row.get("provider_metadata")
         records = metadata.get("verifier") if isinstance(metadata, Mapping) else None
-        if (row.get("study_kind") != "ablation"
-                or row.get("study_variant") != "minus_reviewer_weighting"
+        scope_allowed = (
+            (row.get("study_kind") == "ablation"
+             and row.get("study_variant") in {
+                 "minus_reviewer_weighting", "minus_atf_deanchor",
+             })
+            or (row.get("study_kind") == "noise-gradient"
+                and row.get("study_variant") == "full")
+        )
+        if (not scope_allowed
                 or not isinstance(records, list)
                 or row.get("fallback_used") is not False
                 or any(row.get(field) is not None for field in (

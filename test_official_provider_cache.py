@@ -990,6 +990,123 @@ def test_exhausted_semantic_retries_persist_failure_provenance_without_a_cell(
     assert not list(target.parent.rglob("*.tmp"))
 
 
+def test_exhausted_semantic_retries_can_publish_explicit_invalid_rows(
+    tmp_path, monkeypatch,
+):
+    rows = _full_continuation_rows(tmp_path, monkeypatch)
+    cache_root = tmp_path / "cache"
+    attempts = []
+    for number in range(1, 4):
+        record = _evidence("verifier", "live")
+        record.update({
+            "semantic_attempt": number,
+            "semantic_outcome": "rejected_illegal_iob2",
+            "illegal_transition": {"index": 1, "previous": "O", "current": "I-ORG"},
+            "rejected_tags": ["O", "I-ORG"],
+            "response_sha256": run_multiseed._sha256_json(
+                {"tags": ["O", "I-ORG"]}
+            ),
+        })
+        attempts.append(record)
+    context = {
+        "candidate_paths": [["O", "I-ORG"], ["O", "O"]],
+        "rag_weights": [0.5, 0.5],
+        "provider_metadata": {
+            "coder": [_evidence("coder", "live") for _ in range(3)],
+            "reviewer": [_evidence("reviewer", "skipped_identical")],
+            "verifier": attempts,
+        },
+    }
+
+    async def exhaust_retries(*_args, **_kwargs):
+        raise VerifierSemanticRetryExhausted(attempts, context=context)
+
+    cell = asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "BT", 13, 200, (exhaust_retries, {}),
+        cache_root=cache_root,
+        cache_tag="qwen32b-contextual-nothink-invalid-v1",
+        max_concurrency=32, request_timeout=7200,
+        adapter_factory=_continuation_adapter, git_sha="a" * 40,
+        bundle_hash="b" * 64, allow_verifier_exhausted=True,
+    ))
+
+    records = official_provider_cache.read_provider_cell(
+        Path(cell["path"]), cell["sha256"], 200,
+    )
+    assert len(records) == 200
+    assert all(record["provider_outcome_status"] == "invalid_verifier_iob2"
+               for record in records)
+    assert all(record["anchor_tags"] == [] and record["confidence"] == []
+               for record in records)
+    assert all(record["provider_metadata"]["verifier"] == attempts
+               for record in records)
+
+
+def test_contextual_replay_preserves_published_invalid_verifier_row(tmp_path):
+    rows = [{"tokens": ["Alice", "x"], "dirty_tags": ["O", "O"],
+             "ner_tags": ["B-PER", "O"]}]
+    cache_root = tmp_path / "cache"
+    tag = "qwen32b-contextual-nothink-invalid-v1"
+    attempts = []
+    for number in range(1, 4):
+        record = _evidence("verifier", "live")
+        record.update({
+            "semantic_attempt": number,
+            "semantic_outcome": "rejected_illegal_iob2",
+            "illegal_transition": {"index": 1, "previous": "O", "current": "I-PER"},
+            "rejected_tags": ["O", "I-PER"],
+            "response_sha256": run_multiseed._sha256_json(
+                {"tags": ["O", "I-PER"]}
+            ),
+        })
+        attempts.append(record)
+    context = {
+        "candidate_paths": [["O", "I-PER"], ["O", "O"]],
+        "rag_weights": [0.5, 0.5],
+        "provider_metadata": {
+            "coder": [_evidence("coder", "live") for _ in range(5)],
+            "reviewer": [_evidence("reviewer", "skipped_identical")],
+            "verifier": attempts,
+        },
+    }
+
+    async def exhaust(*_args, **_kwargs):
+        raise VerifierSemanticRetryExhausted(attempts, context=context)
+
+    identity = {
+        "schema": "qwen-contextual-studies-v1", "kind": "ablation",
+        "variant": "minus_atf_deanchor", "ratio": 0.15,
+    }
+    asyncio.run(run_multiseed._run_provider_cache_cell(
+        "selectdenoise_contextual_lattice",
+        run_multiseed.CONFIGURATIONS["selectdenoise_contextual_lattice"],
+        "msra", "ATF", 13, 1, (exhaust, {}), cache_root=cache_root,
+        cache_tag=tag, max_concurrency=1, request_timeout=7200,
+        adapter_factory=_continuation_adapter, git_sha="a" * 40,
+        bundle_hash="b" * 64, explicit_source_rows=rows,
+        study_identity=identity, allow_verifier_exhausted=True,
+    ))
+
+    def must_not_replay(**_kwargs):
+        raise AssertionError("invalid Verifier rows must bypass terminal replay")
+
+    output = asyncio.run(run_multiseed._run_contextual_replay_cell(
+        "msra", "ATF", 13, 1, cache_root=cache_root, cache_tag=tag,
+        bundle_hash="b" * 64, git_sha="a" * 40, replay_fn=must_not_replay,
+        terminal=object(), max_concurrency=1,
+        prediction_path=tmp_path / "prediction.jsonl", enable_thinking=False,
+        explicit_source_rows=rows, study_identity=identity,
+        allow_invalid_verifier=True,
+    ))
+    result = json.loads(output.read_text(encoding="utf-8"))
+    assert result["prediction_status"] == "invalid_verifier_iob2"
+    assert result["pred_tags"] == ["O", "I-PER"]
+    assert result["terminal_model_hash"] is None
+    assert result["confidence"] == []
+
+
 def test_interrupted_semantic_retries_persist_rejected_prefix_without_a_cell(
     tmp_path, monkeypatch,
 ):

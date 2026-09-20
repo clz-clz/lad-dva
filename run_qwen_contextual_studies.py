@@ -636,6 +636,7 @@ def _run_live_variant_cell(
         adapter_factory=factory, git_sha=git_sha,
         bundle_hash=LOCKED_BUNDLE_MANIFEST_HASH,
         explicit_source_rows=rows, study_identity=identity,
+        allow_verifier_exhausted=True,
     ))
     from multi_agent_v2 import _load_contextual_lattice_terminal, run_contextual_lattice_replay
 
@@ -651,6 +652,7 @@ def _run_live_variant_cell(
         prediction_path=staging, enable_thinking=False,
         explicit_source_rows=rows, study_identity=identity,
         config_override=config,
+        allow_invalid_verifier=True,
     ))
 
 
@@ -1539,7 +1541,12 @@ def _audit_prediction_row(
     if invalid_verifier:
         from official_contract import validate_verifier_semantic_retry_evidence
 
-        if kind != "ablation" or variant != "minus_reviewer_weighting":
+        scope_allowed = (
+            (kind == "ablation"
+             and variant in {"minus_reviewer_weighting", "minus_atf_deanchor"})
+            or (kind == "noise-gradient" and variant == "full")
+        )
+        if not scope_allowed:
             raise ValueError("invalid Verifier outcome is outside reviewer weighting")
         matching_records = [record for record in matching_records
                             if record.get("row_index") == row.get("study_row_index")]
