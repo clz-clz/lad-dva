@@ -527,6 +527,358 @@ def test_reviewer_weighting_row_cache_resumes_without_repeating_paid_rows(
     }
 
 
+def test_exhausted_reviewer_verifier_is_counted_as_invalid_not_skipped():
+    from official_contract import VerifierSemanticRetryExhausted
+
+    identity = {
+        "stage": "verifier", "status": "live", "provider": "vllm",
+        "model": runner.QWEN_MODEL, "served_model": runner.QWEN_SERVED_MODEL,
+        "revision": runner.QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False, "thinking_mode": "nothink",
+        "response_model": runner.QWEN_SERVED_MODEL,
+        "response_status": "completed", "finish_reason": "stop",
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+    rejected = ["I-PER"]
+    digest = hashlib.sha256(
+        json.dumps({"tags": rejected}, ensure_ascii=False, sort_keys=True,
+                   separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    attempts = [{
+        **identity, "semantic_attempt": attempt,
+        "semantic_outcome": "rejected_illegal_iob2",
+        "illegal_transition": {"index": 0, "previous": "O", "current": "I-PER"},
+        "rejected_tags": rejected, "response_sha256": digest,
+    } for attempt in (1, 2, 3)]
+    error = VerifierSemanticRetryExhausted(attempts)
+    row = {
+        "tokens": ["Alice"], "gold_tags": ["B-PER"],
+        "pred_tags": rejected, "prediction_status": "invalid_verifier_iob2",
+        "terminal_anchor_tags": None, "terminal_model_hash": None,
+        "terminal_used_anchor": None, "terminal_predicted_gain": None,
+        "terminal_fallback_count": 0, "fallback_used": False,
+        "study_kind": "ablation", "study_variant": "minus_reviewer_weighting",
+        "provider_metadata": {"verifier": list(error.records)},
+    }
+    study.validate_study_prediction_row(row, "msra")
+    from analyze_contextual_studies import _metric_record
+
+    metrics = _metric_record([row])
+    assert metrics["rows"] == 1
+    assert metrics["invalid_rows"] == 1
+    assert metrics["invalid_rate"] == 1.0
+    assert metrics["f1"] is None
+    assert metrics["penalized_f1"] == 0.0
+    assert metrics["scoring_policy"] == "invalid_as_one_fp_plus_all_gold_fn"
+    valid = {
+        "gold_tags": ["B-PER"], "pred_tags": ["B-PER"],
+        "terminal_used_anchor": True, "terminal_fallback_count": 0,
+    }
+    all_o_failure = {**row, "gold_tags": ["O"]}
+    penalized = _metric_record([valid, all_o_failure])
+    assert penalized["f1"] == 1.0
+    assert penalized["penalized_f1"] == pytest.approx(2 / 3)
+    from analyze_contextual_studies import _group_bootstrap
+
+    comparison = _group_bootstrap(
+        [["B-PER"], ["O"]], [["B-PER"], ["O"]],
+        [["B-PER"], []], ["a", "b"], ["msra|ATF", "msra|ATF"],
+        iterations=20, invalid_b=[False, True],
+    )
+    assert comparison["penalized_f1_B"] == pytest.approx(2 / 3)
+    with pytest.raises(ValueError):
+        study.validate_study_prediction_row({**row, "pred_tags": ["B-PER"]}, "msra")
+
+
+def test_historical_invalid_failure_requires_original_log_and_199_row_sha(
+    tmp_path, monkeypatch,
+):
+    log = tmp_path / "reviewer.stderr.log"
+    log.write_text(
+        "official Verifier returned illegal IOB2 sequences after 3 attempts\n",
+        encoding="utf-8",
+    )
+    progress = {
+        "schema": "qwen-reviewer-row-progress-v1",
+        "cell_identity_sha256": "b" * 64,
+        "rows": {str(index): "a" * 64 for index in range(200) if index != 151},
+    }
+    progress_bytes = (
+        json.dumps(progress, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8").replace(b"\n", b"\r\n")
+    monkeypatch.setattr(runner, "HISTORICAL_REVIEWER_LOG", log)
+    monkeypatch.setattr(runner, "HISTORICAL_REVIEWER_LOG_SHA256", _sha(log))
+    monkeypatch.setattr(
+        runner, "HISTORICAL_REVIEWER_PROGRESS_SHA256",
+        hashlib.sha256(progress_bytes).hexdigest(),
+    )
+    evidence = runner._historical_reviewer_failure(
+        progress, dataset="msra", noise="IF", seed=42, row_index=151,
+    )
+    assert evidence["evidence_level"] == "log_only"
+    assert evidence["failed_attempt_count"] == 3
+    assert runner._historical_reviewer_failure(
+        progress, dataset="msra", noise="IF", seed=13, row_index=151,
+    ) is None
+    progress["rows"]["152"] = "c" * 64
+    with pytest.raises(ValueError, match="progress SHA"):
+        runner._historical_reviewer_failure(
+            progress, dataset="msra", noise="IF", seed=42, row_index=151,
+        )
+
+
+def test_existing_study_manifest_requires_immutable_policy_continuation(
+    tmp_path, monkeypatch,
+):
+    root = tmp_path / "study"
+    root.mkdir()
+    _write_json(root / "manifest.json", {"original": True})
+    _write_json(root / "input_manifest.json", {"inputs": True})
+    _write_json(root / "selection.json", [])
+    original = (root / "manifest.json").read_bytes()
+    monkeypatch.setattr(runner, "verify_frozen_inputs", lambda _root: {})
+    monkeypatch.setattr(
+        runner.study, "build_study_manifest", lambda **_kwargs: {"new": True},
+    )
+    real_sha = runner._sha256_file
+    monkeypatch.setattr(
+        runner, "_sha256_file",
+        lambda path: (runner.PRE_INVALID_POLICY_MANIFEST_SHA256
+                      if Path(path) == root / "manifest.json" else real_sha(path)),
+    )
+    with pytest.raises(ValueError, match="requires its invalid-output continuation"):
+        runner.audit_outputs(root, tmp_path / "cache")
+    runner.ensure_manifest(root, "a" * 40)
+    continuation = json.loads(
+        (root / "invalid_output_continuation.json").read_text(encoding="utf-8")
+    )
+    assert continuation["parent_manifest_sha256"] == (
+        runner.PRE_INVALID_POLICY_MANIFEST_SHA256
+    )
+    assert (root / "manifest.json").read_bytes() == original
+    runner.ensure_manifest(root, "a" * 40)
+    continuation["invalid_row_scoring"] = "changed"
+    _write_json(root / "invalid_output_continuation.json", continuation)
+    with pytest.raises(ValueError, match="continuation collision"):
+        runner.ensure_manifest(root, "a" * 40)
+
+
+def test_unrecorded_invalid_row_has_no_tags_and_exact_audit_binding(
+    tmp_path, monkeypatch,
+):
+    import multi_agent_v2
+
+    cache_root = tmp_path / "cache"
+    log = tmp_path / "reviewer.stderr.log"
+    log.write_text(
+        "official Verifier returned illegal IOB2 sequences after 3 attempts\n",
+        encoding="utf-8",
+    )
+    original_progress = {
+        "schema": "qwen-reviewer-row-progress-v1",
+        "cell_identity_sha256": "b" * 64,
+        "rows": {str(index): "a" * 64 for index in range(200) if index != 151},
+    }
+    progress_bytes = (
+        json.dumps(original_progress, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8").replace(b"\n", b"\r\n")
+    monkeypatch.setattr(runner, "HISTORICAL_REVIEWER_LOG", log)
+    monkeypatch.setattr(runner, "HISTORICAL_REVIEWER_LOG_SHA256", _sha(log))
+    monkeypatch.setattr(
+        runner, "HISTORICAL_REVIEWER_PROGRESS_SHA256",
+        hashlib.sha256(progress_bytes).hexdigest(),
+    )
+    historical = runner._historical_reviewer_failure(
+        original_progress, dataset="msra", noise="IF", seed=42, row_index=151,
+    )
+    identity = {
+        "provider": "vllm", "model": runner.QWEN_MODEL,
+        "served_model": runner.QWEN_SERVED_MODEL,
+        "revision": runner.QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False, "thinking_mode": "nothink",
+    }
+    def evidence(stage, status):
+        return {
+            **identity, "stage": stage, "status": status,
+            "response_model": runner.QWEN_SERVED_MODEL if status == "live" else None,
+            "response_status": "completed" if status == "live" else None,
+            "finish_reason": "stop" if status == "live" else None,
+            "usage": {"prompt_tokens": 1} if status == "live" else {},
+        }
+    verifier = {**evidence("verifier", "historical_exhausted_unrecorded"), **historical}
+    metadata = {
+        "coder": [evidence("coder", "live")],
+        "reviewer": [evidence("reviewer", "disabled")],
+        "verifier": [verifier],
+    }
+    noisy = {"tokens": ["Alice"], "ner_tags": ["B-PER"], "dirty_tags": ["O"]}
+    record = {
+        "row_index": 0,
+        "input_digest": runner.run_multiseed._provider_input_digest(noisy),
+        "anchor_tags": [], "candidate_paths": [["B-PER"]],
+        "rag_weights": [1.0], "confidence": [],
+        "provider_metadata": metadata, "fallback_used": False,
+    }
+    fragment_root = (
+        cache_root / runner.REVIEWER_CACHE_TAG / "rows" / "msra" / "IF"
+        / "seed42"
+    )
+    fragment = fragment_root / "row151.jsonl"
+    manifest = runner.run_multiseed._provider_cache_manifest(
+        [noisy], runner.run_multiseed.CONFIGURATIONS[runner.CONFIG_NAME],
+        dataset="msra", noise="IF", seed=42, git_sha="a" * 40,
+        bundle_hash="c" * 64, enable_thinking=False,
+        study_identity={"row_index": 151},
+    )
+    fragment_sha = runner.run_multiseed.write_provider_cell(fragment, [record], manifest)
+    final_progress = {**original_progress, "rows": dict(original_progress["rows"])}
+    final_progress["rows"]["151"] = fragment_sha
+    study._write_json_atomic(fragment_root / "progress.json", final_progress)
+    cache_sha = "d" * 64
+    registry = {cache_sha: {
+        "tag": runner.REVIEWER_CACHE_TAG,
+        "identity": {"dataset": "msra", "noise": "IF", "seed": 42},
+        "records": [{**record, "row_index": 151}],
+    }}
+    runner._audit_historical_reviewer_failure(cache_root, registry)
+    row = {
+        "tokens": ["Alice"], "gold_tags": ["B-PER"], "pred_tags": None,
+        "prediction_status": "invalid_verifier_iob2_unrecorded",
+        "terminal_anchor_tags": None, "terminal_model_hash": None,
+        "terminal_used_anchor": None, "terminal_predicted_gain": None,
+        "terminal_fallback_count": 0, "fallback_used": False,
+        "study_kind": "ablation", "study_variant": "minus_reviewer_weighting",
+        "study_dataset": "msra", "study_seed": 42,
+        "study_row_index": 151, "provider_cache_sha256": cache_sha,
+        **{key: record[key] for key in (
+            "input_digest", "candidate_paths", "rag_weights", "confidence",
+            "provider_metadata",
+        )},
+    }
+    study.validate_study_prediction_row(row, "msra")
+    runner._audit_prediction_row(
+        row, "msra", noisy, registry, kind="ablation",
+        variant="minus_reviewer_weighting", noise="IF", ratio=0.15,
+        terminal=None,
+    )
+    with pytest.raises(ValueError):
+        runner._audit_prediction_row(
+            {**row, "study_row_index": 150}, "msra", noisy, registry,
+            kind="ablation", variant="minus_reviewer_weighting",
+            noise="IF", ratio=0.15, terminal=None,
+        )
+
+
+def test_reviewer_weighting_publishes_exhausted_verifier_as_invalid_row(
+    tmp_path, monkeypatch,
+):
+    import multi_agent_v2
+    from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
+    from official_contract import VerifierSemanticRetryExhausted
+
+    monkeypatch.setattr(study, "SAMPLE_SIZE", 1)
+    root, cache_root = tmp_path / "study", tmp_path / "cache"
+    served = runner.QWEN_SERVED_MODEL
+    identity = {
+        "provider": "vllm", "model": runner.QWEN_MODEL,
+        "served_model": served, "revision": runner.QWEN_REVISION,
+        "structured_api": "chat-completions-json-schema",
+        "enable_thinking": False, "thinking_mode": "nothink",
+    }
+    def live(stage):
+        return {
+            **identity, "stage": stage, "status": "live",
+            "response_model": served, "response_status": "completed",
+            "finish_reason": "stop", "usage": {"prompt_tokens": 1},
+        }
+    source = {
+        "tokens": ["Alice"], "gold_tags": ["B-PER"],
+        "pred_tags": ["B-PER"], "candidate_paths": [["B-PER"], ["B-ORG"]],
+        "rag_weights": [0.8, 0.2], "confidence": [0.8],
+        "terminal_anchor_tags": ["B-PER"],
+        "terminal_model_hash": LOCKED_DECODER_MODEL_HASH,
+        "terminal_used_anchor": True, "terminal_predicted_gain": 0.0,
+        "terminal_fallback_count": 0, "provider_cache_sha256": "d" * 64,
+        "provider_metadata": {
+            "coder": [live("coder")], "reviewer": [live("reviewer")],
+            "verifier": [live("verifier")],
+        }, "fallback_used": False,
+    }
+    study._write_jsonl_atomic(
+        study.study_prediction_path(root, "ablation", "full", "msra", "ATF", 0.15, 13),
+        [source],
+    )
+    study._write_jsonl_atomic(
+        study.study_input_path(root, "msra", "ATF", 13, 0.15),
+        [{"tokens": ["Alice"], "ner_tags": ["B-PER"], "dirty_tags": ["B-ORG"]}],
+    )
+    rejected = ["I-PER"]
+    digest = hashlib.sha256(json.dumps(
+        {"tags": rejected}, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    attempts = [{
+        **live("verifier"), "semantic_attempt": attempt,
+        "semantic_outcome": "rejected_illegal_iob2",
+        "illegal_transition": {"index": 0, "previous": "O", "current": "I-PER"},
+        "rejected_tags": rejected, "response_sha256": digest,
+    } for attempt in (1, 2, 3)]
+
+    class Adapter:
+        def provider_metadata(self):
+            return dict(identity)
+        def structured_requester(self, *_args, **_kwargs):
+            raise AssertionError("fake verifier should intercept provider")
+    monkeypatch.setattr(multi_agent_v2, "_init_deer", lambda *_a, **_k: None)
+    monkeypatch.setattr(multi_agent_v2, "_base_decode", lambda *_a, **_k: ["B-PER"])
+    monkeypatch.setattr(multi_agent_v2, "legalize_noise_aware", lambda tags, *_a: tags)
+    monkeypatch.setattr(multi_agent_v2, "_is_type_contested", lambda _paths: True)
+    async def exhausted(_state):
+        raise VerifierSemanticRetryExhausted(attempts)
+    monkeypatch.setattr(multi_agent_v2, "verifier_node", exhausted)
+    terminal = SimpleNamespace(model_hash=LOCKED_DECODER_MODEL_HASH, fallback_count=0)
+    output = asyncio.run(runner._reviewer_weighting_cell(
+        root, cache_root, Adapter, terminal, dataset="msra", noise="ATF",
+        seed=13, selection=[], max_concurrency=1, git_sha="a" * 40,
+    ))
+    rows = study.validate_study_prediction_file(output, "msra", expected_count=1)
+    assert rows[0]["prediction_status"] == "invalid_verifier_iob2"
+    assert rows[0]["pred_tags"] == rejected
+    assert rows[0]["confidence"] == []
+    assert rows[0]["terminal_model_hash"] is None
+    assert rows[0]["provider_metadata"]["verifier"] == attempts
+    assert runner.run_multiseed._read_provider_cache_index_cell(
+        cache_root, runner.REVIEWER_CACHE_TAG,
+        runner.run_multiseed._provider_cache_cell_key(
+            runner.CONFIG_NAME, "msra", "ATF", 13,
+        ),
+    )["row_count"] == 1
+    cache_path = runner.run_multiseed._provider_cache_cell_path(
+        cache_root, runner.REVIEWER_CACHE_TAG, runner.CONFIG_NAME,
+        "msra", "ATF", 13,
+    )
+    cache_sha = runner._sha256_file(cache_path)
+    cache_records = runner.run_multiseed.read_provider_cell(cache_path, cache_sha, 1)
+    registry = {cache_sha: {
+        "tag": runner.REVIEWER_CACHE_TAG, "records": cache_records,
+    }}
+    noisy = {"tokens": ["Alice"], "ner_tags": ["B-PER"], "dirty_tags": ["B-ORG"]}
+    runner._audit_prediction_row(
+        rows[0], "msra", noisy, registry, kind="ablation",
+        variant="minus_reviewer_weighting", noise="ATF", ratio=0.15,
+        terminal=terminal,
+    )
+    with pytest.raises(ValueError):
+        runner._audit_prediction_row(
+            {**rows[0], "pred_tags": ["B-PER"]}, "msra", noisy, registry,
+            kind="ablation", variant="minus_reviewer_weighting",
+            noise="ATF", ratio=0.15, terminal=terminal,
+        )
+
+
 def test_gradient_selection_rejects_duplicate_or_substituted_coordinates():
     tokens = ["Alice"]
     token_sha = hashlib.sha256(

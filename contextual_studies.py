@@ -56,6 +56,10 @@ NOISE_TYPES = ("BT", "IF", "ATF")
 SEEDS = (13, 42, 2024)
 GRADIENT_RATIOS = (0.05, 0.15, 0.25, 0.35, 0.45)
 OFFICIAL_RATIO = 0.15
+INVALID_VERIFIER_STATUSES = frozenset({
+    "invalid_verifier_iob2",
+    "invalid_verifier_iob2_unrecorded",
+})
 SAMPLE_SIZE = 200
 TEST_GROUPS_PER_DATASET = 30
 ABLATION_VARIANTS = (
@@ -197,19 +201,69 @@ def validate_study_prediction_row(
     tokens = row.get("tokens")
     gold = row.get("gold_tags")
     pred = row.get("pred_tags")
-    if not all(isinstance(value, list) for value in (tokens, gold, pred)):
+    status = row.get("prediction_status")
+    unrecorded = status == "invalid_verifier_iob2_unrecorded"
+    if (not isinstance(tokens, list) or not isinstance(gold, list)
+            or not (isinstance(pred, list) or (unrecorded and pred is None))):
         raise ValueError("study row sequences are not aligned")
     if not all(
         isinstance(item, str)
-        for values in (tokens, gold, pred)
+        for values in (tokens, gold, pred if isinstance(pred, list) else [])
         for item in values
     ):
         raise ValueError("study row sequences are not aligned")
-    if not len(tokens) == len(gold) == len(pred):
+    if (len(tokens) != len(gold)
+            or (isinstance(pred, list) and len(pred) != len(tokens))):
         raise ValueError("study row sequences are not aligned")
     valid = _valid_tags(dataset)
-    if any(tag not in valid for values in (gold, pred) for tag in values):
+    if any(tag not in valid for values in (gold, pred if isinstance(pred, list) else [])
+           for tag in values):
         raise ValueError("study row contains an unknown ontology tag")
+    if unrecorded:
+        metadata = row.get("provider_metadata")
+        records = metadata.get("verifier") if isinstance(metadata, Mapping) else None
+        record = records[0] if isinstance(records, list) and len(records) == 1 else None
+        if (row.get("study_kind") != "ablation"
+                or row.get("study_variant") != "minus_reviewer_weighting"
+                or not isinstance(record, Mapping)
+                or record.get("stage") != "verifier"
+                or record.get("status") != "historical_exhausted_unrecorded"
+                or record.get("evidence_level") != "log_only"
+                or record.get("failed_attempt_count") != 3
+                or not isinstance(record.get("failure_log_sha256"), str)
+                or not _SHA256_RE.fullmatch(record["failure_log_sha256"])
+                or not isinstance(record.get("failure_progress_sha256"), str)
+                or not _SHA256_RE.fullmatch(record["failure_progress_sha256"])
+                or row.get("fallback_used") is not False
+                or any(row.get(field) is not None for field in (
+                    "terminal_anchor_tags", "terminal_model_hash",
+                    "terminal_used_anchor", "terminal_predicted_gain",
+                ))
+                or row.get("terminal_fallback_count") != 0):
+            raise ValueError("unrecorded invalid Verifier row lacks provenance")
+        return
+    if row.get("prediction_status") == "invalid_verifier_iob2":
+        from official_contract import validate_verifier_semantic_retry_evidence
+
+        metadata = row.get("provider_metadata")
+        records = metadata.get("verifier") if isinstance(metadata, Mapping) else None
+        if (row.get("study_kind") != "ablation"
+                or row.get("study_variant") != "minus_reviewer_weighting"
+                or not isinstance(records, list)
+                or row.get("fallback_used") is not False
+                or any(row.get(field) is not None for field in (
+                    "terminal_anchor_tags", "terminal_model_hash",
+                    "terminal_used_anchor", "terminal_predicted_gain",
+                ))
+                or row.get("terminal_fallback_count") != 0):
+            raise ValueError("invalid Verifier row has inconsistent provenance")
+        validate_verifier_semantic_retry_evidence(records, exhausted=True)
+        if (_is_legal_iob2(pred)
+                or pred != records[-1]["rejected_tags"]):
+            raise ValueError("invalid Verifier row does not preserve its rejected output")
+        return
+    if "prediction_status" in row:
+        raise ValueError("unexpected prediction status")
     if not _is_legal_iob2(pred):
         raise ValueError("study row prediction is not legal IOB2")
     if not require_terminal:

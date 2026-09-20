@@ -36,6 +36,53 @@ FORMAL_CACHE_PRODUCER_GIT_SHAS = (
     "1544f7bddf7a0a65766492605c6e526c09462dac",
     "3d6c5c9bfd1734a08720848aa94cdc6de22c9c0b",
 )
+PRE_INVALID_POLICY_GIT_SHA = "fda59ed8906504784bd122e84c63636a8d7bc266"
+PRE_INVALID_POLICY_MANIFEST_SHA256 = (
+    "6eda4970e0a035d0f16e01d11b378f5114ccaa5d465c66ddb7cf9f03f09dfe33"
+)
+HISTORICAL_REVIEWER_LOG_SHA256 = (
+    "94e0567d41fc7c665168fff03785c6da7e26783a7f3668cd9e9218ad86715493"
+)
+HISTORICAL_REVIEWER_PROGRESS_SHA256 = (
+    "22d459bdb560aa452e65a9d97a152bfcff792e9846afebb5b020e338d5604218"
+)
+HISTORICAL_REVIEWER_LOG = (
+    Path(__file__).resolve().parent / ".qwen_diagnostics"
+    / "studies-v2-reviewer-weighting-20260920.stderr.log"
+)
+
+
+def _historical_reviewer_failure(
+    fragment_index: Mapping[str, Any], *, dataset: str, noise: str,
+    seed: int, row_index: int,
+) -> dict[str, Any] | None:
+    """Bind the one lost-response failure to its immutable log and 199-row index.
+
+    This does not claim to reconstruct the three tag arrays. It exists only to
+    count the original failed coordinate without making another model request.
+    """
+    if (dataset, noise, seed, row_index) != ("msra", "IF", 42, 151):
+        return None
+    rows = fragment_index.get("rows")
+    if (not isinstance(rows, Mapping)
+            or set(rows) != {str(index) for index in range(200) if index != 151}):
+        raise ValueError("historical invalid row lacks its unique 199-row progress index")
+    progress_bytes = (json.dumps(
+        fragment_index, ensure_ascii=False, indent=2, sort_keys=True,
+    ) + "\n").encode("utf-8").replace(b"\n", b"\r\n")
+    if hashlib.sha256(progress_bytes).hexdigest() != HISTORICAL_REVIEWER_PROGRESS_SHA256:
+        raise ValueError("historical invalid row progress SHA mismatch")
+    if (not HISTORICAL_REVIEWER_LOG.is_file()
+            or _sha256_file(HISTORICAL_REVIEWER_LOG) != HISTORICAL_REVIEWER_LOG_SHA256
+            or "official Verifier returned illegal IOB2 sequences after 3 attempts"
+            not in HISTORICAL_REVIEWER_LOG.read_text(encoding="utf-8")):
+        raise ValueError("historical invalid row failure log is missing or changed")
+    return {
+        "evidence_level": "log_only",
+        "failed_attempt_count": 3,
+        "failure_log_sha256": HISTORICAL_REVIEWER_LOG_SHA256,
+        "failure_progress_sha256": HISTORICAL_REVIEWER_PROGRESS_SHA256,
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -216,7 +263,23 @@ def ensure_manifest(root: Path, git_sha: str) -> dict[str, Any]:
     if path.exists():
         existing = json.loads(path.read_text(encoding="utf-8"))
         if existing != manifest:
-            raise ValueError("study manifest collision with different content")
+            if _sha256_file(path) != PRE_INVALID_POLICY_MANIFEST_SHA256:
+                raise ValueError("study manifest collision with different content")
+            continuation = {
+                "schema": "qwen-contextual-invalid-output-continuation-v1",
+                "parent_manifest_sha256": PRE_INVALID_POLICY_MANIFEST_SHA256,
+                "parent_git_sha": PRE_INVALID_POLICY_GIT_SHA,
+                "git_sha": git_sha,
+                "source_files": _source_files(),
+                "scope": "minus_reviewer_weighting_verifier_iob2_exhaustion_only",
+                "invalid_row_scoring": "invalid_as_one_fp_plus_all_gold_fn",
+            }
+            continuation_path = root / "invalid_output_continuation.json"
+            if continuation_path.exists():
+                if json.loads(continuation_path.read_text(encoding="utf-8")) != continuation:
+                    raise ValueError("invalid-output continuation collision")
+            else:
+                study._write_json_atomic(continuation_path, continuation)
     else:
         study._write_json_atomic(path, manifest)
     return manifest
@@ -728,7 +791,10 @@ async def _reviewer_weighting_cell(
             cache_root, REVIEWER_CACHE_TAG, cell_key,
         )
         cached_manifest = run_multiseed._read_provider_cache_manifest(cell_path)
-        run_multiseed._validate_replay_cache_identity(cached_manifest, full_manifest)
+        run_multiseed._validate_replay_cache_identity(
+            cached_manifest, full_manifest,
+            compatible_git_shas=(PRE_INVALID_POLICY_GIT_SHA,),
+        )
         if (not run_multiseed._provider_cache_index_path_matches(
                 indexed["path"], cell_path)
                 or indexed["row_count"] != len(noisy)):
@@ -767,10 +833,45 @@ async def _reviewer_weighting_cell(
                 cached_manifest = run_multiseed._read_provider_cache_manifest(fragment)
                 run_multiseed._validate_replay_cache_identity(
                     cached_manifest, row_manifest,
+                    compatible_git_shas=(PRE_INVALID_POLICY_GIT_SHA,),
                 )
                 cached = run_multiseed.read_provider_cell(fragment, fragment_sha, 1)[0]
                 cached["row_index"] = index
                 provider_records[index] = cached
+                return
+            historical = _historical_reviewer_failure(
+                fragment_index, dataset=dataset, noise=noise,
+                seed=seed, row_index=index,
+            )
+            if historical is not None:
+                verifier_record = multi_agent_v2._stage_status_record(
+                    "verifier", "historical_exhausted_unrecorded",
+                    provider_identity,
+                )
+                verifier_record.update(historical)
+                record = {
+                    "row_index": 0,
+                    "input_digest": run_multiseed._provider_input_digest(noisy[index]),
+                    "anchor_tags": [],
+                    "candidate_paths": candidates,
+                    "rag_weights": weights,
+                    "confidence": [],
+                    "provider_metadata": {
+                        "coder": [dict(item) for item in row["provider_metadata"]["coder"]],
+                        "reviewer": [multi_agent_v2._stage_status_record(
+                            "reviewer", "disabled", provider_identity,
+                        )],
+                        "verifier": [verifier_record],
+                    },
+                    "fallback_used": False,
+                }
+                run_multiseed.write_provider_cell(fragment, [record], row_manifest)
+                fragment_sha = _sha256_file(fragment)
+                async with fragment_index_lock:
+                    fragment_index["rows"][str(index)] = fragment_sha
+                    study._write_json_atomic(fragment_index_path, fragment_index)
+                record["row_index"] = index
+                provider_records[index] = record
                 return
             valid_types = set(multi_agent_v2.DATASET_ENTITY_TYPES[dataset])
             dangling_policy = "demote" if noise == "IF" else "promote"
@@ -801,12 +902,22 @@ async def _reviewer_weighting_cell(
                 },
                 "structured_requester": adapter.structured_requester,
             }
+            verifier_exhausted = False
             if multi_agent_v2._is_type_contested(candidates):
-                verifier_result = await asyncio.wait_for(
-                    multi_agent_v2.verifier_node(state), timeout=7200.0,
-                )
-                anchor = list(verifier_result["current_tags"])
-                provider_metadata = verifier_result["provider_metadata"]
+                try:
+                    verifier_result = await asyncio.wait_for(
+                        multi_agent_v2.verifier_node(state), timeout=7200.0,
+                    )
+                except run_multiseed.VerifierSemanticRetryExhausted as exc:
+                    verifier_exhausted = True
+                    anchor = []
+                    provider_metadata = {
+                        "coder": coder_evidence, "reviewer": [reviewer_record],
+                        "verifier": [dict(item) for item in exc.records],
+                    }
+                else:
+                    anchor = list(verifier_result["current_tags"])
+                    provider_metadata = verifier_result["provider_metadata"]
             else:
                 anchor = base
                 provider_metadata = {
@@ -817,15 +928,17 @@ async def _reviewer_weighting_cell(
                 }
             multi_agent_v2._validate_contextual_official_evidence(
                 provider_metadata, allow_reviewer_disabled=True,
+                allow_verifier_exhausted=verifier_exhausted,
             )
             record = {
                 "row_index": 0,
                 "input_digest": run_multiseed._provider_input_digest(noisy[index]),
                 "anchor_tags": anchor, "candidate_paths": candidates,
                 "rag_weights": weights,
-                "confidence": multi_agent_v2._per_position_confidence(
-                    candidates, weights, anchor,
-                ),
+                "confidence": ([] if verifier_exhausted else
+                               multi_agent_v2._per_position_confidence(
+                                   candidates, weights, anchor,
+                               )),
                 "provider_metadata": provider_metadata,
                 "fallback_used": False,
             }
@@ -878,6 +991,63 @@ async def _reviewer_weighting_cell(
     predictions = []
     for index, cached in enumerate(provider_records):
         assert cached is not None
+        verifier_records = cached["provider_metadata"]["verifier"]
+        if (len(verifier_records) == 1 and verifier_records[0].get("status")
+                == "historical_exhausted_unrecorded"):
+            if ((dataset, noise, seed, index) != ("msra", "IF", 42, 151)
+                    or cached["anchor_tags"] != []
+                    or cached["confidence"] != []
+                    or verifier_records[0].get("failure_log_sha256")
+                    != HISTORICAL_REVIEWER_LOG_SHA256
+                    or verifier_records[0].get("failure_progress_sha256")
+                    != HISTORICAL_REVIEWER_PROGRESS_SHA256):
+                raise ValueError("historical invalid Verifier cache is not bound")
+            predictions.append({
+                "tokens": list(source[index]["tokens"]),
+                "gold_tags": list(source[index]["gold_tags"]),
+                "pred_tags": None,
+                "prediction_status": "invalid_verifier_iob2_unrecorded",
+                "input_digest": cached["input_digest"],
+                "candidate_paths": cached["candidate_paths"],
+                "rag_weights": cached["rag_weights"],
+                "confidence": [],
+                "terminal_anchor_tags": None,
+                "terminal_model_hash": None,
+                "terminal_used_anchor": None,
+                "terminal_predicted_gain": None,
+                "terminal_fallback_count": 0,
+                "provider_cache_sha256": cache_sha,
+                "provider_metadata": cached["provider_metadata"],
+                "fallback_used": False,
+            })
+            continue
+        if (len(verifier_records) == 3 and all(
+                item.get("semantic_outcome") == "rejected_illegal_iob2"
+                for item in verifier_records)):
+            from official_contract import validate_verifier_semantic_retry_evidence
+
+            validate_verifier_semantic_retry_evidence(verifier_records, exhausted=True)
+            if cached["anchor_tags"] != []:
+                raise ValueError("exhausted Verifier cache must not fabricate an anchor")
+            predictions.append({
+                "tokens": list(source[index]["tokens"]),
+                "gold_tags": list(source[index]["gold_tags"]),
+                "pred_tags": list(verifier_records[-1]["rejected_tags"]),
+                "prediction_status": "invalid_verifier_iob2",
+                "input_digest": cached["input_digest"],
+                "candidate_paths": cached["candidate_paths"],
+                "rag_weights": cached["rag_weights"],
+                "confidence": cached["confidence"],
+                "terminal_anchor_tags": None,
+                "terminal_model_hash": None,
+                "terminal_used_anchor": None,
+                "terminal_predicted_gain": None,
+                "terminal_fallback_count": 0,
+                "provider_cache_sha256": cache_sha,
+                "provider_metadata": cached["provider_metadata"],
+                "fallback_used": False,
+            })
+            continue
         replay = await asyncio.to_thread(
             multi_agent_v2.run_contextual_lattice_replay,
             tokens=list(source[index]["tokens"]),
@@ -1301,7 +1471,11 @@ def _audit_prediction_row(
 ) -> None:
     from contextual_lattice_runtime import LOCKED_DECODER_MODEL_HASH
 
-    if row.get("terminal_model_hash") != LOCKED_DECODER_MODEL_HASH:
+    invalid_verifier = row.get("prediction_status") in study.INVALID_VERIFIER_STATUSES
+    unrecorded_invalid = row.get("prediction_status") == (
+        "invalid_verifier_iob2_unrecorded"
+    )
+    if not invalid_verifier and row.get("terminal_model_hash") != LOCKED_DECODER_MODEL_HASH:
         raise ValueError("terminal model hash mismatch")
     cache_sha = row.get("provider_cache_sha256")
     if cache_sha not in cache_registry:
@@ -1321,7 +1495,8 @@ def _audit_prediction_row(
     if (not isinstance(candidates, list) or not candidates
             or not isinstance(weights, list) or len(weights) != len(candidates)
             or not isinstance(confidence, list)
-            or len(confidence) != len(row["tokens"])):
+            or (invalid_verifier and confidence != [])
+            or (not invalid_verifier and len(confidence) != len(row["tokens"]))):
         raise ValueError("candidate evidence is incomplete")
     valid = study._valid_tags(dataset)
     if any(
@@ -1361,6 +1536,43 @@ def _audit_prediction_row(
     ]
     if not matching_records:
         raise ValueError("prediction evidence is not exactly present in its provider-cache cell")
+    if invalid_verifier:
+        from official_contract import validate_verifier_semantic_retry_evidence
+
+        if kind != "ablation" or variant != "minus_reviewer_weighting":
+            raise ValueError("invalid Verifier outcome is outside reviewer weighting")
+        matching_records = [record for record in matching_records
+                            if record.get("row_index") == row.get("study_row_index")]
+        if not matching_records:
+            raise ValueError("invalid Verifier outcome lacks exact row binding")
+        cached = matching_records[0]
+        verifier_records = cached["provider_metadata"]["verifier"]
+        if unrecorded_invalid:
+            if ((row.get("study_dataset"), noise, row.get("study_seed"),
+                 row.get("study_row_index")) != ("msra", "IF", 42, 151)
+                    or len(verifier_records) != 1
+                    or verifier_records[0].get("status")
+                    != "historical_exhausted_unrecorded"
+                    or verifier_records[0].get("evidence_level") != "log_only"
+                    or verifier_records[0].get("failed_attempt_count") != 3
+                    or verifier_records[0].get("failure_log_sha256")
+                    != HISTORICAL_REVIEWER_LOG_SHA256
+                    or verifier_records[0].get("failure_progress_sha256")
+                    != HISTORICAL_REVIEWER_PROGRESS_SHA256
+                    or row.get("pred_tags") is not None
+                    or cached.get("confidence") != []):
+                raise ValueError("historical invalid Verifier evidence is unbound")
+        else:
+            validate_verifier_semantic_retry_evidence(verifier_records, exhausted=True)
+            if row.get("pred_tags") != verifier_records[-1]["rejected_tags"]:
+                raise ValueError("invalid Verifier output was substituted")
+        if (cached.get("anchor_tags") != []
+                or any(row.get(field) is not None for field in (
+                    "terminal_anchor_tags", "terminal_model_hash",
+                    "terminal_used_anchor", "terminal_predicted_gain",
+                ))):
+            raise ValueError("invalid Verifier output was terminalized")
+        return
     if variant != "minus_verifier" and not any(
         record.get("anchor_tags") == row.get("terminal_anchor_tags")
         for record in matching_records
@@ -1433,15 +1645,84 @@ def _validate_gradient_selection(
             raise ValueError("gradient frozen-selection digest mismatch")
 
 
+def _audit_historical_reviewer_failure(
+    cache_root: Path, registry: Mapping[str, Mapping[str, Any]],
+) -> None:
+    affected = [
+        (binding, record)
+        for binding in registry.values()
+        if binding.get("tag") == REVIEWER_CACHE_TAG
+        for record in binding["records"]
+        if len(record["provider_metadata"]["verifier"]) == 1
+        and record["provider_metadata"]["verifier"][0].get("status")
+        == "historical_exhausted_unrecorded"
+    ]
+    if not affected:
+        return
+    if len(affected) != 1:
+        raise ValueError("historical reviewer failure must have exactly one coordinate")
+    binding, record = affected[0]
+    identity = binding["identity"]
+    if ((identity.get("dataset"), identity.get("noise"), identity.get("seed"),
+         record.get("row_index")) != ("msra", "IF", 42, 151)):
+        raise ValueError("historical reviewer failure coordinate mismatch")
+    fragment_root = (
+        cache_root / REVIEWER_CACHE_TAG / "rows" / "msra" / "IF" / "seed42"
+    )
+    progress = json.loads((fragment_root / "progress.json").read_text(encoding="utf-8"))
+    rows = progress.get("rows") if isinstance(progress, Mapping) else None
+    if (not isinstance(rows, Mapping)
+            or set(rows) != {str(index) for index in range(200)}):
+        raise ValueError("historical reviewer progress is incomplete")
+    fragment = fragment_root / "row151.jsonl"
+    if _sha256_file(fragment) != rows["151"]:
+        raise ValueError("historical reviewer fragment SHA mismatch")
+    fragment_record = run_multiseed.read_provider_cell(fragment, rows["151"], 1)[0]
+    if {**fragment_record, "row_index": 151} != record:
+        raise ValueError("historical reviewer fragment differs from published cell")
+    original_progress = {**progress, "rows": dict(rows)}
+    original_progress["rows"].pop("151")
+    expected = _historical_reviewer_failure(
+        original_progress, dataset="msra", noise="IF", seed=42,
+        row_index=151,
+    )
+    evidence = record["provider_metadata"]["verifier"][0]
+    if expected is None or any(evidence.get(key) != value
+                               for key, value in expected.items()):
+        raise ValueError("historical reviewer evidence does not match original failure")
+
+
 def audit_outputs(root: Path, cache_root: Path) -> dict[str, Any]:
     """Fail closed on exact matrix, metadata, ontology, and provenance."""
     errors: list[str] = []
+    continuation_path = root / "invalid_output_continuation.json"
+    parent_is_pre_policy = (
+        _sha256_file(root / "manifest.json")
+        == PRE_INVALID_POLICY_MANIFEST_SHA256
+    )
+    if parent_is_pre_policy and not continuation_path.is_file():
+        raise ValueError("pre-policy study requires its invalid-output continuation")
+    if continuation_path.exists():
+        continuation = json.loads(continuation_path.read_text(encoding="utf-8"))
+        if (not parent_is_pre_policy
+                or continuation != {
+                    "schema": "qwen-contextual-invalid-output-continuation-v1",
+                    "parent_manifest_sha256": PRE_INVALID_POLICY_MANIFEST_SHA256,
+                    "parent_git_sha": PRE_INVALID_POLICY_GIT_SHA,
+                    "git_sha": _git_sha(),
+                    "source_files": _source_files(),
+                    "scope": "minus_reviewer_weighting_verifier_iob2_exhaustion_only",
+                    "invalid_row_scoring": "invalid_as_one_fp_plus_all_gold_fn",
+                }):
+            raise ValueError("invalid-output continuation provenance mismatch")
     cache_registry = _validated_cache_registry(root, cache_root)
+    _audit_historical_reviewer_failure(cache_root, cache_registry)
     import multi_agent_v2
     from multi_agent_v2 import _load_contextual_lattice_terminal
 
     terminal = _load_contextual_lattice_terminal()
     ablation_cells = ablation_rows = gradient_cells = gradient_rows = 0
+    invalid_ablation_rows = 0
     for variant in study.ABLATION_VARIANTS:
         for dataset in study.DATASETS:
             if variant == "minus_verifier":
@@ -1484,6 +1765,10 @@ def audit_outputs(root: Path, cache_root: Path) -> dict[str, Any]:
                                 row, dataset, noisy_rows[row_index], cache_registry,
                                 kind="ablation", variant=variant, noise=noise,
                                 ratio=study.OFFICIAL_RATIO, terminal=terminal,
+                            )
+                            invalid_ablation_rows += (
+                                row.get("prediction_status")
+                                in study.INVALID_VERIFIER_STATUSES
                             )
                         ablation_cells += 1
                         ablation_rows += len(rows)
@@ -1575,6 +1860,7 @@ def audit_outputs(root: Path, cache_root: Path) -> dict[str, Any]:
         "study_tag": STUDY_TAG,
         "ablation_cells": ablation_cells,
         "ablation_rows": ablation_rows,
+        "invalid_ablation_rows": invalid_ablation_rows,
         "gradient_cells": gradient_cells,
         "gradient_rows": gradient_rows,
         "errors": errors,

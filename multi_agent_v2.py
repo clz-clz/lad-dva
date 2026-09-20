@@ -325,6 +325,7 @@ def _with_stage_records(state: Mapping[str, Any], stage: str,
 
 def _validate_contextual_official_evidence(
     evidence: Mapping[str, Any], *, allow_reviewer_disabled: bool = False,
+    allow_verifier_exhausted: bool = False,
 ) -> None:
     """Reject unbound or incomplete provider evidence before cache publication."""
     if set(evidence) != set(_CONTEXTUAL_PROVIDER_STAGES):
@@ -372,7 +373,9 @@ def _validate_contextual_official_evidence(
                     raise RuntimeError("official contextual skipped evidence claims a response")
         if stage == "verifier":
             try:
-                validate_verifier_semantic_retry_evidence(records)
+                validate_verifier_semantic_retry_evidence(
+                    records, exhausted=allow_verifier_exhausted,
+                )
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from exc
 

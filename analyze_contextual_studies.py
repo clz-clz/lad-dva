@@ -1,6 +1,7 @@
 """Analyze completed Contextual-Lattice study artifacts.
 
-All metrics are computed from the study namespace after strict row validation.
+Valid-output P/R/F1 is strict IOB2. Explicitly invalid rows have a separate
+rate and a clearly labeled policy-penalized score; no missing tags are invented.
 The primary ablation comparisons use the locked 450-row test selection; the
 full 9,000-row matrix is reported separately as descriptive deployment scope.
 """
@@ -76,23 +77,65 @@ def _span_set(tags: Sequence[str]) -> set[tuple[str, int, int]]:
 
 def _metric_record(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     gold = [list(row["gold_tags"]) for row in rows]
-    pred = [list(row["pred_tags"]) for row in rows]
-    metrics = compute_prf1(gold, pred)
-    rates = token_class_rates(pred)
+    pred = [list(row["pred_tags"]) if isinstance(row.get("pred_tags"), list)
+            else [] for row in rows]
+    invalid = [row.get("prediction_status") in study.INVALID_VERIFIER_STATUSES
+               for row in rows]
+    # A failed Verifier contributes all gold spans as misses and one explicit
+    # invalid-output false positive. This is a scoring rule, not a replacement
+    # tag path; raw tags remain unchanged (or null if historically unrecorded).
+    scored_pred = [[] if failed else tags for failed, tags in zip(invalid, pred)]
+    counts_by_sentence = _per_sentence_span_counts(gold, scored_pred)
+    for index, failed in enumerate(invalid):
+        if failed:
+            counts_by_sentence[index, 1] += 1
+    counts = counts_by_sentence.sum(axis=0)
+    tp, fp, fn = (int(value) for value in counts)
+    penalized_precision = tp / (tp + fp) if tp + fp else 0.0
+    penalized_recall = tp / (tp + fn) if tp + fn else 0.0
+    penalized_f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
+    valid_gold = [tags for tags, failed in zip(gold, invalid) if not failed]
+    valid_pred = [tags for tags, failed in zip(pred, invalid) if not failed]
+    strict = compute_prf1(valid_gold, valid_pred) if valid_gold else {
+        "precision": None, "recall": None, "f1": None,
+    }
+    observed_pred = [tags for row, tags in zip(rows, pred)
+                     if isinstance(row.get("pred_tags"), list)]
+    rates = token_class_rates(observed_pred)
     acceptance = float(np.mean([
-        not bool(row.get("terminal_used_anchor")) for row in rows
+        not failed and row.get("terminal_used_anchor") is False
+        for row, failed in zip(rows, invalid)
+    ])) if rows else 0.0
+    anchor_rate = float(np.mean([
+        not failed and row.get("terminal_used_anchor") is True
+        for row, failed in zip(rows, invalid)
     ])) if rows else 0.0
     fallback = sum(int(row.get("terminal_fallback_count", 0)) for row in rows)
     return {
         "rows": len(rows),
-        "precision": metrics["precision"],
-        "recall": metrics["recall"],
-        "f1": metrics["f1"],
-        "ser": compute_ser(pred),
+        "invalid_rows": sum(invalid),
+        "invalid_rate": sum(invalid) / len(rows) if rows else 0.0,
+        "valid_output_rows": len(rows) - sum(invalid),
+        "strict_metric_defined": bool(valid_gold),
+        "strict_metric_scope": "valid_outputs_only",
+        "unrecorded_invalid_rows": sum(
+            row.get("prediction_status") == "invalid_verifier_iob2_unrecorded"
+            for row in rows
+        ),
+        "scoring_policy": "invalid_as_one_fp_plus_all_gold_fn",
+        "precision": strict["precision"],
+        "recall": strict["recall"],
+        "f1": strict["f1"],
+        "penalized_precision": penalized_precision,
+        "penalized_recall": penalized_recall,
+        "penalized_f1": penalized_f1,
+        "ser": compute_ser(observed_pred),
+        "ser_scope": "observed_raw_outputs_only",
         "o_rate": rates["o_rate"],
         "entity_rate": rates["entity_rate"],
+        "token_rate_scope": "observed_raw_outputs_only",
         "terminal_acceptance_rate": acceptance,
-        "terminal_anchor_rate": 1.0 - acceptance,
+        "terminal_anchor_rate": anchor_rate,
         "terminal_fallback_count": fallback,
     }
 
@@ -144,16 +187,23 @@ def _group_bootstrap(
     gold: Sequence[Sequence[str]], pred_a: Sequence[Sequence[str]],
     pred_b: Sequence[Sequence[str]], groups: Sequence[str],
     strata: Sequence[str], *, iterations: int = BOOTSTRAP_ITERATIONS,
-    seed: int = 0,
+    seed: int = 0, invalid_b: Sequence[bool] | None = None,
 ) -> dict[str, float]:
-    """Paired strict-span bootstrap clustered by group within each stratum."""
+    """Paired policy-penalized span bootstrap by group and stratum."""
     if not (len(gold) == len(pred_a) == len(pred_b) == len(groups) == len(strata)):
         raise ValueError("cluster bootstrap inputs are not aligned")
     if not gold:
-        return {"f1_A": 0.0, "f1_B": 0.0, "delta": 0.0,
+        return {"penalized_f1_A": 0.0, "penalized_f1_B": 0.0,
+                "penalized_delta": 0.0,
                 "p_value": 1.0, "ci_95_low": 0.0, "ci_95_high": 0.0}
     counts_a = _per_sentence_span_counts([list(x) for x in gold], [list(x) for x in pred_a])
     counts_b = _per_sentence_span_counts([list(x) for x in gold], [list(x) for x in pred_b])
+    if invalid_b is not None:
+        if len(invalid_b) != len(gold):
+            raise ValueError("cluster bootstrap invalid-output markers are not aligned")
+        for index, failed in enumerate(invalid_b):
+            if failed:
+                counts_b[index, 1] += 1
     strata_groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
     for index, (group, strata_key) in enumerate(zip(groups, strata)):
         strata_groups[strata_key][group].append(index)
@@ -186,9 +236,9 @@ def _group_bootstrap(
     obs_a = float(2 * a_total[0] / denom_a) if denom_a else 0.0
     obs_b = float(2 * b_total[0] / denom_b) if denom_b else 0.0
     return {
-        "f1_A": obs_a,
-        "f1_B": obs_b,
-        "delta": obs_a - obs_b,
+        "penalized_f1_A": obs_a,
+        "penalized_f1_B": obs_b,
+        "penalized_delta": obs_a - obs_b,
         "p_value": float(np.mean(deltas <= 0.0)),
         "ci_95_low": float(np.quantile(deltas, 0.025)),
         "ci_95_high": float(np.quantile(deltas, 0.975)),
@@ -242,12 +292,17 @@ def analyze_ablation(root: Path, source_tag: str = study.SOURCE_TAG) -> dict[str
         result = _group_bootstrap(
             [row["gold_tags"] for row in full],
             [row["pred_tags"] for row in full],
-            [row["pred_tags"] for row in ablated],
+            [([] if row.get("prediction_status") in study.INVALID_VERIFIER_STATUSES
+              else row["pred_tags"]) for row in ablated],
             groups, strata, seed=20260914 + index,
+            invalid_b=[row.get("prediction_status") in study.INVALID_VERIFIER_STATUSES
+                       for row in ablated],
         )
         comparison = {
             "full_vs": variant,
             "comparison": "Full - ablation",
+            "comparison_metric": "invalid_penalized_span_f1",
+            "invalid_row_scoring": "one_fp_plus_all_gold_fn",
             **result,
         }
         comparisons.append(comparison)
@@ -426,7 +481,7 @@ def analyze_gradient(root: Path, source_tag: str = study.SOURCE_TAG) -> dict[str
             deltas.append({
                 "scope": "delta_vs_15_pooled", "noise": noise, "ratio": ratio,
                 "reference_ratio": study.OFFICIAL_RATIO,
-                "delta_f1": result["delta"],
+                "delta_f1": result["penalized_delta"],
                 "p_value": result["p_value"],
                 "ci_95_low": result["ci_95_low"],
                 "ci_95_high": result["ci_95_high"],
